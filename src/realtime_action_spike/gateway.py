@@ -1,0 +1,186 @@
+"""Loopback FastAPI gateway for OpenAI Realtime SDP and local action execution."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from typing import Any, Protocol
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field
+
+from .capabilities import (
+    CAPABILITIES,
+    CapabilityBroker,
+    ExecutionContractError,
+    UnknownCapabilityError,
+)
+from .config import Settings, build_realtime_session
+
+OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
+
+
+class AsyncPostClient(Protocol):
+    async def post(self, url: str, **kwargs: Any) -> httpx.Response: ...
+
+
+class ExecutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    call_id: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=128)
+    arguments: str | dict[str, Any]
+
+
+def _safety_identifier() -> str:
+    value = b"openai-realtime-action-spike:single-local-user"
+    return hashlib.sha256(value).hexdigest()
+
+
+async def _post_to_openai(
+    *,
+    settings: Settings,
+    sdp: str,
+    upstream_client: AsyncPostClient | None,
+) -> httpx.Response:
+    api_key = settings.api_key_value()
+    assert api_key is not None
+
+    request_kwargs = {
+        "headers": {
+            "Authorization": f"Bearer {api_key}",
+            "OpenAI-Safety-Identifier": _safety_identifier(),
+        },
+        "files": {
+            "sdp": (None, sdp, "application/sdp"),
+            "session": (
+                None,
+                json.dumps(build_realtime_session(settings), separators=(",", ":")),
+                "application/json",
+            ),
+        },
+    }
+
+    if upstream_client is not None:
+        return await upstream_client.post(OPENAI_REALTIME_CALLS_URL, **request_kwargs)
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        return await client.post(OPENAI_REALTIME_CALLS_URL, **request_kwargs)
+
+
+def create_app(
+    settings: Settings | None = None,
+    *,
+    upstream_client: AsyncPostClient | None = None,
+    broker: CapabilityBroker | None = None,
+) -> FastAPI:
+    settings = settings or Settings.from_env()
+    broker = broker or CapabilityBroker()
+
+    app = FastAPI(title="OpenAI Realtime Action Spike Gateway", version="0.1.0")
+    allowed_origins = [
+        f"http://127.0.0.1:{settings.streamlit_port}",
+        f"http://localhost:{settings.streamlit_port}",
+    ]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Content-Type"],
+    )
+
+    @app.get("/health")
+    async def health() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "api_key_configured": settings.api_key_value() is not None,
+            "model": settings.realtime_model,
+            "capabilities": [capability.name for capability in CAPABILITIES],
+        }
+
+    @app.post("/session")
+    async def create_realtime_session(request: Request) -> Response:
+        if settings.api_key_value() is None:
+            raise HTTPException(
+                status_code=503,
+                detail="OPENAI_API_KEY is not configured on the gateway",
+            )
+
+        media_type = request.headers.get("content-type", "").split(";", maxsplit=1)[0]
+        if media_type != "application/sdp":
+            raise HTTPException(status_code=415, detail="Content-Type must be application/sdp")
+
+        try:
+            sdp = (await request.body()).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(status_code=400, detail="SDP must be UTF-8 text") from exc
+        if not sdp.strip():
+            raise HTTPException(status_code=400, detail="SDP offer is empty")
+
+        try:
+            upstream = await _post_to_openai(
+                settings=settings,
+                sdp=sdp,
+                upstream_client=upstream_client,
+            )
+        except httpx.HTTPError:
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "detail": "OpenAI Realtime session request failed",
+                    "upstream_status": None,
+                    "request_id": None,
+                },
+            )
+
+        request_id = upstream.headers.get("x-request-id")
+        if not upstream.is_success:
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "detail": "OpenAI Realtime session creation failed",
+                    "upstream_status": upstream.status_code,
+                    "request_id": request_id,
+                },
+            )
+
+        headers = {"X-OpenAI-Request-ID": request_id} if request_id else None
+        return Response(
+            content=upstream.text,
+            media_type="application/sdp",
+            headers=headers,
+        )
+
+    @app.post("/execute")
+    async def execute_capability(execution_request: ExecutionRequest) -> Response:
+        try:
+            result = broker.execute(execution_request.name, execution_request.arguments)
+        except UnknownCapabilityError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "call_id": execution_request.call_id,
+                    "error": {"type": "unknown_capability", "message": str(exc)},
+                },
+            )
+        except ExecutionContractError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "call_id": execution_request.call_id,
+                    "error": {"type": "invalid_arguments", "message": str(exc)},
+                },
+            )
+
+        return JSONResponse(content={"call_id": execution_request.call_id, **result})
+
+    return app
+
+
+app = create_app()
