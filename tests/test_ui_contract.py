@@ -40,6 +40,7 @@ def test_panel_uses_browser_webrtc_and_server_sdp_relay() -> None:
 def test_panel_executes_and_returns_realtime_function_calls() -> None:
     panel = read_panel()
 
+    assert 'event.type === "response.function_call_arguments.done"' in panel
     assert 'event.type === "response.done"' in panel
     assert 'item.type === "function_call"' in panel
     assert "handledCallIds" in panel
