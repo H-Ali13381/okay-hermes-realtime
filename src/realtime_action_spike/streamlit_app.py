@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 from realtime_action_spike.config import Settings
 
@@ -44,7 +43,7 @@ def render() -> None:
             "The gateway has no OpenAI API key yet. Add OPENAI_API_KEY to .env, then restart."
         )
 
-    components.html(panel, height=870, scrolling=False, tab_index=0)
+    st.iframe(panel, width="stretch", height=870, tab_index=0)
 
 
 if __name__ == "__main__":

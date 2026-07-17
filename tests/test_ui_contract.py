@@ -73,7 +73,8 @@ def test_streamlit_app_embeds_the_panel_with_loopback_gateway_origin() -> None:
     app = APP_PATH.read_text(encoding="utf-8")
 
     assert "st.set_page_config" in app
-    assert "components.html" in app
+    assert "st.iframe" in app
+    assert "components.html" not in app
     assert "realtime_panel.html" in app
     assert "__GATEWAY_ORIGIN__" in app
     assert "settings.gateway_host" in app
