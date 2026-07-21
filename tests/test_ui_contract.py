@@ -53,6 +53,15 @@ def test_panel_executes_and_returns_realtime_function_calls() -> None:
     assert "arguments" in panel
 
 
+def test_panel_scopes_execution_to_the_active_openai_realtime_session() -> None:
+    panel = read_panel()
+
+    assert "let openAIRealtimeSessionId = null" in panel
+    assert 'sdpResponse.headers.get("X-OpenAI-Realtime-Session-ID")' in panel
+    assert "session_id: sessionContext.sessionId" in panel
+    assert "openAIRealtimeSessionId = null" in panel
+
+
 def test_panel_renders_user_and_assistant_transcription_events() -> None:
     panel = read_panel()
 
@@ -83,6 +92,46 @@ def test_panel_cleans_up_microphone_data_channel_and_peer_connection() -> None:
     assert "peerConnection.close()" in panel
     assert "remoteAudio.srcObject = null" in panel
     assert "beforeunload" in panel
+
+
+def test_panel_cleans_up_failed_and_persistently_disconnected_webrtc() -> None:
+    panel = read_panel()
+
+    assert 'pc.connectionState === "failed"' in panel
+    assert 'pc.connectionState === "disconnected"' in panel
+    assert "scheduleTransportFailure" in panel
+    assert "clearTransportFailureTimer" in panel
+    assert 'failConversation(`WebRTC ${pc.connectionState}`)' in panel
+
+
+def test_panel_cleans_up_unexpected_realtime_data_channel_termination() -> None:
+    panel = read_panel()
+
+    assert 'dc.addEventListener("error"' in panel
+    assert 'dc.addEventListener("close"' in panel
+    assert 'failConversation("Realtime data channel failed")' in panel
+    assert 'failConversation("Realtime data channel closed unexpectedly")' in panel
+    assert "isStopping" in panel
+
+
+def test_panel_ignores_lifecycle_events_from_replaced_webrtc_session() -> None:
+    panel = read_panel()
+
+    assert 'const dc = pc.createDataChannel("oai-events")' in panel
+    assert "if (dataChannel !== dc || peerConnection !== pc) return" in panel
+    assert "dataChannel === dc && peerConnection === pc" in panel
+    assert "if (peerConnection !== pc) return" in panel
+
+
+def test_panel_never_sends_stale_tool_output_into_a_replacement_session() -> None:
+    panel = read_panel()
+
+    assert "async function executeFunctionCall(item, sessionContext)" in panel
+    assert "session_id: sessionContext.sessionId" in panel
+    assert "peerConnection !== sessionContext.pc" in panel
+    assert "dataChannel !== sessionContext.dc" in panel
+    assert "openAIRealtimeSessionId !== sessionContext.sessionId" in panel
+    assert "handleRealtimeEvent(event, { pc, dc, sessionId })" in panel
 
 
 def test_panel_never_embeds_permanent_openai_credentials() -> None:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
+from contextlib import suppress
 from typing import Any, Protocol
 
 import httpx
@@ -21,6 +23,8 @@ from .capabilities import (
 from .config import Settings, build_realtime_session
 
 OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
+OPENAI_REALTIME_SESSION_HEADER = "X-OpenAI-Realtime-Session-ID"
+MAX_OPENAI_CALLS_PER_SESSION = 512
 
 
 class AsyncPostClient(Protocol):
@@ -30,9 +34,23 @@ class AsyncPostClient(Protocol):
 class ExecutionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    session_id: str = Field(min_length=1, max_length=200)
     call_id: str = Field(min_length=1, max_length=200)
     name: str = Field(min_length=1, max_length=128)
     arguments: str | dict[str, Any]
+
+
+def _openai_execution_fingerprint(execution_request: ExecutionRequest) -> str:
+    arguments: Any = execution_request.arguments
+    if isinstance(arguments, str):
+        with suppress(json.JSONDecodeError):
+            arguments = json.loads(arguments)
+    canonical_request = json.dumps(
+        {"name": execution_request.name, "arguments": arguments},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical_request.encode()).hexdigest()
 
 
 def _safety_identifier() -> str:
@@ -79,6 +97,9 @@ def create_app(
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     broker = broker or CapabilityBroker()
+    active_session_id: str | None = None
+    latest_session_attempt = 0
+    execution_results_by_call_id: dict[str, tuple[str, int, str]] = {}
 
     app = FastAPI(title="OpenAI Realtime Action Spike Gateway", version="0.1.0")
     allowed_origins = [
@@ -91,6 +112,7 @@ def create_app(
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["Content-Type"],
+        expose_headers=["X-OpenAI-Request-ID", OPENAI_REALTIME_SESSION_HEADER],
     )
 
     @app.get("/health")
@@ -104,6 +126,7 @@ def create_app(
 
     @app.post("/session")
     async def create_realtime_session(request: Request) -> Response:
+        nonlocal active_session_id, latest_session_attempt
         if settings.api_key_value() is None:
             raise HTTPException(
                 status_code=503,
@@ -121,6 +144,8 @@ def create_app(
         if not sdp.strip():
             raise HTTPException(status_code=400, detail="SDP offer is empty")
 
+        latest_session_attempt += 1
+        session_attempt = latest_session_attempt
         try:
             upstream = await _post_to_openai(
                 settings=settings,
@@ -137,6 +162,12 @@ def create_app(
                 },
             )
 
+        if session_attempt != latest_session_attempt:
+            return JSONResponse(
+                status_code=409,
+                content={"detail": "OpenAI Realtime session attempt was superseded"},
+            )
+
         request_id = upstream.headers.get("x-request-id")
         if not upstream.is_success:
             return JSONResponse(
@@ -148,7 +179,11 @@ def create_app(
                 },
             )
 
-        headers = {"X-OpenAI-Request-ID": request_id} if request_id else None
+        active_session_id = secrets.token_urlsafe(24)
+        execution_results_by_call_id.clear()
+        headers = {OPENAI_REALTIME_SESSION_HEADER: active_session_id}
+        if request_id:
+            headers["X-OpenAI-Request-ID"] = request_id
         return Response(
             content=upstream.text,
             media_type="application/sdp",
@@ -157,28 +192,83 @@ def create_app(
 
     @app.post("/execute")
     async def execute_capability(execution_request: ExecutionRequest) -> Response:
-        try:
-            result = broker.execute(execution_request.name, execution_request.arguments)
-        except UnknownCapabilityError as exc:
+        if active_session_id is None or execution_request.session_id != active_session_id:
             return JSONResponse(
-                status_code=400,
+                status_code=409,
                 content={
                     "ok": False,
                     "call_id": execution_request.call_id,
-                    "error": {"type": "unknown_capability", "message": str(exc)},
-                },
-            )
-        except ExecutionContractError as exc:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "ok": False,
-                    "call_id": execution_request.call_id,
-                    "error": {"type": "invalid_arguments", "message": str(exc)},
+                    "error": {
+                        "type": "stale_session",
+                        "message": "OpenAI Realtime session is not current",
+                    },
                 },
             )
 
-        return JSONResponse(content={"call_id": execution_request.call_id, **result})
+        fingerprint = _openai_execution_fingerprint(execution_request)
+        cached = execution_results_by_call_id.get(execution_request.call_id)
+        if cached is not None:
+            cached_fingerprint, cached_status, cached_body_json = cached
+            if cached_fingerprint != fingerprint:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "ok": False,
+                        "call_id": execution_request.call_id,
+                        "error": {
+                            "type": "call_id_conflict",
+                            "message": (
+                                "OpenAI call_id was already used with a different request"
+                            ),
+                        },
+                    },
+                )
+            return Response(
+                content=cached_body_json,
+                status_code=cached_status,
+                media_type="application/json",
+            )
+
+        if len(execution_results_by_call_id) >= MAX_OPENAI_CALLS_PER_SESSION:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "ok": False,
+                    "call_id": execution_request.call_id,
+                    "error": {
+                        "type": "session_call_limit_exceeded",
+                        "message": "OpenAI Realtime session reached its execution safety limit",
+                    },
+                },
+            )
+
+        try:
+            result = broker.execute(execution_request.name, execution_request.arguments)
+        except UnknownCapabilityError as exc:
+            status_code = 400
+            body = {
+                "ok": False,
+                "call_id": execution_request.call_id,
+                "error": {"type": "unknown_capability", "message": str(exc)},
+            }
+        except ExecutionContractError as exc:
+            status_code = 400
+            body = {
+                "ok": False,
+                "call_id": execution_request.call_id,
+                "error": {"type": "invalid_arguments", "message": str(exc)},
+            }
+        else:
+            status_code = 200
+            body = {"call_id": execution_request.call_id, **result}
+
+        body_json = json.dumps(body, separators=(",", ":"))
+        execution_results_by_call_id[execution_request.call_id] = (
+            fingerprint,
+            status_code,
+            body_json,
+        )
+        return Response(content=body_json, status_code=status_code, media_type="application/json")
 
     return app
 

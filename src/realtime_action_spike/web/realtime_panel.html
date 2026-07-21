@@ -550,8 +550,11 @@
     let peerConnection = null;
     let dataChannel = null;
     let localStream = null;
+    let openAIRealtimeSessionId = null;
     let receivedExecutionCount = 0;
     let disconnectAfterResponse = false;
+    let transportFailureTimer = null;
+    let isStopping = false;
     const handledCallIds = new Set();
     const transcriptTurns = new Map();
 
@@ -572,6 +575,29 @@
     function clearError() {
       errorBanner.textContent = "";
       errorBanner.dataset.visible = "false";
+    }
+
+    function clearTransportFailureTimer() {
+      if (transportFailureTimer !== null) {
+        window.clearTimeout(transportFailureTimer);
+        transportFailureTimer = null;
+      }
+    }
+
+    function failConversation(message) {
+      if (isStopping) return;
+      showError(message);
+      stopConversation({ preserveError: true });
+    }
+
+    function scheduleTransportFailure(pc) {
+      clearTransportFailureTimer();
+      transportFailureTimer = window.setTimeout(() => {
+        transportFailureTimer = null;
+        if (peerConnection === pc && pc.connectionState === "disconnected") {
+          failConversation(`WebRTC ${pc.connectionState}`);
+        }
+      }, 3000);
     }
 
     function clearEmptyState(container) {
@@ -726,14 +752,14 @@
       card.result.textContent = formatJson(output);
     }
 
-    function sendRealtimeEvent(event) {
-      if (!dataChannel || dataChannel.readyState !== "open") {
+    function sendRealtimeEvent(event, channel = dataChannel) {
+      if (!channel || channel.readyState !== "open") {
         throw new Error("Realtime data channel is not open");
       }
-      dataChannel.send(JSON.stringify(event));
+      channel.send(JSON.stringify(event));
     }
 
-    async function executeFunctionCall(item) {
+    async function executeFunctionCall(item, sessionContext) {
       const callId = item.call_id;
       if (!callId || handledCallIds.has(callId)) return;
       handledCallIds.add(callId);
@@ -752,6 +778,7 @@
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
+            session_id: sessionContext.sessionId,
             call_id: callId,
             name: item.name,
             arguments: item.arguments || "{}",
@@ -773,6 +800,17 @@
         };
       }
 
+      if (
+        peerConnection !== sessionContext.pc ||
+        dataChannel !== sessionContext.dc ||
+        openAIRealtimeSessionId !== sessionContext.sessionId
+      ) {
+        card.state.textContent = "discarded";
+        card.state.classList.add("error");
+        card.result.textContent = "Originating Realtime session ended before result delivery.";
+        return;
+      }
+
       updateExecutionCard(card, output);
       sendRealtimeEvent({
         type: "conversation.item.create",
@@ -781,15 +819,15 @@
           call_id: callId,
           output: JSON.stringify(output),
         },
-      });
-      sendRealtimeEvent({ type: "response.create" });
+      }, sessionContext.dc);
+      sendRealtimeEvent({ type: "response.create" }, sessionContext.dc);
 
       if (output.ok && output.result?.end_session) {
         disconnectAfterResponse = true;
       }
     }
 
-    async function handleRealtimeEvent(event) {
+    async function handleRealtimeEvent(event, sessionContext) {
       appendEvent(event);
 
       if (event.type === "conversation.item.input_audio_transcription.delta") {
@@ -821,14 +859,14 @@
           name: event.name,
           arguments: event.arguments,
           item_id: event.item_id,
-        });
+        }, sessionContext);
       } else if (event.type === "response.done") {
         const functionCalls = (event.response?.output || []).filter(
           (item) => item.type === "function_call"
         );
         if (functionCalls.length > 0) {
           for (const item of functionCalls) {
-            await executeFunctionCall(item);
+            await executeFunctionCall(item, sessionContext);
           }
         } else if (disconnectAfterResponse) {
           disconnectAfterResponse = false;
@@ -844,6 +882,7 @@
     async function startConversation() {
       clearError();
       resetTranscript();
+      openAIRealtimeSessionId = null;
       startButton.disabled = true;
       setStatus("connecting", "Requesting microphone");
 
@@ -859,6 +898,7 @@
         const pc = new RTCPeerConnection();
         peerConnection = pc;
         pc.ontrack = (event) => {
+          if (peerConnection !== pc) return;
           remoteAudio.srcObject = event.streams[0];
           remoteAudio.play().catch(() => {});
         };
@@ -866,26 +906,41 @@
           pc.addTrack(track, localStream);
         }
 
-        dataChannel = pc.createDataChannel("oai-events");
-        dataChannel.addEventListener("open", () => {
+        const dc = pc.createDataChannel("oai-events");
+        dataChannel = dc;
+        dc.addEventListener("open", () => {
+          if (dataChannel !== dc || peerConnection !== pc) return;
           setStatus("connected", "Connected — speak naturally");
         });
-        dataChannel.addEventListener("message", (message) => {
+        dc.addEventListener("message", (message) => {
+          if (dataChannel !== dc || peerConnection !== pc) return;
           try {
             const event = JSON.parse(message.data);
-            void handleRealtimeEvent(event);
+            void handleRealtimeEvent(event, { pc, dc, sessionId });
           } catch (error) {
             showError(`Could not parse a Realtime event: ${error.message}`);
           }
         });
-        dataChannel.addEventListener("close", () => {
-          if (peerConnection) setStatus("idle", "Disconnected");
+        dc.addEventListener("error", () => {
+          if (dataChannel === dc && peerConnection === pc) {
+            failConversation("Realtime data channel failed");
+          }
+        });
+        dc.addEventListener("close", () => {
+          if (!isStopping && dataChannel === dc && peerConnection === pc) {
+            failConversation("Realtime data channel closed unexpectedly");
+          }
         });
 
         pc.addEventListener("connectionstatechange", () => {
+          if (peerConnection !== pc) return;
           appendEvent({ type: "webrtc.connection_state", state: pc.connectionState });
-          if (["failed", "closed"].includes(pc.connectionState)) {
-            setStatus("error", `WebRTC ${pc.connectionState}`);
+          if (pc.connectionState === "failed") {
+            failConversation(`WebRTC ${pc.connectionState}`);
+          } else if (pc.connectionState === "disconnected") {
+            scheduleTransportFailure(pc);
+          } else {
+            clearTransportFailureTimer();
           }
         });
 
@@ -907,6 +962,11 @@
           throw new Error(detail || `Session gateway returned ${sdpResponse.status}`);
         }
 
+        const sessionId = sdpResponse.headers.get("X-OpenAI-Realtime-Session-ID");
+        if (!sessionId) {
+          throw new Error("Session gateway did not return an OpenAI Realtime session ID");
+        }
+        openAIRealtimeSessionId = sessionId;
         const answer = { type: "answer", sdp: await sdpResponse.text() };
         await pc.setRemoteDescription(answer);
         stopButton.disabled = false;
@@ -917,6 +977,9 @@
     }
 
     function stopConversation(options = {}) {
+      if (isStopping) return;
+      isStopping = true;
+      clearTransportFailureTimer();
       if (localStream) {
         for (const track of localStream.getTracks()) track.stop();
         localStream = null;
@@ -931,6 +994,7 @@
       }
       remoteAudio.pause();
       remoteAudio.srcObject = null;
+      openAIRealtimeSessionId = null;
       handledCallIds.clear();
       disconnectAfterResponse = false;
       startButton.disabled = false;
@@ -940,6 +1004,7 @@
         clearError();
         setStatus("idle", "Not connected");
       }
+      isStopping = false;
     }
 
     startButton.addEventListener("click", startConversation);

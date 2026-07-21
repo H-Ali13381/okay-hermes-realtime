@@ -11,8 +11,10 @@ This is a private, OpenAI-specific demo and prototype—not an OHV production in
 - server-side OpenAI Realtime session creation
 - six typed assistant capabilities
 - local allowlisted execution broker
+- per-session OpenAI `call_id` replay protection for tool execution
 - live execution-request and Realtime-event inspector
 - clean Stop behavior for microphone, data channel, and peer connection
+- guarded cleanup for failed, persistently disconnected, or unexpectedly closed transports
 
 The default model is `gpt-realtime-2.1-mini` with minimal reasoning, `marin`, audio output, semantic VAD with high eagerness, automatic responses, and interruption enabled.
 
@@ -81,7 +83,7 @@ The permanent API key:
 - never appears in tool schemas or execution results;
 - is redacted from upstream error responses.
 
-The execution broker rejects unknown capabilities, malformed JSON, extra fields, invalid enums, and bounded-value violations. It never evaluates model-generated code or shell commands.
+The execution broker rejects unknown capabilities, malformed JSON, extra fields, invalid enums, and bounded-value violations. After a successful SDP relay, the gateway issues a local OpenAI Realtime session ID that every execution request must return. Concurrent session attempts are generation-guarded, so a late completion cannot replace a newer scope. Within that active session, the gateway replays a serialized cached result for an identical OpenAI `call_id`, rejects reuse with a changed payload, and rejects new calls after a hard safety ceiling instead of evicting old results. It never evaluates model-generated code or shell commands.
 
 ## OpenAI-specific architecture
 
@@ -115,6 +117,7 @@ http://127.0.0.1:8501/_stcore/health
 ## Known limitations
 
 - Only OpenAI `gpt-realtime` is supported; there is deliberately no provider abstraction or fallback.
+- The local gateway intentionally permits one active OpenAI Realtime execution scope at a time; a newer successful session invalidates the older scope.
 - OpenAI performs intent recognition and chooses the tool in this Realtime mode.
 - Tool selection is probabilistic; the inspector is intended to make failures visible.
 - Side effects are mocks, so this does not yet prove Spotify, timers, or Hermes integration.

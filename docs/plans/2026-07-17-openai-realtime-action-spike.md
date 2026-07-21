@@ -131,6 +131,16 @@ The model is `gpt-realtime-2.1-mini` with `reasoning.effort=minimal`, audio outp
 6. In the browser, verify microphone permission, several conversational turns, interruption, at least one tool request in the inspector, matching execution output, spoken acknowledgement, and clean Stop behavior.
 7. Record any credential, account-tier, microphone, browser-policy, or provider-schema blocker precisely rather than claiming an unperformed live voice test.
 
+### Continuation verification — 2026-07-21
+
+- `uv run pytest -q`: 44 passed.
+- `uv run ruff check .`: passed.
+- `uv run python -m compileall -q src scripts`: passed.
+- Gateway and Streamlit health endpoints returned healthy responses.
+- An isolated Brave session using fake microphone input established a real OpenAI Realtime connection.
+- A text turn sent through the live Realtime data channel selected `assistant_get_current_time`; the local broker completed the Tokyo-time request, returned `function_call_output`, and the session continued without an error.
+- Stop returned the panel to `Not connected`, re-enabled Start, disabled Stop, and left no visible error.
+
 ## Continuation gates
 
 Before expanding the prototype:
