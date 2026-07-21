@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 type JsonPrimitive = str | int | float | bool | None
 type JsonValue = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
@@ -39,16 +41,27 @@ _CORRELATION_KEYS: frozenset[str] = frozenset(
     }
 )
 
-_SECRET_SUBSTRINGS: tuple[str, ...] = (
+_SECRET_KEY_NAMES: tuple[str, ...] = (
     "api_key",
     "authorization",
-    "bearer ",
-    "token",
+    "bearer",
     "password",
+    "token",
     "secret",
 )
 
-_SDP_KEYS: frozenset[str] = frozenset({"sdp", "offer_sdp", "answer_sdp", "local_sdp", "remote_sdp"})
+_BEARER_VALUE_RE = re.compile(
+    r"\bbearer\s+[A-Za-z0-9._~+/=-]{8,}",
+    re.IGNORECASE,
+)
+
+_SDP_KEYS: dict[str, str] = {
+    "sdp": "sdp_hash",
+    "offer_sdp": "offer_sdp_hash",
+    "answer_sdp": "answer_sdp_hash",
+    "local_sdp": "local_sdp_hash",
+    "remote_sdp": "remote_sdp_hash",
+}
 
 
 def _default_wall_clock() -> str:
@@ -61,7 +74,32 @@ def _sha256_hex(value: str) -> str:
 
 def _is_secret_key(key: str) -> bool:
     lowered = key.lower()
-    return any(fragment in lowered for fragment in _SECRET_SUBSTRINGS)
+    return lowered in _SECRET_KEY_NAMES or any(
+        lowered.endswith(f"_{fragment}") for fragment in _SECRET_KEY_NAMES
+    )
+
+
+def _is_bearer_secret(value: str) -> bool:
+    return bool(_BEARER_VALUE_RE.search(value))
+
+
+def _validate_json_value(value: JsonValue) -> None:
+    if isinstance(value, list):
+        for item in value:
+            _validate_json_value(item)
+        return
+
+    if isinstance(value, dict):
+        for item_key, item_value in value.items():
+            if not isinstance(item_key, str):
+                raise TypeError("all JSON object keys must be strings")
+            _validate_json_value(item_value)
+        return
+
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return
+
+    raise TypeError(f"unsupported runtime JSON value type: {type(value)!r}")
 
 
 def _sanitize_scalar(value: JsonValue) -> JsonValue:
@@ -69,6 +107,8 @@ def _sanitize_scalar(value: JsonValue) -> JsonValue:
         return _sanitize_dict(value)
     if isinstance(value, list):
         return [_sanitize_scalar(item) for item in value]
+    if isinstance(value, str) and _is_bearer_secret(value):
+        return "[REDACTED]"
     return value
 
 
@@ -78,7 +118,7 @@ def _sanitize_dict(value: dict[str, JsonValue], *, is_function_payload: bool = F
         lowered_key = key.lower()
 
         if lowered_key in _SDP_KEYS and isinstance(item, str):
-            output["sdp_hash"] = _sha256_hex(item)
+            output[_SDP_KEYS[lowered_key]] = _sha256_hex(item)
             continue
 
         if is_function_payload and _is_secret_key(lowered_key):
@@ -108,7 +148,11 @@ def sanitize_timing_data(data: dict[str, JsonValue]) -> dict[str, JsonValue]:
         lowered_key = key.lower()
 
         if lowered_key in _SDP_KEYS and isinstance(value, str):
-            sanitized["sdp_hash"] = _sha256_hex(value)
+            sanitized[_SDP_KEYS[lowered_key]] = _sha256_hex(value)
+            continue
+
+        if _is_secret_key(lowered_key) and lowered_key not in _CORRELATION_KEYS:
+            sanitized[key] = "[REDACTED]"
             continue
 
         if key in ("arguments", "result"):
@@ -148,12 +192,20 @@ class SessionTrace:
             raise ValueError("timing record monotonic_ns must be non-decreasing")
 
         payload = data or {}
+        if not isinstance(payload, dict):
+            raise TypeError("timing record payload must be a dict of JSON values")
+
+        for key, value in payload.items():
+            if not isinstance(key, str):
+                raise TypeError("timing record payload keys must be strings")
+            _validate_json_value(value)
+
         event = TimingEvent(
             name=name,
             monotonic_ns=monotonic_value,
             wall_time=wall_time_value,
             source=source,
-            data=dict(payload),
+            data=copy.deepcopy(payload),
         )
         self.events.append(event)
         return event
@@ -182,10 +234,5 @@ class SessionTrace:
 
     def write_jsonl(self, path: str | Path) -> None:
         path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(self.to_jsonl(), encoding="utf-8")
-
-
-def _load_json_lines(raw: str) -> list[dict[str, Any]]:
-    if not raw:
-        return []
-    return [json.loads(line) for line in raw.splitlines() if line]

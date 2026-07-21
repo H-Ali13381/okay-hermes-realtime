@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
@@ -138,3 +139,120 @@ def test_jsonl_serialization_excludes_secrets_and_raw_sdp_preserves_correlations
     assert data["arguments"]["query"] == "play jazz"
     assert data["result"]["status"] == "ok"
     assert data["execution_fingerprint"] == "a1b2c3d4"
+
+
+def test_jsonl_redacts_bearer_credentials_in_nested_string_values_case_insensitively() -> None:
+    trace = SessionTrace(session_id="timeline-session")
+
+    trace.record(
+        "function_call",
+        source="controller",
+        data={
+            "local_session_id": "timeline-session",
+            "payload": {
+                "raw": "Bearer live-secret",
+                "notes": ["ignore this", "bEaReR another-secret"],
+            },
+            "bearer": "top-secret-token",
+            "notes": "the bearer of light",
+        },
+    )
+
+    data = json.loads(trace.to_jsonl())["data"]
+
+    assert data["local_session_id"] == "timeline-session"
+    assert data["payload"]["raw"] == "[REDACTED]"
+    assert data["payload"]["notes"] == ["ignore this", "[REDACTED]"]
+    assert data["bearer"] == "[REDACTED]"
+    assert data["notes"] == "the bearer of light"
+    assert "live-secret" not in json.dumps(data)
+
+
+def test_record_copies_data_deeply_to_prevent_nested_mutation_leakage() -> None:
+    event_payload = {"nested": {"tokens": ["Bearer live-secret", "keep"]}}
+    trace = SessionTrace(session_id="timeline-session")
+
+    trace.record("function_call", source="controller", data=event_payload)
+    event_payload["nested"]["tokens"][0] = "changed"
+
+    data = json.loads(trace.to_jsonl())["data"]
+
+    assert data["nested"] == {"tokens": ["[REDACTED]", "keep"]}
+
+
+@pytest.mark.parametrize(
+    "runtime_value",
+    [
+        {"tuple": (1, 2, 3)},
+        {"set": {"a", "b"}},
+        {"bytes": b"raw-bytes"},
+        {"custom": object()},
+    ],
+)
+def test_record_rejects_non_json_runtime_values(runtime_value: dict[str, object]) -> None:
+    trace = SessionTrace(session_id="timeline-session")
+
+    with pytest.raises((TypeError, ValueError), match=r"unsupported|not JSON|json"):
+        trace.record("bad_payload", source="controller", data=runtime_value)
+
+
+def test_record_accepts_recursive_json_values() -> None:
+    trace = SessionTrace(session_id="timeline-session")
+
+    trace.record(
+        "json_payload",
+        source="controller",
+        data={
+            "level": {
+                "name": "ok",
+                "flags": [True, False, None],
+                "counts": [1, 2, 3],
+            }
+        },
+    )
+
+    data = json.loads(trace.to_jsonl())["data"]
+
+    assert data["level"]["name"] == "ok"
+    assert data["level"]["flags"] == [True, False, None]
+
+
+def test_record_generates_distinct_sdp_hash_fields_for_each_variant() -> None:
+    trace = SessionTrace(session_id="timeline-session")
+
+    trace.record(
+        "sdp_fields",
+        source="controller",
+        data={
+            "sdp": "v=0\no=sdp",
+            "offer_sdp": "v=0\no=offer",
+            "answer_sdp": "v=0\no=answer",
+            "local_sdp": "v=0\no=local",
+            "remote_sdp": "v=0\no=remote",
+        },
+    )
+
+    data = json.loads(trace.to_jsonl())["data"]
+
+    assert data == {
+        "sdp_hash": hashlib.sha256(b"v=0\no=sdp").hexdigest(),
+        "offer_sdp_hash": hashlib.sha256(b"v=0\no=offer").hexdigest(),
+        "answer_sdp_hash": hashlib.sha256(b"v=0\no=answer").hexdigest(),
+        "local_sdp_hash": hashlib.sha256(b"v=0\no=local").hexdigest(),
+        "remote_sdp_hash": hashlib.sha256(b"v=0\no=remote").hexdigest(),
+    }
+
+
+def test_write_jsonl_creates_parent_directories(tmp_path: Path) -> None:
+    trace = SessionTrace(session_id="timeline-session")
+    trace.record("wake_detected", source="wake", data={"openai_request_id": "req-id"})
+
+    output = tmp_path / "levels" / "nested" / "events.jsonl"
+
+    trace.write_jsonl(output)
+
+    assert output.exists()
+    assert output.parent.exists()
+
+    loaded = json.loads(trace.to_jsonl_lines()[0])
+    assert loaded["session_id"] == "timeline-session"
