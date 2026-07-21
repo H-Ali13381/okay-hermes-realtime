@@ -142,6 +142,8 @@ class SessionTrace:
 
 `SessionTrace.record()` must accept an injected monotonic/wall clock for deterministic tests, reject timestamps that move backwards, and serialize one JSON object per line without secret material.
 
+Where available, timing records must retain stable correlation fields—not payload secrets—including local session ID, OpenAI request ID, provider call ID, `event_id`, `response.id`, conversation item ID, peer-connection state, and data-channel state. Record hashes rather than raw SDP. Function arguments/results are sanitized before persistence; the execution registry may retain only the canonical request fingerprint needed for replay protection.
+
 **Step 1: Write failing tests**
 
 Cover:
@@ -217,6 +219,8 @@ Assert:
 - no Streamlit iframe or Streamlit import remains;
 - permanent OpenAI credentials do not appear in page assets;
 - existing `getUserMedia`, `RTCPeerConnection`, cleanup, stale-session, and transcript contracts remain represented in `voice.js`.
+
+The page must publish sanitized control markers for peer-connection transitions, data-channel transitions, SDP offer creation, SDP answer application, and transport failure. These markers feed the controller trace; raw SDP never crosses the telemetry protocol.
 
 **Step 2: Verify red**
 
@@ -810,14 +814,16 @@ git commit -m "feat: unify voice session teardown"
 
 - Binary and log labels use `okay-hermes-realtime-*`.
 - No default `~/.hermes` config or OHV Python module.
-- Model path and handler command are explicit command-line arguments.
+- Model path, handler executable, and handler argv are explicit command-line arguments.
 - Capture-health path belongs to `~/.local/state/okay-hermes-realtime/` or an explicit argument.
 - Default no-handler behavior prints activation JSON for direct testing.
+- Handler launch uses a pipe plus `fork`/`execve` or `posix_spawn`; it never passes user/config text through `/bin/sh -c`.
+- The build resolves ONNX Runtime from explicit `ONNXRUNTIME_ROOT` or the replacement installation environment, installs its shared library beside the replacement binary, and links with an `$ORIGIN`-relative rpath. It never depends on the Hermes Agent or OHV venv at runtime.
 - Preserve Apache-2.0 provenance in `THIRD_PARTY_NOTICES.md`.
 
 **Step 1: Port architecture/build tests first**
 
-Test callback boundaries, worker inference, health writes, CLI parsing, help output, self-test, and successful native compilation.
+Test callback boundaries, worker inference, health writes, CLI parsing, exact handler argv, absence of shell dispatch, help output, self-test, shared-library resolution, and successful native compilation.
 
 **Step 2: Verify red**
 
@@ -876,7 +882,9 @@ Make the project installable before writing the units:
 - replace `[tool.uv] package = false` with package mode;
 - expose `okay-hermes-realtime-controller = realtime_action_spike.service:main` and `okay-hermes-realtime-activation = realtime_action_spike.activation_handler:main`;
 - create a dedicated venv at `~/.local/share/okay-hermes-realtime/venv` and install this repository into it;
-- point both systemd `ExecStart` and the listener handler command at executables in that dedicated venv, never the OHV or Hermes Agent venv.
+- install the native listener's ONNX Runtime dependency into or from an explicitly configured replacement-owned location, then copy the required shared object beside the installed listener binary;
+- install native binaries and private libraries under `~/.local/lib/okay-hermes-realtime/`, with only user-facing launchers in `~/.local/bin/`;
+- point both systemd `ExecStart` and the listener handler executable/argv at replacement-owned paths, never the OHV or Hermes Agent venv.
 
 **Step 1: Write failing service/installer contract tests**
 
