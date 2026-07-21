@@ -27,10 +27,17 @@ def render() -> None:
     st.markdown(
         """
         <style>
+          :root {
+            --realtime-panel-height: clamp(620px, calc(100vh - 8rem), 1000px);
+          }
           .stApp { background: #101113; }
-          [data-testid="stAppViewContainer"] > .main .block-container {
-            max-width: 1480px;
-            padding: 0.75rem 1rem 1rem;
+          [data-testid="stMainBlockContainer"] {
+            max-width: none;
+            padding: 0.75rem clamp(0.75rem, 4vw, 5rem) 1rem;
+          }
+          [data-testid="stElementContainer"]:has(> iframe[data-testid="stIFrame"]),
+          iframe[data-testid="stIFrame"] {
+            height: var(--realtime-panel-height) !important;
           }
           [data-testid="stHeader"], footer { display: none; }
         </style>
@@ -43,7 +50,7 @@ def render() -> None:
             "The gateway has no OpenAI API key yet. Add OPENAI_API_KEY to .env, then restart."
         )
 
-    st.iframe(panel, width="stretch", height=870, tab_index=0)
+    st.iframe(panel, width="stretch", height=720, tab_index=0)
 
 
 if __name__ == "__main__":

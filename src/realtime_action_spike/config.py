@@ -80,6 +80,7 @@ def build_realtime_session(settings: Settings) -> dict[str, Any]:
         "reasoning": {"effort": settings.realtime_reasoning_effort},
         "audio": {
             "input": {
+                "transcription": {"model": "gpt-4o-mini-transcribe"},
                 "turn_detection": {
                     "type": "semantic_vad",
                     "eagerness": "high",

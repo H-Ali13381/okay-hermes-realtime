@@ -38,6 +38,9 @@ def test_session_configuration_uses_fast_natural_voice_defaults() -> None:
         "create_response": True,
         "interrupt_response": True,
     }
+    assert session["audio"]["input"]["transcription"] == {
+        "model": "gpt-4o-mini-transcribe"
+    }
     assert session["tool_choice"] == "auto"
     assert len(session["tools"]) == 6
     assert "Do not claim an action succeeded before its tool result" in session["instructions"]

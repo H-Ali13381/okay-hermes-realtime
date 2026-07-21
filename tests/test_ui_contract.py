@@ -18,6 +18,7 @@ def test_panel_has_persistent_conversation_controls_and_inspectors() -> None:
     assert "Start conversation" in panel
     assert 'id="stop-button"' in panel
     assert 'id="connection-status"' in panel
+    assert 'id="transcript-list"' in panel
     assert 'id="execution-list"' in panel
     assert 'id="event-list"' in panel
 
@@ -50,6 +51,28 @@ def test_panel_executes_and_returns_realtime_function_calls() -> None:
     assert 'type: "response.create"' in panel
     assert "call_id" in panel
     assert "arguments" in panel
+
+
+def test_panel_renders_user_and_assistant_transcription_events() -> None:
+    panel = read_panel()
+
+    assert 'event.type === "conversation.item.input_audio_transcription.delta"' in panel
+    assert 'event.type === "conversation.item.input_audio_transcription.completed"' in panel
+    assert 'event.type === "conversation.item.input_audio_transcription.failed"' in panel
+    assert 'event.type === "response.output_audio_transcript.delta"' in panel
+    assert 'event.type === "response.output_audio_transcript.done"' in panel
+    assert "transcriptTurns" in panel
+
+
+def test_panel_and_streamlit_iframe_use_viewport_responsive_height() -> None:
+    panel = read_panel()
+    app = APP_PATH.read_text(encoding="utf-8")
+
+    assert "height: calc(100dvh - 4px)" in panel
+    assert "min-height: 840px" not in panel
+    assert "min-height: 760px" not in panel
+    assert "--realtime-panel-height: clamp(" in app
+    assert 'height="stretch"' not in app
 
 
 def test_panel_cleans_up_microphone_data_channel_and_peer_connection() -> None:

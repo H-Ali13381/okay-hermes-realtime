@@ -27,7 +27,8 @@
 
     html, body {
       margin: 0;
-      min-height: 100%;
+      height: 100%;
+      overflow: hidden;
       background: var(--bg);
       color: var(--text);
     }
@@ -37,7 +38,10 @@
     button { font: inherit; }
 
     .shell {
-      min-height: 840px;
+      width: min(100%, 1560px);
+      height: calc(100dvh - 4px);
+      min-height: 0;
+      margin: 0 auto;
       display: grid;
       grid-template-rows: auto 1fr;
       gap: 14px;
@@ -141,7 +145,7 @@
     .voice-card {
       display: grid;
       grid-template-rows: 1fr auto;
-      min-height: 760px;
+      min-height: 0;
     }
 
     .voice-stage {
@@ -262,9 +266,9 @@
     .button:disabled { cursor: not-allowed; opacity: 0.38; }
 
     .inspector {
-      min-height: 760px;
+      min-height: 0;
       display: grid;
-      grid-template-rows: minmax(310px, 0.9fr) minmax(350px, 1.1fr);
+      grid-template-rows: repeat(3, minmax(150px, 1fr));
     }
 
     .inspector-section {
@@ -313,6 +317,34 @@
       font-size: 12px;
       text-align: center;
     }
+
+    .transcript-turn {
+      display: grid;
+      grid-template-columns: 70px minmax(0, 1fr);
+      gap: 10px;
+      padding: 10px 4px;
+      border-bottom: 1px solid #24282d;
+    }
+
+    .transcript-turn:last-child { border-bottom: 0; }
+
+    .transcript-speaker {
+      color: var(--quiet);
+      font-size: 11px;
+      font-weight: 650;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .transcript-text {
+      margin: 0;
+      color: #d8dadd;
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }
+
+    .transcript-turn[data-error="true"] .transcript-text { color: var(--danger); }
 
     .execution {
       margin-bottom: 10px;
@@ -403,9 +435,20 @@
     .error-banner[data-visible="true"] { display: block; }
 
     @media (max-width: 850px) {
+      html, body { height: auto; overflow: auto; }
       .workspace { grid-template-columns: 1fr; }
-      .voice-card, .inspector { min-height: 650px; }
-      .shell { min-height: auto; }
+      .voice-card { min-height: 560px; }
+      .inspector { min-height: 720px; }
+      .shell { height: auto; min-height: 0; }
+    }
+
+    @media (max-height: 720px) and (min-width: 851px) {
+      .voice-stage { gap: 14px; padding: 18px 22px; }
+      .orb-wrap { width: 112px; height: 112px; }
+      .orb { width: 76px; height: 76px; }
+      .voice-copy h2 { font-size: 19px; }
+      .examples { gap: 6px; }
+      .example { padding: 7px 9px; }
     }
   </style>
 </head>
@@ -455,6 +498,16 @@
       <aside class="card inspector" aria-label="Realtime inspector">
         <section class="inspector-section">
           <div class="section-head">
+            <h2>Conversation</h2>
+            <span>live transcript</span>
+          </div>
+          <div id="transcript-list" class="scroll-list" aria-live="polite">
+            <div class="empty">Your words and the assistant’s spoken replies will appear here.</div>
+          </div>
+        </section>
+
+        <section class="inspector-section">
+          <div class="section-head">
             <h2>Execution requests</h2>
             <span id="execution-count">0 received</span>
           </div>
@@ -488,6 +541,7 @@
     const connectionStatus = document.getElementById("connection-status");
     const statusText = document.getElementById("status-text");
     const errorBanner = document.getElementById("error-banner");
+    const transcriptList = document.getElementById("transcript-list");
     const executionList = document.getElementById("execution-list");
     const executionCount = document.getElementById("execution-count");
     const eventList = document.getElementById("event-list");
@@ -499,6 +553,7 @@
     let receivedExecutionCount = 0;
     let disconnectAfterResponse = false;
     const handledCallIds = new Set();
+    const transcriptTurns = new Map();
 
     function setStatus(state, text) {
       connectionStatus.dataset.state = state;
@@ -522,6 +577,56 @@
     function clearEmptyState(container) {
       const empty = container.querySelector(".empty");
       if (empty) empty.remove();
+    }
+
+    function ensureTranscriptTurn(role, itemId) {
+      const key = `${role}:${itemId}`;
+      const existing = transcriptTurns.get(key);
+      if (existing) return existing;
+
+      clearEmptyState(transcriptList);
+      const row = document.createElement("article");
+      row.className = "transcript-turn";
+      row.dataset.key = key;
+      row.dataset.error = "false";
+
+      const speaker = document.createElement("div");
+      speaker.className = "transcript-speaker";
+      speaker.textContent = role === "user" ? "You" : "Assistant";
+
+      const text = document.createElement("p");
+      text.className = "transcript-text";
+      text.textContent = role === "user" ? "Transcribing…" : "Speaking…";
+      row.append(speaker, text);
+      transcriptList.append(row);
+
+      const turn = { row, text, value: "" };
+      transcriptTurns.set(key, turn);
+      transcriptList.scrollTop = transcriptList.scrollHeight;
+
+      while (transcriptList.children.length > 40) {
+        const oldest = transcriptList.firstElementChild;
+        transcriptTurns.delete(oldest.dataset.key);
+        oldest.remove();
+      }
+      return turn;
+    }
+
+    function updateTranscriptTurn(role, itemId, value, options = {}) {
+      if (!itemId) return;
+      const turn = ensureTranscriptTurn(role, itemId);
+      turn.value = options.append ? `${turn.value}${value || ""}` : value || "";
+      turn.text.textContent = turn.value || (role === "user" ? "No speech detected." : "No transcript received.");
+      turn.row.dataset.error = String(Boolean(options.error));
+      transcriptList.scrollTop = transcriptList.scrollHeight;
+    }
+
+    function resetTranscript() {
+      transcriptTurns.clear();
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "Your words and the assistant’s spoken replies will appear here.";
+      transcriptList.replaceChildren(empty);
     }
 
     function formatJson(value) {
@@ -687,9 +792,25 @@
     async function handleRealtimeEvent(event) {
       appendEvent(event);
 
-      if (event.type === "input_audio_buffer.speech_started") {
+      if (event.type === "conversation.item.input_audio_transcription.delta") {
+        updateTranscriptTurn("user", event.item_id, event.delta, { append: true });
+      } else if (event.type === "conversation.item.input_audio_transcription.completed") {
+        updateTranscriptTurn("user", event.item_id, event.transcript);
+      } else if (event.type === "conversation.item.input_audio_transcription.failed") {
+        updateTranscriptTurn(
+          "user",
+          event.item_id,
+          `Transcription failed: ${event.error?.message || "unknown error"}`,
+          { error: true }
+        );
+      } else if (event.type === "response.output_audio_transcript.delta") {
+        updateTranscriptTurn("assistant", event.item_id, event.delta, { append: true });
+      } else if (event.type === "response.output_audio_transcript.done") {
+        updateTranscriptTurn("assistant", event.item_id, event.transcript);
+      } else if (event.type === "input_audio_buffer.speech_started") {
         setStatus("listening", "Listening");
       } else if (event.type === "input_audio_buffer.speech_stopped") {
+        ensureTranscriptTurn("user", event.item_id);
         setStatus("thinking", "Thinking");
       } else if (event.type === "response.created") {
         setStatus("responding", "Responding");
@@ -722,6 +843,7 @@
 
     async function startConversation() {
       clearError();
+      resetTranscript();
       startButton.disabled = true;
       setStatus("connecting", "Requesting microphone");
 
