@@ -1,8 +1,8 @@
 # OpenAI Realtime Action Spike
 
-A local feasibility test for one concrete question: can OpenAI Realtime hold a natural full-duplex voice conversation while reliably emitting typed execution requests that a local assistant controls?
+A local feasibility test for one concrete question: can OpenAI `gpt-realtime` hold a natural full-duplex voice conversation while reliably emitting typed execution requests that a local assistant controls?
 
-This is a private spike, not an OHV production integration. Tool side effects are simulated except for reading the current time.
+This is a private, OpenAI-specific demo and prototype—not an OHV production integration or a multi-provider voice layer. Tool side effects are simulated except for reading the current time.
 
 ## What it contains
 
@@ -15,6 +15,14 @@ This is a private spike, not an OHV production integration. Tool side effects ar
 - clean Stop behavior for microphone, data channel, and peer connection
 
 The default model is `gpt-realtime-2.1-mini` with minimal reasoning, `marin`, audio output, semantic VAD with high eagerness, automatic responses, and interruption enabled.
+
+## Provider scope
+
+This prototype supports only OpenAI `gpt-realtime`. Continued work must preserve the provider's native WebRTC, session, event, transcription, interruption, and function-call semantics rather than forcing them through a generic realtime-provider contract.
+
+If another realtime provider is explored later, it will be implemented as a separate provider-specific code path on its own branch. It will not share a `RealtimeProvider` adapter, normalized event model, transport manager, or provider-switching conditionals with this implementation. Stable local services such as authorization and capability execution may remain external dependencies, but all provider-session integration stays isolated.
+
+See [`docs/design/2026-07-21-gpt-realtime-prototype-boundary.md`](docs/design/2026-07-21-gpt-realtime-prototype-boundary.md) for the accepted architecture decision.
 
 ## Setup
 
@@ -75,7 +83,7 @@ The permanent API key:
 
 The execution broker rejects unknown capabilities, malformed JSON, extra fields, invalid enums, and bounded-value violations. It never evaluates model-generated code or shell commands.
 
-## Architecture
+## OpenAI-specific architecture
 
 ```text
 Browser / Streamlit iframe
@@ -106,6 +114,7 @@ http://127.0.0.1:8501/_stcore/health
 
 ## Known limitations
 
+- Only OpenAI `gpt-realtime` is supported; there is deliberately no provider abstraction or fallback.
 - OpenAI performs intent recognition and chooses the tool in this Realtime mode.
 - Tool selection is probabilistic; the inspector is intended to make failures visible.
 - Side effects are mocks, so this does not yet prove Spotify, timers, or Hermes integration.

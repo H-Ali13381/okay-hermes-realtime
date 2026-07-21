@@ -8,11 +8,31 @@
 
 **Tech Stack:** Python 3.12, uv, Streamlit, FastAPI, httpx, Pydantic, browser WebRTC/JavaScript, pytest, Ruff.
 
+**Status:** Working demo/prototype. Initial implementation is complete; continued work follows the accepted provider-boundary decision recorded on 2026-07-21.
+
 ---
+
+## Accepted continuation decision — 2026-07-21
+
+The prototype will support only OpenAI `gpt-realtime`. This is both a focused demo and an evolving prototype; fidelity to OpenAI's native contract takes priority over provider interchangeability.
+
+Continued implementation rules:
+
+1. Perform continued `gpt-realtime` work on a dedicated branch, separate from shared/default OHV integration work.
+2. Keep WebRTC negotiation, session configuration, OpenAI event handling, transcription, interruption, function-call extraction, `function_call_output`, and response continuation in an explicitly OpenAI-specific path.
+3. Do not introduce a shared realtime-provider adapter, base client, normalized provider event bus, common session manager, or provider-selection conditionals.
+4. Do not rename concrete OpenAI concepts into generic names merely to imply future portability.
+5. If another provider is considered later, build and test its complete lifecycle on its own branch and in its own parallel code path.
+6. Provider paths may call stable external OHV services for authorization, local capability execution, logging, and policy. Those service boundaries do not make provider transport or conversation logic shared.
+7. Select the provider-specific lifecycle before opening the microphone or creating a remote session. Do not switch providers inside an active conversation.
+
+This decision deliberately rejects an adapter architecture. The provider APIs differ in transport, session state, reconnection, event ordering, interruption, transcripts, and tool continuation; hiding those differences would make the prototype harder to understand and debug.
+
+Design details and acceptance criteria: [`../design/2026-07-21-gpt-realtime-prototype-boundary.md`](../design/2026-07-21-gpt-realtime-prototype-boundary.md).
 
 ## Scope and safety
 
-This is a feasibility spike, not an OHV production integration.
+This is an OpenAI `gpt-realtime` feasibility spike, demo, and prototype—not an OHV production integration or a multi-provider abstraction.
 
 Initial capabilities are drawn from the OHV router contract:
 
@@ -110,3 +130,21 @@ The model is `gpt-realtime-2.1-mini` with `reasoning.effort=minimal`, audio outp
 5. If `OPENAI_API_KEY` is available, submit a synthetic SDP/API session request or connect in the browser and confirm a provider session is created. Never print the key.
 6. In the browser, verify microphone permission, several conversational turns, interruption, at least one tool request in the inspector, matching execution output, spoken acknowledgement, and clean Stop behavior.
 7. Record any credential, account-tier, microphone, browser-policy, or provider-schema blocker precisely rather than claiming an unperformed live voice test.
+
+## Continuation gates
+
+Before expanding the prototype:
+
+1. Finish and verify the current responsive-layout and transcription checkpoint without mixing it with architecture refactoring.
+2. Begin subsequent prototype work on the dedicated `gpt-realtime` branch from a clean, verified baseline.
+3. Preserve the existing OpenAI-specific flow: browser WebRTC → `/v1/realtime/calls` → OpenAI events → local allowlisted execution → `function_call_output` → `response.create`.
+4. Add production-like actions one at a time, with focused broker, gateway, UI-contract, and live-provider verification.
+5. Keep any future provider experiment out of this module, its tests, and its branch.
+
+The prototype remains acceptable only while:
+
+- no generic provider adapter or base class exists;
+- no provider dropdown or runtime provider switch exists;
+- OpenAI event names and lifecycle transitions remain directly inspectable;
+- local authorization and execution remain outside model control;
+- removing a future provider path would require no changes to this OpenAI path.
