@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import re
 import time
 from collections.abc import Callable
@@ -41,13 +42,22 @@ _CORRELATION_KEYS: frozenset[str] = frozenset(
     }
 )
 
-_SECRET_KEY_NAMES: tuple[str, ...] = (
-    "api_key",
-    "authorization",
-    "bearer",
-    "password",
-    "token",
-    "secret",
+_CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+_SECRET_KEY_SHAPES: tuple[tuple[str, ...], ...] = (
+    ("api", "key"),
+    ("authorization",),
+    ("password",),
+    ("secret",),
+    ("bearer",),
+    ("token",),
+    ("bearer", "credential"),
+    ("token", "credential"),
+)
+
+_SAFE_KEY_SHAPES: tuple[tuple[str, ...], ...] = (
+    ("token", "count"),
+    ("secretary", "note"),
 )
 
 _BEARER_VALUE_RE = re.compile(
@@ -72,11 +82,26 @@ def _sha256_hex(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _key_components(key: str) -> tuple[str, ...]:
+    delimited_key = _CAMEL_CASE_BOUNDARY_RE.sub(" ", key)
+    normalized_key = re.sub(r"[_-]", " ", delimited_key)
+    return tuple(part for part in normalized_key.lower().split() if part)
+
+
 def _is_secret_key(key: str) -> bool:
-    lowered = key.lower()
-    return lowered in _SECRET_KEY_NAMES or any(
-        lowered.endswith(f"_{fragment}") for fragment in _SECRET_KEY_NAMES
-    )
+    key_components = _key_components(key)
+    if key_components in _SAFE_KEY_SHAPES:
+        return False
+
+    for shape in _SECRET_KEY_SHAPES:
+        shape_len = len(shape)
+        if any(
+            key_components[index : index + shape_len] == shape
+            for index in range(len(key_components) - shape_len + 1)
+        ):
+            return True
+
+    return False
 
 
 def _is_bearer_secret(value: str) -> bool:
@@ -95,6 +120,9 @@ def _validate_json_value(value: JsonValue) -> None:
                 raise TypeError("all JSON object keys must be strings")
             _validate_json_value(item_value)
         return
+
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("finite JSON numbers are required")
 
     if isinstance(value, (str, int, float, bool)) or value is None:
         return
@@ -121,10 +149,15 @@ def _sanitize_dict(value: dict[str, JsonValue], *, is_function_payload: bool = F
             output[_SDP_KEYS[lowered_key]] = _sha256_hex(item)
             continue
 
-        if is_function_payload and _is_secret_key(lowered_key):
+        if lowered_key in _CORRELATION_KEYS:
+            output[key] = _sanitize_scalar(item)
             continue
 
-        if _is_secret_key(key) and not (is_function_payload or lowered_key in _CORRELATION_KEYS):
+        if is_function_payload and _is_secret_key(key):
+            output[key] = "[REDACTED]"
+            continue
+
+        if _is_secret_key(key):
             output[key] = "[REDACTED]"
             continue
 
@@ -151,7 +184,11 @@ def sanitize_timing_data(data: dict[str, JsonValue]) -> dict[str, JsonValue]:
             sanitized[_SDP_KEYS[lowered_key]] = _sha256_hex(value)
             continue
 
-        if _is_secret_key(lowered_key) and lowered_key not in _CORRELATION_KEYS:
+        if lowered_key in _CORRELATION_KEYS:
+            sanitized[key] = _sanitize_scalar(value)
+            continue
+
+        if _is_secret_key(key):
             sanitized[key] = "[REDACTED]"
             continue
 

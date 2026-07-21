@@ -141,6 +141,28 @@ def test_jsonl_serialization_excludes_secrets_and_raw_sdp_preserves_correlations
     assert data["execution_fingerprint"] == "a1b2c3d4"
 
 
+@pytest.mark.parametrize(
+    "raw_value",
+    [float("nan"), float("inf"), float("-inf")],
+)
+def test_record_rejects_non_finite_json_numbers(raw_value: float) -> None:
+    trace = SessionTrace(session_id="timeline-session")
+
+    with pytest.raises(ValueError, match=r"finite JSON numbers"):
+        trace.record("function_call", source="controller", data={"metric": raw_value})
+
+
+def test_record_accepts_finite_numbers() -> None:
+    trace = SessionTrace(session_id="timeline-session")
+
+    trace.record("function_call", source="controller", data={"metric": 42.5, "ratio": 0.0})
+
+    data = json.loads(trace.to_jsonl())["data"]
+
+    assert data["metric"] == 42.5
+    assert data["ratio"] == 0.0
+
+
 def test_jsonl_redacts_bearer_credentials_in_nested_string_values_case_insensitively() -> None:
     trace = SessionTrace(session_id="timeline-session")
 
@@ -166,6 +188,50 @@ def test_jsonl_redacts_bearer_credentials_in_nested_string_values_case_insensiti
     assert data["bearer"] == "[REDACTED]"
     assert data["notes"] == "the bearer of light"
     assert "live-secret" not in json.dumps(data)
+
+
+@pytest.mark.parametrize(
+    "secret_key",
+    ["client_secret_value", "openai_api_key_backup", "authorization_header"],
+)
+def test_jsonl_redacts_compound_nested_secret_keys(secret_key: str) -> None:
+    trace = SessionTrace(session_id="timeline-session")
+
+    trace.record(
+        "function_call",
+        source="controller",
+        data={
+            "local_session_id": "timeline-session",
+            "metadata": {
+                secret_key: "must-not-leak",
+            },
+        },
+    )
+
+    data = json.loads(trace.to_jsonl())["data"]
+
+    assert data["metadata"][secret_key] == "[REDACTED]"
+    assert "must-not-leak" not in json.dumps(data)
+
+
+def test_safe_nested_control_fields_are_not_redacted() -> None:
+    trace = SessionTrace(session_id="timeline-session")
+
+    trace.record(
+        "function_call",
+        source="controller",
+        data={
+            "metadata": {
+                "token_count": 4,
+                "secretary_note": "approved",
+            },
+        },
+    )
+
+    data = json.loads(trace.to_jsonl())["data"]
+
+    assert data["metadata"]["token_count"] == 4
+    assert data["metadata"]["secretary_note"] == "approved"
 
 
 def test_record_copies_data_deeply_to_prevent_nested_mutation_leakage() -> None:
