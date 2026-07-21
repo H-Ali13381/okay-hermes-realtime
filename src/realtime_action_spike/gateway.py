@@ -6,12 +6,12 @@ import hashlib
 import json
 import secrets
 from contextlib import suppress
+from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from .capabilities import (
@@ -100,20 +100,24 @@ def create_app(
     active_session_id: str | None = None
     latest_session_attempt = 0
     execution_results_by_call_id: dict[str, tuple[str, int, str]] = {}
+    web_root = Path(__file__).resolve().parent / "web"
+    index_html = web_root / "index.html"
+    voice_css = web_root / "voice.css"
+    voice_js = web_root / "voice.js"
 
     app = FastAPI(title="OpenAI Realtime Action Spike Gateway", version="0.1.0")
-    allowed_origins = [
-        f"http://127.0.0.1:{settings.streamlit_port}",
-        f"http://localhost:{settings.streamlit_port}",
-    ]
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=allowed_origins,
-        allow_credentials=False,
-        allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Content-Type"],
-        expose_headers=["X-OpenAI-Request-ID", OPENAI_REALTIME_SESSION_HEADER],
-    )
+
+    @app.get("/voice", include_in_schema=False)
+    async def voice_page() -> FileResponse:
+        return FileResponse(index_html)
+
+    @app.get("/assets/{asset_name}", include_in_schema=False)
+    async def voice_asset(asset_name: str) -> Response:
+        if asset_name == "voice.css":
+            return FileResponse(voice_css, media_type="text/css")
+        if asset_name == "voice.js":
+            return FileResponse(voice_js, media_type="text/javascript")
+        return Response(status_code=404)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:

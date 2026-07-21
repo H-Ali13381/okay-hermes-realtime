@@ -42,8 +42,6 @@ class Settings(BaseModel):
     )
     gateway_host: str = "127.0.0.1"
     gateway_port: int = Field(default=8765, ge=1, le=65_535)
-    streamlit_host: str = "127.0.0.1"
-    streamlit_port: int = Field(default=8501, ge=1, le=65_535)
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -59,8 +57,6 @@ class Settings(BaseModel):
                 ),
                 "gateway_host": os.getenv("GATEWAY_HOST", "127.0.0.1"),
                 "gateway_port": os.getenv("GATEWAY_PORT", "8765"),
-                "streamlit_host": os.getenv("STREAMLIT_HOST", "127.0.0.1"),
-                "streamlit_port": os.getenv("STREAMLIT_PORT", "8501"),
             }
         )
 

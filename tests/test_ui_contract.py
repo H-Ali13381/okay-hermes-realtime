@@ -2,153 +2,139 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from fastapi.testclient import TestClient
+from pydantic import SecretStr
+
+from realtime_action_spike.config import Settings
+from realtime_action_spike.gateway import create_app
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-PANEL_PATH = PROJECT_ROOT / "src/realtime_action_spike/web/realtime_panel.html"
-APP_PATH = PROJECT_ROOT / "src/realtime_action_spike/streamlit_app.py"
+INDEX_PATH = PROJECT_ROOT / "src/realtime_action_spike/web/index.html"
+CSS_PATH = PROJECT_ROOT / "src/realtime_action_spike/web/voice.css"
+JS_PATH = PROJECT_ROOT / "src/realtime_action_spike/web/voice.js"
 
 
-def read_panel() -> str:
-    return PANEL_PATH.read_text(encoding="utf-8")
+def _read(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
 
 
-def test_panel_has_persistent_conversation_controls_and_inspectors() -> None:
-    panel = read_panel()
-
-    assert 'id="start-button"' in panel
-    assert "Start conversation" in panel
-    assert 'id="stop-button"' in panel
-    assert 'id="connection-status"' in panel
-    assert 'id="transcript-list"' in panel
-    assert 'id="execution-list"' in panel
-    assert 'id="event-list"' in panel
+def _client() -> TestClient:
+    return TestClient(create_app(Settings(openai_api_key=SecretStr("test-secret-key"))))
 
 
-def test_panel_uses_browser_webrtc_and_server_sdp_relay() -> None:
-    panel = read_panel()
+def test_voice_route_serves_visible_html() -> None:
+    response = _client().get("/voice")
 
-    assert "new RTCPeerConnection()" in panel
-    assert "navigator.mediaDevices.getUserMedia" in panel
-    assert 'pc.createDataChannel("oai-events")' in panel
-    assert "pc.addTrack" in panel
-    assert "pc.createOffer()" in panel
-    assert "pc.setLocalDescription" in panel
-    assert "`${GATEWAY_ORIGIN}/session`" in panel
-    assert '"Content-Type": "application/sdp"' in panel
-    assert "pc.setRemoteDescription" in panel
-    assert "remoteAudio.srcObject" in panel
+    assert response.status_code == 200
+    assert response.text.startswith("<!doctype html>")
+    assert "Start conversation" in response.text
+    assert "data-testid" not in response.text
 
 
-def test_panel_executes_and_returns_realtime_function_calls() -> None:
-    panel = read_panel()
+def test_assets_routes_serve_voice_css_and_js() -> None:
+    client = _client()
 
-    assert 'event.type === "response.function_call_arguments.done"' in panel
-    assert 'event.type === "response.done"' in panel
-    assert 'item.type === "function_call"' in panel
-    assert "handledCallIds" in panel
-    assert "`${GATEWAY_ORIGIN}/execute`" in panel
-    assert 'type: "conversation.item.create"' in panel
-    assert 'type: "function_call_output"' in panel
-    assert 'type: "response.create"' in panel
-    assert "call_id" in panel
-    assert "arguments" in panel
+    css = client.get("/assets/voice.css")
+    js = client.get("/assets/voice.js")
 
+    assert css.status_code == 200
+    assert css.text
+    assert css.headers["content-type"].startswith("text/css")
 
-def test_panel_scopes_execution_to_the_active_openai_realtime_session() -> None:
-    panel = read_panel()
-
-    assert "let openAIRealtimeSessionId = null" in panel
-    assert 'sdpResponse.headers.get("X-OpenAI-Realtime-Session-ID")' in panel
-    assert "session_id: sessionContext.sessionId" in panel
-    assert "openAIRealtimeSessionId = null" in panel
+    assert js.status_code == 200
+    assert js.text
+    assert js.headers["content-type"].startswith(("text/javascript", "application/javascript"))
 
 
-def test_panel_renders_user_and_assistant_transcription_events() -> None:
-    panel = read_panel()
+def test_page_loads_static_assets_via_relative_routes() -> None:
+    response = _client().get("/voice")
+    html = response.text
 
-    assert 'event.type === "conversation.item.input_audio_transcription.delta"' in panel
-    assert 'event.type === "conversation.item.input_audio_transcription.completed"' in panel
-    assert 'event.type === "conversation.item.input_audio_transcription.failed"' in panel
-    assert 'event.type === "response.output_audio_transcript.delta"' in panel
-    assert 'event.type === "response.output_audio_transcript.done"' in panel
-    assert "transcriptTurns" in panel
+    assert '<link rel="stylesheet" href="/assets/voice.css"' in html
+    assert '<script src="/assets/voice.js" defer></script>' in html
 
 
-def test_panel_and_streamlit_iframe_use_viewport_responsive_height() -> None:
-    panel = read_panel()
-    app = APP_PATH.read_text(encoding="utf-8")
+def test_page_retains_dom_controls_and_panels() -> None:
+    html = _read(INDEX_PATH)
 
-    assert "height: calc(100dvh - 4px)" in panel
-    assert "min-height: 840px" not in panel
-    assert "min-height: 760px" not in panel
-    assert "--realtime-panel-height: clamp(" in app
-    assert 'height="stretch"' not in app
-
-
-def test_panel_cleans_up_microphone_data_channel_and_peer_connection() -> None:
-    panel = read_panel()
-
-    assert "track.stop()" in panel
-    assert "dataChannel.close()" in panel
-    assert "peerConnection.close()" in panel
-    assert "remoteAudio.srcObject = null" in panel
-    assert "beforeunload" in panel
+    assert 'id="connection-status"' in html
+    assert "id=\"transcript-list\"" in html
+    assert 'id="execution-list"' in html
+    assert 'id="execution-count"' in html
+    assert 'id="event-list"' in html
+    assert 'id="remote-audio"' in html
+    assert 'Start conversation' in html
+    assert 'Stop' in html
 
 
-def test_panel_cleans_up_failed_and_persistently_disconnected_webrtc() -> None:
-    panel = read_panel()
+def test_assets_are_split_files() -> None:
+    index_html = _read(INDEX_PATH)
+    script_js = _read(JS_PATH)
+    css = _read(CSS_PATH)
 
-    assert 'pc.connectionState === "failed"' in panel
-    assert 'pc.connectionState === "disconnected"' in panel
-    assert "scheduleTransportFailure" in panel
-    assert "clearTransportFailureTimer" in panel
-    assert 'failConversation(`WebRTC ${pc.connectionState}`)' in panel
-
-
-def test_panel_cleans_up_unexpected_realtime_data_channel_termination() -> None:
-    panel = read_panel()
-
-    assert 'dc.addEventListener("error"' in panel
-    assert 'dc.addEventListener("close"' in panel
-    assert 'failConversation("Realtime data channel failed")' in panel
-    assert 'failConversation("Realtime data channel closed unexpectedly")' in panel
-    assert "isStopping" in panel
+    assert "<style>" not in index_html
+    assert "<script>" not in index_html
+    assert "new RTCPeerConnection()" in script_js
+    assert "oai-events" in script_js
+    assert ".voice-card" in css
 
 
-def test_panel_ignores_lifecycle_events_from_replaced_webrtc_session() -> None:
-    panel = read_panel()
+def test_js_preserves_webrtc_relay_and_function_execution_paths() -> None:
+    script = _read(JS_PATH)
 
-    assert 'const dc = pc.createDataChannel("oai-events")' in panel
-    assert "if (dataChannel !== dc || peerConnection !== pc) return" in panel
-    assert "dataChannel === dc && peerConnection === pc" in panel
-    assert "if (peerConnection !== pc) return" in panel
-
-
-def test_panel_never_sends_stale_tool_output_into_a_replacement_session() -> None:
-    panel = read_panel()
-
-    assert "async function executeFunctionCall(item, sessionContext)" in panel
-    assert "session_id: sessionContext.sessionId" in panel
-    assert "peerConnection !== sessionContext.pc" in panel
-    assert "dataChannel !== sessionContext.dc" in panel
-    assert "openAIRealtimeSessionId !== sessionContext.sessionId" in panel
-    assert "handleRealtimeEvent(event, { pc, dc, sessionId })" in panel
+    assert "navigator.mediaDevices.getUserMedia" in script
+    assert "new RTCPeerConnection()" in script
+    assert 'pc.createDataChannel("oai-events")' in script
+    assert "pc.createOffer()" in script
+    assert "pc.setLocalDescription" in script
+    assert "pc.setRemoteDescription" in script
+    assert 'fetch("/session"' in script
+    assert 'headers: { "Content-Type": "application/sdp" }' in script
+    assert 'fetch("/execute"' in script
+    assert "conversation.item.create" in script
+    assert "function_call_output" in script
 
 
-def test_panel_never_embeds_permanent_openai_credentials() -> None:
-    panel = read_panel()
+def test_js_keeps_same_origin_and_session_state_guards() -> None:
+    script = _read(JS_PATH)
 
-    assert "OPENAI_API_KEY" not in panel
-    assert "api.openai.com" not in panel
-    assert "Bearer " not in panel
+    assert "GATEWAY_ORIGIN" not in script
+    assert "__GATEWAY_ORIGIN__" not in script
+    assert "peerConnection !== sessionContext.pc" in script
+    assert "dataChannel !== sessionContext.dc" in script
+    assert "openAIRealtimeSessionId !== sessionContext.sessionId" in script
+    assert "/session" in script
+    assert "/execute" in script
 
 
-def test_streamlit_app_embeds_the_panel_with_loopback_gateway_origin() -> None:
-    app = APP_PATH.read_text(encoding="utf-8")
+def test_js_has_sanitized_timing_markers() -> None:
+    script = _read(JS_PATH)
 
-    assert "st.set_page_config" in app
-    assert "st.iframe" in app
-    assert "components.html" not in app
-    assert "realtime_panel.html" in app
-    assert "__GATEWAY_ORIGIN__" in app
-    assert "settings.gateway_host" in app
-    assert "settings.gateway_port" in app
+    assert "function recordTiming" in script
+    assert "performance.now()" in script
+    for marker in [
+        "peer_connection_state",
+        "data_channel_state",
+        "sdp_offer_created",
+        "sdp_answer_applied",
+        "webrtc_transport_failure",
+    ]:
+        assert f'"{marker}"' in script
+
+    assert "event.type === \"timing\"" in script
+    assert "OPENAI_API_KEY" not in script
+    assert "api.openai.com" not in script
+    assert "Authorization" not in script
+    assert "Bearer " not in script
+
+
+def test_ui_contract_keeps_cleanup_guards() -> None:
+    script = _read(JS_PATH)
+
+    assert "track.stop()" in script
+    assert "dataChannel.close()" in script
+    assert "peerConnection.close()" in script
+    assert "remoteAudio.pause()" in script
+    assert "remoteAudio.srcObject = null" in script
+    assert "beforeunload" in script
+    assert "appendEvent({" in script

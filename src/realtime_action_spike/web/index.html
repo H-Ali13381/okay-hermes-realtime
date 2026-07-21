@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Realtime action test</title>
+  <link rel="stylesheet" href="/assets/voice.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="identity">
+        <div class="mark" aria-hidden="true">R</div>
+        <div>
+          <h1>Realtime action test</h1>
+          <p>Direct WebRTC conversation · server-authorized mock tools</p>
+        </div>
+      </div>
+      <div id="connection-status" class="status" data-state="idle" aria-live="polite">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="status-text">Not connected</span>
+      </div>
+    </header>
+
+    <section class="workspace">
+      <article id="voice-card" class="card voice-card" data-active="false">
+        <div class="voice-stage">
+          <div class="orb-wrap" aria-hidden="true"><div class="orb"></div></div>
+          <div class="voice-copy">
+            <h2>One tap, then speak naturally</h2>
+            <p>
+              The browser maintains a full-duplex voice session. Interrupt naturally; action
+              requests appear in the inspector before the local test broker returns a result.
+            </p>
+          </div>
+          <div class="examples" aria-label="Suggested tests">
+            <div class="example"><strong>Direct answer:</strong> “Tell me why CRTs need a flyback transformer.”</div>
+            <div class="example"><strong>Local utility:</strong> “What time is it in Tokyo?”</div>
+            <div class="example"><strong>Mock action:</strong> “Play Daft Punk, then pause it.”</div>
+            <div class="example"><strong>Mock handoff:</strong> “Research active HDMI to composite converters.”</div>
+          </div>
+        </div>
+        <div>
+          <div id="error-banner" class="error-banner" data-visible="false" role="alert"></div>
+          <div class="controls">
+            <button id="start-button" class="button primary" type="button">Start conversation</button>
+            <button id="stop-button" class="button" type="button" disabled>Stop</button>
+          </div>
+        </div>
+      </article>
+
+      <aside class="card inspector" aria-label="Realtime inspector">
+        <section class="inspector-section">
+          <div class="section-head">
+            <h2>Conversation</h2>
+            <span>live transcript</span>
+          </div>
+          <div id="transcript-list" class="scroll-list" aria-live="polite">
+            <div class="empty">Your words and the assistant’s spoken replies will appear here.</div>
+          </div>
+        </section>
+
+        <section class="inspector-section">
+          <div class="section-head">
+            <h2>Execution requests</h2>
+            <span id="execution-count">0 received</span>
+          </div>
+          <div id="execution-list" class="scroll-list">
+            <div class="empty">Tool calls from the model will appear here with arguments and broker results.</div>
+          </div>
+        </section>
+
+        <section class="inspector-section">
+          <div class="section-head">
+            <h2>Realtime events</h2>
+            <span>high-signal events only</span>
+          </div>
+          <div id="event-list" class="scroll-list">
+            <div class="empty">Session, speech, response, function, and error events will appear here.</div>
+          </div>
+        </section>
+      </aside>
+    </section>
+  </main>
+
+  <audio id="remote-audio" autoplay playsinline></audio>
+
+  <script src="/assets/voice.js" defer></script>
+</body>
+</html>

@@ -173,7 +173,6 @@ def test_session_endpoint_relays_sdp_and_server_owned_configuration() -> None:
         content="v=0\r\nmock-offer",
         headers={
             "Content-Type": "application/sdp",
-            "Origin": "http://127.0.0.1:8501",
         },
     )
 
@@ -181,7 +180,6 @@ def test_session_endpoint_relays_sdp_and_server_owned_configuration() -> None:
     assert response.headers["content-type"].startswith("application/sdp")
     assert response.headers["x-openai-request-id"] == "req_realtime_test"
     assert response.headers["x-openai-realtime-session-id"]
-    assert "X-OpenAI-Realtime-Session-ID" in response.headers["access-control-expose-headers"]
     assert response.text == "v=0\r\nmock-answer"
     assert len(upstream.calls) == 1
 
@@ -511,17 +509,17 @@ def test_execute_endpoint_rejects_unknown_capability_as_structured_error() -> No
     }
 
 
-def test_cors_allows_only_loopback_streamlit_origin() -> None:
+def test_same_origin_requests_require_no_cross_origin_cors_headers() -> None:
     client = TestClient(create_app(settings()))
 
-    allowed = client.options(
+    same_origin = client.options(
         "/execute",
         headers={
-            "Origin": "http://127.0.0.1:8501",
+            "Origin": "http://127.0.0.1:8765",
             "Access-Control-Request-Method": "POST",
         },
     )
-    blocked = client.options(
+    cross_origin = client.options(
         "/execute",
         headers={
             "Origin": "https://evil.example",
@@ -529,5 +527,5 @@ def test_cors_allows_only_loopback_streamlit_origin() -> None:
         },
     )
 
-    assert allowed.headers["access-control-allow-origin"] == "http://127.0.0.1:8501"
-    assert "access-control-allow-origin" not in blocked.headers
+    assert "access-control-allow-origin" not in same_origin.headers
+    assert "access-control-allow-origin" not in cross_origin.headers

@@ -1,7 +1,7 @@
 [project]
 name = "openai-realtime-action-spike"
 version = "0.1.0"
-description = "Streamlit feasibility spike for OpenAI Realtime voice function calling"
+description = "FastAPI-based OpenAI Realtime voice function-calling action spike"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -9,7 +9,6 @@ dependencies = [
   "httpx>=0.28,<1",
   "pydantic>=2.11,<3",
   "python-dotenv>=1.1,<2",
-  "streamlit>=1.46,<2",
   "uvicorn>=0.35,<1",
 ]
 

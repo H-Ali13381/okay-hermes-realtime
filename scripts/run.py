@@ -1,4 +1,4 @@
-"""Launch the loopback Realtime gateway and Streamlit UI as one process group."""
+"""Launch the loopback Realtime gateway as the single runnable process."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from realtime_action_spike.config import Settings  # noqa: E402
 def build_commands(
     settings: Settings,
     root: Path = ROOT,
-) -> tuple[list[str], list[str], dict[str, str]]:
+) -> tuple[list[str], dict[str, str]]:
     environment = os.environ.copy()
     existing_pythonpath = environment.get("PYTHONPATH")
     python_paths = [str(root / "src")]
@@ -42,22 +42,7 @@ def build_commands(
         "--port",
         str(settings.gateway_port),
     ]
-    streamlit = [
-        sys.executable,
-        "-m",
-        "streamlit",
-        "run",
-        str(root / "src/realtime_action_spike/streamlit_app.py"),
-        "--server.address",
-        settings.streamlit_host,
-        "--server.port",
-        str(settings.streamlit_port),
-        "--server.headless",
-        "true",
-        "--browser.gatherUsageStats",
-        "false",
-    ]
-    return gateway, streamlit, environment
+    return gateway, environment
 
 
 def wait_for_health(
@@ -95,9 +80,8 @@ def stop_process(process: subprocess.Popen[bytes] | None) -> None:
 def main(_arguments: Sequence[str] | None = None) -> int:
     os.chdir(ROOT)
     settings = Settings.from_env()
-    gateway_command, streamlit_command, environment = build_commands(settings)
+    gateway_command, environment = build_commands(settings)
     gateway_process: subprocess.Popen[bytes] | None = None
-    streamlit_process: subprocess.Popen[bytes] | None = None
     stopping = False
 
     def request_stop(_signal_number: int, _frame: FrameType | None) -> None:
@@ -110,27 +94,23 @@ def main(_arguments: Sequence[str] | None = None) -> int:
         gateway_process = subprocess.Popen(gateway_command, cwd=ROOT, env=environment)
         health_url = f"http://{settings.gateway_host}:{settings.gateway_port}/health"
         wait_for_health(health_url, gateway_process)
-
-        streamlit_process = subprocess.Popen(streamlit_command, cwd=ROOT, env=environment)
-        page_url = f"http://{settings.streamlit_host}:{settings.streamlit_port}"
-        print(f"Realtime action test: {page_url}", flush=True)
+        print(
+            f"Realtime action test: http://{settings.gateway_host}:{settings.gateway_port}/voice",
+            flush=True,
+        )
         if settings.api_key_value() is None:
             print(
-                "OPENAI_API_KEY is not configured; the UI will start but sessions cannot.",
+                "OPENAI_API_KEY is not configured; sessions may fail until configured.",
                 flush=True,
             )
 
         while not stopping:
             gateway_status = gateway_process.poll()
-            streamlit_status = streamlit_process.poll()
             if gateway_status is not None:
                 return gateway_status or 1
-            if streamlit_status is not None:
-                return streamlit_status
             time.sleep(0.25)
         return 0
     finally:
-        stop_process(streamlit_process)
         stop_process(gateway_process)
         signal.signal(signal.SIGINT, previous_sigint)
         signal.signal(signal.SIGTERM, previous_sigterm)
