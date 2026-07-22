@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -335,3 +336,32 @@ def test_write_jsonl_creates_parent_directories(tmp_path: Path) -> None:
 
     loaded = json.loads(trace.to_jsonl_lines()[0])
     assert loaded["session_id"] == "timeline-session"
+
+
+def test_write_jsonl_atomically_replaces_an_existing_trace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    trace = SessionTrace(session_id="atomic-session")
+    trace.record("session_closed", source="controller", data={"outcome": "completed"})
+    output = tmp_path / "events.jsonl"
+    output.write_text("previous-complete-trace", encoding="utf-8")
+    real_replace = os.replace
+    replacements: list[tuple[Path, Path]] = []
+
+    def observe_replace(source: str | Path, destination: str | Path) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        assert output.read_text(encoding="utf-8") == "previous-complete-trace"
+        assert source_path.read_text(encoding="utf-8") == trace.to_jsonl()
+        replacements.append((source_path, destination_path))
+        real_replace(source_path, destination_path)
+
+    monkeypatch.setattr("realtime_action_spike.runtime.timing.os.replace", observe_replace)
+
+    trace.write_jsonl(output)
+
+    assert len(replacements) == 1
+    assert replacements[0][1] == output
+    assert output.read_text(encoding="utf-8") == trace.to_jsonl()
+    assert not list(tmp_path.glob(".events.jsonl.*.tmp"))

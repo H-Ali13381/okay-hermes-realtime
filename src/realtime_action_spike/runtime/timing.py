@@ -4,7 +4,9 @@ import copy
 import hashlib
 import json
 import math
+import os
 import re
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -287,4 +289,22 @@ class SessionTrace:
     def write_jsonl(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self.to_jsonl(), encoding="utf-8")
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(file_descriptor, "w", encoding="utf-8") as temporary_file:
+                temporary_file.write(self.to_jsonl())
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            os.replace(temporary_path, path)
+            directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        finally:
+            temporary_path.unlink(missing_ok=True)
