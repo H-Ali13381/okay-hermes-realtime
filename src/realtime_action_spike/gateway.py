@@ -1,4 +1,4 @@
-"""Loopback FastAPI gateway for OpenAI Realtime SDP and local action execution."""
+"""Loopback FastAPI gateway for OpenAI Realtime SDP and voice-session control."""
 
 from __future__ import annotations
 
@@ -7,21 +7,17 @@ import hashlib
 import json
 import re
 import secrets
-from contextlib import suppress
 from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field
 from starlette.websockets import WebSocketDisconnect
 
 from .capabilities import (
     CAPABILITIES,
     CapabilityBroker,
-    ExecutionContractError,
-    UnknownCapabilityError,
 )
 from .config import Settings, build_realtime_session
 from .openai.calls import (
@@ -36,7 +32,6 @@ from .runtime.tokens import LaunchTokenStore
 OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
 OPENAI_REALTIME_SESSION_HEADER = "X-OpenAI-Realtime-Session-ID"
 LOCAL_CONTROLLER_SESSION_HEADER = "X-Okay-Hermes-Session-ID"
-MAX_OPENAI_CALLS_PER_SESSION = 512
 _LOCAL_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,128}$")
 
 
@@ -67,28 +62,6 @@ class _InMemoryRealtimeCallHandleRegistry:
 
     def clear(self) -> None:
         self._handles.clear()
-
-
-class ExecutionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: str = Field(min_length=1, max_length=200)
-    call_id: str = Field(min_length=1, max_length=200)
-    name: str = Field(min_length=1, max_length=128)
-    arguments: str | dict[str, Any]
-
-
-def _openai_execution_fingerprint(execution_request: ExecutionRequest) -> str:
-    arguments: Any = execution_request.arguments
-    if isinstance(arguments, str):
-        with suppress(json.JSONDecodeError):
-            arguments = json.loads(arguments)
-    canonical_request = json.dumps(
-        {"name": execution_request.name, "arguments": arguments},
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(canonical_request.encode()).hexdigest()
 
 
 def _safety_identifier() -> str:
@@ -201,12 +174,12 @@ def create_app(
         else VoiceSessionController(
             launcher=_DiagnosticLauncher(),
             token_store=LaunchTokenStore(),
+            capability_broker=broker,
         )
     )
 
     active_session_id: str | None = None
     latest_session_attempt = 0
-    execution_results_by_call_id: dict[str, tuple[str, int, str]] = {}
 
     def _is_loopback_client(request: Request) -> bool:
         if request.client is None:
@@ -373,7 +346,6 @@ def create_app(
                 )
 
         active_session_id = local_session_id or secrets.token_urlsafe(24)
-        execution_results_by_call_id.clear()
         call_handle_registry.clear()
         call_handle_registry.set(active_session_id, handle)
 
@@ -382,86 +354,6 @@ def create_app(
             media_type="application/sdp",
             headers={OPENAI_REALTIME_SESSION_HEADER: active_session_id},
         )
-
-    @app.post("/execute")
-    async def execute_capability(execution_request: ExecutionRequest) -> Response:
-        if active_session_id is None or execution_request.session_id != active_session_id:
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "ok": False,
-                    "call_id": execution_request.call_id,
-                    "error": {
-                        "type": "stale_session",
-                        "message": "OpenAI Realtime session is not current",
-                    },
-                },
-            )
-
-        fingerprint = _openai_execution_fingerprint(execution_request)
-        cached = execution_results_by_call_id.get(execution_request.call_id)
-        if cached is not None:
-            cached_fingerprint, cached_status, cached_body_json = cached
-            if cached_fingerprint != fingerprint:
-                return JSONResponse(
-                    status_code=409,
-                    content={
-                        "ok": False,
-                        "call_id": execution_request.call_id,
-                        "error": {
-                            "type": "call_id_conflict",
-                            "message": (
-                                "OpenAI call_id was already used with a different request"
-                            ),
-                        },
-                    },
-                )
-            return Response(
-                content=cached_body_json,
-                status_code=cached_status,
-                media_type="application/json",
-            )
-
-        if len(execution_results_by_call_id) >= MAX_OPENAI_CALLS_PER_SESSION:
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "ok": False,
-                    "call_id": execution_request.call_id,
-                    "error": {
-                        "type": "session_call_limit_exceeded",
-                        "message": "OpenAI Realtime session reached its execution safety limit",
-                    },
-                },
-            )
-
-        try:
-            result = broker.execute(execution_request.name, execution_request.arguments)
-        except UnknownCapabilityError as exc:
-            status_code = 400
-            body = {
-                "ok": False,
-                "call_id": execution_request.call_id,
-                "error": {"type": "unknown_capability", "message": str(exc)},
-            }
-        except ExecutionContractError as exc:
-            status_code = 400
-            body = {
-                "ok": False,
-                "call_id": execution_request.call_id,
-                "error": {"type": "invalid_arguments", "message": str(exc)},
-            }
-        else:
-            status_code = 200
-            body = {"call_id": execution_request.call_id, **result}
-
-        body_json = json.dumps(body, separators=(",", ":"))
-        execution_results_by_call_id[execution_request.call_id] = (
-            fingerprint,
-            status_code,
-            body_json,
-        )
-        return Response(content=body_json, status_code=status_code, media_type="application/json")
 
     return app
 
