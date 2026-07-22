@@ -4,6 +4,10 @@ import asyncio
 
 import pytest
 
+from realtime_action_spike.openai.interruption import (
+    InterruptionEvent,
+    InterruptionEventKind,
+)
 from realtime_action_spike.runtime.browser import BrowserHandle, NoopBrowserHandle
 from realtime_action_spike.runtime.controller import (
     SessionOutcome,
@@ -60,6 +64,14 @@ class SequenceFactory:
         value = self._values[self._index]
         self._index += 1
         return value
+
+
+def interruption_controller() -> VoiceSessionController:
+    return VoiceSessionController(
+        DeterministicLauncher(),
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-interruption"])),
+        session_id_factory=SequenceFactory(["local-interruption-01"]),
+    )
 
 
 @pytest.mark.asyncio
@@ -426,3 +438,103 @@ async def test_stale_control_message_cannot_resolve_newer_session_terminal_futur
 
     result = await second_waiter
     assert result.outcome == SessionOutcome.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_controller_owns_interruption_reducer_for_exact_active_session() -> None:
+    controller = interruption_controller()
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id == "local-interruption-01"
+
+    await controller.begin_realtime_response(
+        session_id,
+        "resp-1",
+        received_ns=1_000,
+        provider_audio_start_ms=25,
+    )
+    accepted = await controller.record_interruption_event(
+        session_id,
+        InterruptionEvent(
+            local_session_id=session_id,
+            response_id="resp-1",
+            kind=InterruptionEventKind.SPEECH_STARTED,
+            occurred_ns=2_000,
+            user_speech_onset_ms=30.0,
+        ),
+    )
+
+    traces = await controller.interruption_traces(session_id)
+    assert accepted is True
+    assert len(traces) == 1
+    assert traces[0].response_id == "resp-1"
+    assert traces[0].provider_audio_start_ms == 25
+    assert traces[0].speech_started_received_ns == 2_000
+
+
+@pytest.mark.asyncio
+async def test_controller_rejects_stale_session_and_response_interruption_events() -> None:
+    controller = interruption_controller()
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id is not None
+    await controller.begin_realtime_response(
+        session_id,
+        "resp-current",
+        received_ns=1_000,
+        provider_audio_start_ms=25,
+    )
+
+    with pytest.raises(StaleControlMessage):
+        await controller.record_interruption_event(
+            "stale-session-000",
+            InterruptionEvent(
+                local_session_id="stale-session-000",
+                response_id="resp-current",
+                kind=InterruptionEventKind.SPEECH_STARTED,
+                occurred_ns=2_000,
+            ),
+        )
+
+    accepted = await controller.record_interruption_event(
+        session_id,
+        InterruptionEvent(
+            local_session_id=session_id,
+            response_id="resp-stale",
+            kind=InterruptionEventKind.SPEECH_STARTED,
+            occurred_ns=2_000,
+        ),
+    )
+    assert accepted is False
+    assert await controller.interruption_traces(session_id) == ()
+
+
+@pytest.mark.asyncio
+async def test_controller_retains_completed_session_interruption_traces() -> None:
+    controller = interruption_controller()
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id is not None
+    await controller.begin_realtime_response(
+        session_id,
+        "resp-1",
+        received_ns=1_000,
+        provider_audio_start_ms=25,
+    )
+    await controller.record_interruption_event(
+        session_id,
+        InterruptionEvent(
+            local_session_id=session_id,
+            response_id="resp-1",
+            kind=InterruptionEventKind.SPEECH_STARTED,
+            occurred_ns=2_000,
+        ),
+    )
+    teardown = encode_loopback_message(
+        TeardownCompleteMessage(type="teardown_complete", session_id=session_id)
+    )
+    await controller.process_control_message(session_id, teardown)
+
+    traces = await controller.interruption_traces(session_id)
+    assert len(traces) == 1
+    assert traces[0].response_id == "resp-1"

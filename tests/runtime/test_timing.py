@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from realtime_action_spike.runtime.timing import SessionTrace
+from realtime_action_spike.runtime.timing import SessionTrace, monotonic_delta_ms
 
 
 def _steady_clock(values: list[int]) -> Iterator[int]:
@@ -16,6 +16,19 @@ def _steady_clock(values: list[int]) -> Iterator[int]:
 
 def _wall_clock(values: list[str]) -> Iterator[str]:
     return iter(values)
+
+
+def test_monotonic_delta_ms_preserves_missing_and_reversed_markers() -> None:
+    assert monotonic_delta_ms(1_000_000, 12_000_000) == 11.0
+    assert monotonic_delta_ms(None, 12_000_000) is None
+    assert monotonic_delta_ms(1_000_000, None) is None
+    assert monotonic_delta_ms(12_000_000, 1_000_000) is None
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5])
+def test_monotonic_delta_ms_rejects_invalid_markers(value: object) -> None:
+    with pytest.raises((TypeError, ValueError), match="start_ns"):
+        monotonic_delta_ms(value, 2_000_000)  # type: ignore[arg-type]
 
 
 def test_timing_records_preserve_event_order_and_source() -> None:

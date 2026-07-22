@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from .browser import BrowserHandle
@@ -21,8 +22,15 @@ from .protocol import (
     parse_loopback_message,
 )
 from .session_state import SessionPhase, SessionState, SessionTransitionError
-from .timing import SessionTrace, sanitize_timing_data
+from .timing import JsonValue, SessionTrace, sanitize_timing_data
 from .tokens import LaunchTokenStore
+
+if TYPE_CHECKING:
+    from realtime_action_spike.openai.interruption import (
+        InterruptionEvent,
+        InterruptionTimelineReducer,
+        InterruptionTrace,
+    )
 
 ControlState = Literal["idle", "launching", "connecting", "live", "stopping"]
 ActivationStatus = Literal["opened", "busy", "failed"]
@@ -59,6 +67,7 @@ class _WakeSession:
     token: str
     state: SessionState
     trace: SessionTrace
+    interruptions: InterruptionTimelineReducer
     browser_handle: BrowserHandle | None
     stop_reason: StopReason | None = None
     resolved_result: TerminalSessionResult | None = None
@@ -84,6 +93,7 @@ class VoiceSessionController:
         self._last_closed_session_id: str | None = None
         self._terminal_futures: dict[str, asyncio.Future[TerminalSessionResult]] = {}
         self._terminal_results: dict[str, TerminalSessionResult] = {}
+        self._last_closed_interruption_traces: tuple[InterruptionTrace, ...] = ()
 
     @property
     def token_store(self) -> LaunchTokenStore:
@@ -125,6 +135,9 @@ class VoiceSessionController:
                 asyncio.get_running_loop().create_future()
             )
             trace = SessionTrace(session_id=session_id)
+            from realtime_action_spike.openai.interruption import InterruptionTimelineReducer
+
+            interruptions = InterruptionTimelineReducer(session_id)
 
             state.transition_to(SessionPhase.LAUNCHING)
             session = _WakeSession(
@@ -132,13 +145,14 @@ class VoiceSessionController:
                 token=token,
                 state=state,
                 trace=trace,
+                interruptions=interruptions,
                 browser_handle=None,
             )
 
             self._active_session = session
             self._terminal_futures[session_id] = terminal_future
             self._last_closed_session_id = None
-
+            self._last_closed_interruption_traces = ()
             try:
                 browser_handle = self._launcher.launch(
                     _append_activation_query(launch_base_url, token)
@@ -196,6 +210,74 @@ class VoiceSessionController:
                 return None
 
             return local_session_id
+
+    async def begin_realtime_response(
+        self,
+        session_id: str,
+        response_id: str,
+        *,
+        received_ns: int,
+        provider_audio_start_ms: int | None,
+    ) -> None:
+        """Bind first audio for one explicit provider response to the active session."""
+
+        async with self._lock:
+            active = self._require_active_session(session_id)
+            active.interruptions.begin_response(
+                response_id,
+                received_ns=received_ns,
+                provider_audio_start_ms=provider_audio_start_ms,
+            )
+            data: dict[str, JsonValue] = {"response_id": response_id}
+            if provider_audio_start_ms is not None:
+                data["provider_audio_start_ms"] = provider_audio_start_ms
+            active.trace.record(
+                "response_first_audio",
+                source="openai",
+                data=data,
+                monotonic_ns=received_ns,
+            )
+
+    async def record_interruption_event(
+        self,
+        session_id: str,
+        event: InterruptionEvent,
+    ) -> bool:
+        """Record one exact-session observation, rejecting stale response events."""
+
+        async with self._lock:
+            active = self._require_active_session(session_id)
+            if event.local_session_id != session_id:
+                raise StaleControlMessage("interruption event session mismatch")
+            accepted = active.interruptions.consume(event)
+            if not accepted:
+                return False
+            source = (
+                "browser"
+                if event.kind.value in {"playback_suppressed", "listening_restored"}
+                else "openai"
+            )
+            data: dict[str, JsonValue] = {"response_id": event.response_id}
+            if event.user_speech_onset_ms is not None:
+                data["user_speech_onset_ms"] = event.user_speech_onset_ms
+            active.trace.record(
+                event.kind.value,
+                source=source,
+                data=data,
+                monotonic_ns=event.occurred_ns,
+            )
+            return True
+
+    async def interruption_traces(self, session_id: str) -> tuple[InterruptionTrace, ...]:
+        """Return an isolated snapshot for the active or most recently closed session."""
+
+        async with self._lock:
+            active = self._active_session
+            if active is not None and active.session_id == session_id:
+                return copy.deepcopy(active.interruptions.traces)
+            if session_id == self._last_closed_session_id:
+                return copy.deepcopy(self._last_closed_interruption_traces)
+            raise StaleControlMessage("interruption traces are not available for session")
 
     async def process_control_message(
         self,
@@ -269,6 +351,9 @@ class VoiceSessionController:
             active = self._active_session
             if active is None:
                 return
+            self._last_closed_interruption_traces = copy.deepcopy(
+                active.interruptions.traces
+            )
             self._active_session = None
             self._last_closed_session_id = active.session_id
 
@@ -286,6 +371,7 @@ class VoiceSessionController:
             self._terminal_results[active.session_id] = resolved
 
     def _close_active_session_locked(self, session: _WakeSession) -> SessionClosedMessage:
+        _transition(session, SessionPhase.CLOSED)
         outcome = self._resolve_session_outcome(session)
         resolved = self._resolve_terminal_result(
             session,
@@ -293,6 +379,9 @@ class VoiceSessionController:
             error=None,
         )
 
+        self._last_closed_interruption_traces = copy.deepcopy(
+            session.interruptions.traces
+        )
         self._active_session = None
         self._last_closed_session_id = session.session_id
 
@@ -336,6 +425,12 @@ class VoiceSessionController:
         self._token_store.invalidate(session.token)
 
         return result
+
+    def _require_active_session(self, session_id: str) -> _WakeSession:
+        active = self._active_session
+        if active is None or active.session_id != session_id:
+            raise StaleControlMessage("stale session id")
+        return active
 
 
 def _append_activation_query(url: str, token: str) -> str:

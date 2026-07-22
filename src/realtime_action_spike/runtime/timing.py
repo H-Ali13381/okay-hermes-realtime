@@ -78,6 +78,21 @@ def _default_wall_clock() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
+def monotonic_delta_ms(start_ns: int | None, end_ns: int | None) -> float | None:
+    """Return a same-clock monotonic delta without fabricating missing data."""
+
+    if start_ns is None or end_ns is None:
+        return None
+    for name, value in (("start_ns", start_ns), ("end_ns", end_ns)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be an integer or None")
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative")
+    if end_ns < start_ns:
+        return None
+    return round((end_ns - start_ns) / 1_000_000, 6)
+
+
 def _sha256_hex(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
