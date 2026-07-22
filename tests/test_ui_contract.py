@@ -227,6 +227,18 @@ def test_interruption_ui_uses_pure_reducer_and_explicit_response_guards() -> Non
     assert '<details id="interruption-diagnostics"' in html
 
 
+def test_audio_transcript_delta_restores_suppressed_webrtc_playback() -> None:
+    script = _read(JS_PATH)
+    transcript_delta_branch = _extract_block(
+        script,
+        'if (event.type === "response.output_audio_transcript.delta") {',
+        '} else if (event.type === "response.output_audio_transcript.done") {',
+    )
+
+    assert "updateTranscriptTurn" in transcript_delta_branch
+    assert "handleResponseFirstAudio(event, sessionContext)" in transcript_delta_branch
+
+
 def test_js_stop_message_from_controller_invokes_local_teardown_once() -> None:
     script = _read(JS_PATH)
 
@@ -243,6 +255,11 @@ def test_js_stop_message_from_controller_invokes_local_teardown_once() -> None:
     )
     assert "sendStopMessage: false" in stop_event_block
     assert "stopConversation({" in stop_event_block
+    assert 'window.setTimeout(() => window.close(), 500);' in stop_event_block
+    _assert_order(
+        stop_event_block,
+        ["stopConversation({", "window.setTimeout(() => window.close(), 500);"],
+    )
 
 
 def test_js_teardown_order_is_stop_playback_then_channels_then_tracks_then_ack() -> None:

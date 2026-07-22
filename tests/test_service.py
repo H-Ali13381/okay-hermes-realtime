@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import socket
 from dataclasses import dataclass
 from pathlib import Path
@@ -123,6 +124,63 @@ async def test_readiness_waits_for_socket_and_http_then_shutdown_is_coordinated(
 
 
 @pytest.mark.asyncio
+async def test_shutdown_closes_active_session_before_http_and_activation_socket() -> None:
+    harness = _harness()
+    events: list[str] = []
+    original_controller_close = harness.controller.close_active_session
+    original_http_shutdown = harness.http.shutdown
+    original_socket_stop = harness.socket.stop
+
+    async def close_active_session() -> None:
+        events.append("controller_close")
+        await original_controller_close()
+
+    async def shutdown_http() -> None:
+        events.append("http_shutdown")
+        await original_http_shutdown()
+
+    async def stop_socket() -> None:
+        events.append("socket_stop")
+        await original_socket_stop()
+
+    harness.controller.close_active_session = close_active_session
+    harness.http.shutdown = shutdown_http
+    harness.socket.stop = stop_socket
+
+    run_task = asyncio.create_task(harness.service.run())
+    await asyncio.wait_for(harness.http.serve_entered.wait(), timeout=1.0)
+    harness.http.started.set()
+    await asyncio.wait_for(harness.service.ready.wait(), timeout=1.0)
+
+    harness.service.request_shutdown()
+    await asyncio.wait_for(run_task, timeout=1.0)
+
+    assert events == ["controller_close", "http_shutdown", "socket_stop"]
+
+
+@pytest.mark.asyncio
+async def test_controller_health_marker_tracks_service_readiness_and_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    harness = _harness()
+    marker = tmp_path / "okay-hermes-realtime" / "controller-health"
+    run_task = asyncio.create_task(harness.service.run())
+
+    await asyncio.wait_for(harness.http.serve_entered.wait(), timeout=1.0)
+    assert not marker.exists()
+
+    harness.http.started.set()
+    await asyncio.wait_for(harness.service.ready.wait(), timeout=1.0)
+    assert marker.read_text(encoding="utf-8") == "ready\n"
+
+    harness.service.request_shutdown()
+    await asyncio.wait_for(run_task, timeout=1.0)
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
 async def test_http_startup_failure_is_propagated_and_socket_is_cleaned() -> None:
     failure = RuntimeError("http failed during startup")
     harness = _harness(http=FakeHTTPServer(serve_error=failure))
@@ -168,6 +226,46 @@ async def test_hung_http_shutdown_is_bounded_and_task_is_cancelled() -> None:
 
 
 @pytest.mark.asyncio
+async def test_shutdown_uses_one_shared_deadline_across_all_phases() -> None:
+    harness = _harness(
+        http=FakeHTTPServer(shutdown_releases=False),
+        shutdown_timeout=0.03,
+    )
+    never = asyncio.Event()
+
+    async def hang_controller_close() -> None:
+        harness.controller.close_calls += 1
+        await never.wait()
+
+    async def hang_http_shutdown() -> None:
+        harness.http.shutdown_calls += 1
+        await never.wait()
+
+    async def hang_socket_stop() -> None:
+        harness.socket.stop_calls += 1
+        await never.wait()
+
+    harness.controller.close_active_session = hang_controller_close
+    harness.http.shutdown = hang_http_shutdown
+    harness.socket.stop = hang_socket_stop
+
+    run_task = asyncio.create_task(harness.service.run())
+    await asyncio.wait_for(harness.http.serve_entered.wait(), timeout=1.0)
+    harness.http.started.set()
+    await asyncio.wait_for(harness.service.ready.wait(), timeout=1.0)
+
+    started = asyncio.get_running_loop().time()
+    harness.service.request_shutdown()
+    await asyncio.wait_for(run_task, timeout=0.2)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.08
+    assert harness.controller.close_calls == 1
+    assert harness.http.shutdown_calls == 1
+    assert harness.socket.stop_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_service_task_cancellation_still_cleans_all_owned_components() -> None:
     harness = _harness()
     run_task = asyncio.create_task(harness.service.run())
@@ -201,6 +299,37 @@ async def test_uvicorn_adapter_publishes_event_readiness_and_stops() -> None:
     assert server.started.is_set()
     await server.shutdown()
     await asyncio.wait_for(serve_task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_uvicorn_adapter_leaves_signal_ownership_to_runtime_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_signals = False
+
+    @contextlib.contextmanager
+    def observe_signal_capture(_server: object):
+        nonlocal captured_signals
+        captured_signals = True
+        yield
+
+    monkeypatch.setattr(service_module.uvicorn.Server, "capture_signals", observe_signal_capture)
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    server = _UvicornServer(
+        FastAPI(),
+        Settings(gateway_host="127.0.0.1", gateway_port=port),
+    )
+    serve_task = asyncio.create_task(server.serve())
+
+    await asyncio.wait_for(server.started.wait(), timeout=2.0)
+    await server.shutdown()
+    await asyncio.wait_for(serve_task, timeout=2.0)
+
+    assert not captured_signals
 
 
 def test_service_module_executes_main_only_under_module_entrypoint() -> None:

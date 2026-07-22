@@ -124,6 +124,7 @@ function openControllerSocket() {
           preserveError: true,
           sendStopMessage: false,
         });
+        window.setTimeout(() => window.close(), 500);
         return;
       }
       if (event.type === "session_closed") {
@@ -563,6 +564,7 @@ async function handleRealtimeEvent(event, sessionContext) {
     );
   } else if (event.type === "response.output_audio_transcript.delta") {
     updateTranscriptTurn("assistant", event.item_id, event.delta, { append: true });
+    handleResponseFirstAudio(event, sessionContext);
   } else if (event.type === "response.output_audio_transcript.done") {
     updateTranscriptTurn("assistant", event.item_id, event.transcript);
   } else if (event.type === "response.output_item.added") {

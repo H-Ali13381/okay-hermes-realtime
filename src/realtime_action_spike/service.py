@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import os
 import signal
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import Protocol
 
@@ -24,9 +24,17 @@ class HTTPServerProtocol(Protocol):
     async def shutdown(self) -> None: ...
 
 
+class _EmbeddedUvicornServer(uvicorn.Server):
+    """Run under RuntimeService's coordinated signal ownership."""
+
+    @contextlib.contextmanager
+    def capture_signals(self) -> Generator[None, None, None]:
+        yield
+
+
 class _UvicornServer:
     def __init__(self, app: object, settings: Settings) -> None:
-        self._server = uvicorn.Server(
+        self._server = _EmbeddedUvicornServer(
             uvicorn.Config(
                 app,
                 host=settings.gateway_host,
@@ -111,13 +119,17 @@ class RuntimeService:
         self._signal_handlers_registered = False
 
         self._launcher = launcher_factory(settings)
+        state_home = Path(
+            os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
+        )
+        self._controller_health_path = (
+            state_home / "okay-hermes-realtime" / "controller-health"
+        )
         if controller_factory is None:
-            state_home = Path(
-                os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
-            )
             self._controller = VoiceSessionController(
                 launcher=self._launcher,
                 trace_directory=state_home / "okay-hermes-realtime" / "traces",
+                status_observer=self._publish_controller_status,
             )
         else:
             self._controller = controller_factory(self._launcher)
@@ -159,6 +171,7 @@ class RuntimeService:
                 timeout=self.startup_timeout_seconds,
             )
             self._started = True
+            self._publish_controller_status(getattr(self._controller, "status", "idle"))
         except Exception:
             await self._shutdown()
             raise
@@ -187,16 +200,32 @@ class RuntimeService:
             return
         self._shutdown_complete = True
 
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.shutdown_timeout_seconds
+
+        def remaining_timeout() -> float:
+            # A tiny floor lets every cleanup coroutine start and perform immediate
+            # cleanup work without multiplying the shared shutdown budget.
+            return max(0.001, deadline - loop.time())
+
+        # Keep HTTP/WebSocket alive until the active page acknowledges teardown and
+        # closes its app window. Otherwise transport loss forces a process-group kill.
+        with contextlib.suppress(TimeoutError, Exception):
+            await asyncio.wait_for(
+                self._controller.close_active_session(),
+                timeout=remaining_timeout(),
+            )
+
         with contextlib.suppress(TimeoutError, Exception):
             await asyncio.wait_for(
                 self._http_server.shutdown(),
-                timeout=self.shutdown_timeout_seconds,
+                timeout=remaining_timeout(),
             )
 
         if self._http_task is not None:
             done, _pending = await asyncio.wait(
                 {self._http_task},
-                timeout=self.shutdown_timeout_seconds,
+                timeout=remaining_timeout(),
             )
             if not done:
                 self._http_task.cancel()
@@ -211,19 +240,28 @@ class RuntimeService:
         with contextlib.suppress(TimeoutError, Exception):
             await asyncio.wait_for(
                 self._socket.stop(),
-                timeout=self.shutdown_timeout_seconds,
-            )
-
-        with contextlib.suppress(TimeoutError, Exception):
-            await asyncio.wait_for(
-                self._controller.close_active_session(),
-                timeout=self.shutdown_timeout_seconds,
+                timeout=remaining_timeout(),
             )
 
         await self._remove_signal_handlers()
+        self._controller_health_path.unlink(missing_ok=True)
         self._ready.clear()
         self._started = False
         self._running = False
+
+    def _publish_controller_status(self, status: str) -> None:
+        marker_status = {
+            "idle": "ready",
+            "launching": "starting",
+            "connecting": "starting",
+            "live": "conversation-active",
+            "stopping": "starting",
+        }.get(status, "error")
+        path = self._controller_health_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.tmp")
+        temporary.write_text(f"{marker_status}\n", encoding="utf-8")
+        temporary.replace(path)
 
     async def _install_signal_handlers(self) -> None:
         if self._signal_handlers_registered:

@@ -178,7 +178,13 @@ def test_pure_state_helpers_compile_and_match_health_contract(tmp_path: Path) ->
                     true, CaptureHealth::Healthy, true, true, ControllerHealth::Ready) ==
                     DaemonState::On);
                 assert(okay_hermes_realtime_tray::stateFromInputs(
+                    true, CaptureHealth::Healthy, false, false, ControllerHealth::Ready) ==
+                    DaemonState::On);
+                assert(okay_hermes_realtime_tray::stateFromInputs(
                     true, CaptureHealth::Healthy, true, true,
+                    ControllerHealth::ConversationActive) == DaemonState::ConversationActive);
+                assert(okay_hermes_realtime_tray::stateFromInputs(
+                    true, CaptureHealth::Healthy, false, false,
                     ControllerHealth::ConversationActive) == DaemonState::ConversationActive);
                 assert(okay_hermes_realtime_tray::stateFromInputs(
                     true, CaptureHealth::Unhealthy, true, true, ControllerHealth::Ready) ==

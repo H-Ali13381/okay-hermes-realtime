@@ -27,10 +27,14 @@ class FakeProcess:
         self.poll_value = poll_value
         self.wait_results = list(wait_results or [0])
         self.wait_calls: list[float | None] = []
+        self.terminate_calls = 0
         self.kwargs: dict[str, object] = {}
 
     def poll(self) -> int | None:
         return self.poll_value
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
 
     def wait(self, timeout: float | None = None) -> int:
         self.wait_calls.append(timeout)
@@ -60,6 +64,29 @@ class KillCapture:
 
     def __call__(self, process_group_id: int, sig: int) -> None:
         self.calls.append((process_group_id, sig))
+
+
+@dataclass
+class GroupProbe:
+    responses: list[bool]
+    calls: list[int] = field(default_factory=list)
+
+    def __call__(self, process_group_id: int) -> bool:
+        self.calls.append(process_group_id)
+        if self.responses:
+            return self.responses.pop(0)
+        return False
+
+
+@dataclass
+class FakeClock:
+    now: float = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
 
 
 def make_executable(path: Path) -> Path:
@@ -97,6 +124,8 @@ def test_launch_builds_expected_command_and_process_options(
                 f"--app={url}",
                 "--no-first-run",
                 "--disable-default-apps",
+                "--disable-background-mode",
+                "--use-fake-ui-for-media-stream",
             ],
             {
                 "stdin": subprocess.DEVNULL,
@@ -108,6 +137,7 @@ def test_launch_builds_expected_command_and_process_options(
         )
     ]
     assert handle.process_group_id == process.pid
+    assert handle.close_timeout_seconds == 0.6
     assert process.kwargs["stdin"] == subprocess.DEVNULL
     assert process.kwargs["stdout"] == subprocess.DEVNULL
     assert process.kwargs["stderr"] == subprocess.DEVNULL
@@ -244,12 +274,18 @@ def make_handle(
     *,
     close_timeout_seconds: float = 2.0,
     kill_capture: KillCapture | None = None,
+    group_probe: GroupProbe | None = None,
+    clock: FakeClock | None = None,
 ) -> DedicatedBrowserHandle:
+    fake_clock = clock or FakeClock()
     return DedicatedBrowserHandle(
         process=process,
         process_group_id=process.pid,
         close_timeout_seconds=close_timeout_seconds,
         kill_process_group=kill_capture or KillCapture(),
+        process_group_exists=group_probe or GroupProbe([False]),
+        clock=fake_clock,
+        sleep=fake_clock.sleep,
     )
 
 
@@ -265,7 +301,27 @@ def test_handle_close_is_idempotent_when_process_already_exited() -> None:
     assert kill.calls == []
 
 
-def test_handle_close_uses_sigterm_then_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_handle_close_kills_and_waits_for_children_after_main_process_exits() -> None:
+    kill = KillCapture()
+    probe = GroupProbe([True, True, False])
+    clock = FakeClock()
+    process = FakeProcess(pid=43, poll_value=0)
+    handle = make_handle(
+        process,
+        kill_capture=kill,
+        group_probe=probe,
+        clock=clock,
+        close_timeout_seconds=0.1,
+    )
+
+    handle.close()
+
+    assert kill.calls == [(43, signal.SIGKILL)]
+    assert probe.calls == [43, 43, 43]
+    assert clock.now > 0
+
+
+def test_handle_close_waits_for_page_driven_graceful_exit_before_signaling() -> None:
     process = FakeProcess(
         pid=84,
         poll_value=None,
@@ -276,8 +332,22 @@ def test_handle_close_uses_sigterm_then_wait(monkeypatch: pytest.MonkeyPatch) ->
 
     handle.close()
 
-    assert kill.calls == [(84, signal.SIGTERM)]
+    assert kill.calls == []
+    assert process.terminate_calls == 0
     assert process.wait_calls == [0.01]
+
+
+def test_handle_close_terminates_only_main_pid_after_graceful_exit_timeout() -> None:
+    timed_out = subprocess.TimeoutExpired("brave", 0.01)
+    process = FakeProcess(pid=84, poll_value=None, wait_results=[timed_out, 0])
+    kill = KillCapture()
+    handle = make_handle(process, close_timeout_seconds=0.01, kill_capture=kill)
+
+    handle.close()
+
+    assert process.terminate_calls == 1
+    assert kill.calls == []
+    assert process.wait_calls == [0.01, 0.01]
 
 
 def test_handle_close_escalates_to_sigkill_after_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -285,23 +355,31 @@ def test_handle_close_escalates_to_sigkill_after_timeout(monkeypatch: pytest.Mon
     process = FakeProcess(
         pid=85,
         poll_value=None,
-        wait_results=[timed_out, 0],
+        wait_results=[timed_out, timed_out, 0],
     )
     kill = KillCapture()
     handle = make_handle(process, close_timeout_seconds=0.01, kill_capture=kill)
 
     handle.close()
 
-    assert kill.calls == [(85, signal.SIGTERM), (85, signal.SIGKILL)]
-    assert process.wait_calls == [0.01, 0.01]
+    assert process.terminate_calls == 1
+    assert kill.calls == [(85, signal.SIGKILL)]
+    assert process.wait_calls == [0.01, 0.01, 0.01]
 
 
-def test_handle_close_raises_sanitized_error_and_remains_idempotent_on_kill_error() -> None:
+def test_handle_close_raises_sanitized_error_and_failed_cleanup_remains_retryable() -> None:
     def fail_kill(_process_group_id: int, _sig: int) -> None:
         raise RuntimeError("secret-token-abc")
 
     process = FakeProcess(
-        pid=99, poll_value=None, wait_results=[subprocess.TimeoutExpired("brave", 0.01), 0]
+        pid=99,
+        poll_value=None,
+        wait_results=[
+            subprocess.TimeoutExpired("brave-graceful", 0.01),
+            subprocess.TimeoutExpired("brave-term", 0.01),
+            subprocess.TimeoutExpired("brave-retry-graceful", 0.01),
+            subprocess.TimeoutExpired("brave-retry-term", 0.01),
+        ],
     )
     handle = DedicatedBrowserHandle(
         process=process,
@@ -314,18 +392,28 @@ def test_handle_close_raises_sanitized_error_and_remains_idempotent_on_kill_erro
         handle.close()
     assert "secret-token-abc" not in str(exc.value)
 
-    # second close remains idempotent
-    handle.close()
+    with pytest.raises(BrowserLaunchError):
+        handle.close()
+    assert process.terminate_calls == 2
     assert str(exc.value) != ""
 
 
-def test_handle_close_only_targets_owned_process_group() -> None:
-    process = FakeProcess(pid=1234, poll_value=None, wait_results=[0])
+def test_handle_close_fallback_only_targets_owned_process_group() -> None:
+    process = FakeProcess(
+        pid=1234,
+        poll_value=None,
+        wait_results=[
+            subprocess.TimeoutExpired("brave-graceful", 0.01),
+            subprocess.TimeoutExpired("brave-term", 0.01),
+            0,
+        ],
+    )
     kill = KillCapture()
     handle = make_handle(process, close_timeout_seconds=0.01, kill_capture=kill)
 
     handle.close()
 
-    assert kill.calls == [(1234, signal.SIGTERM)]
+    assert process.terminate_calls == 1
+    assert kill.calls == [(1234, signal.SIGKILL)]
     assert all(group == process.pid for group, _ in kill.calls)
-    assert all(sig in {signal.SIGTERM} for _, sig in kill.calls)
+    assert all(sig == signal.SIGKILL for _, sig in kill.calls)

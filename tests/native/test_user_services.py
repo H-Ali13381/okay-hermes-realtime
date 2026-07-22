@@ -71,6 +71,8 @@ def test_controller_unit_contract_and_socket_layout():
     assert "RuntimeDirectoryMode=0700" in lines
     assert "StateDirectory=okay-hermes-realtime" in lines
     assert "StateDirectoryMode=0700" in lines
+    assert "KillMode=mixed" in lines
+    assert "TimeoutStopSec=10s" in lines
 
     exec_cmd = _find_execstart(lines)
     assert CONTROLLER_EXEC in exec_cmd
@@ -118,6 +120,7 @@ def test_pyproject_has_package_entrypoints_and_build_backend():
     assert data["tool"]["uv"]["package"] is True
     assert data["build-system"]["build-backend"] == "hatchling.build"
     assert data["build-system"]["requires"]
+    assert "/artifacts" in data["tool"]["hatch"]["build"]["exclude"]
 
     package_data = data["tool"]["hatch"]["build"]["targets"]["wheel"].get("include")
     assert package_data is not None

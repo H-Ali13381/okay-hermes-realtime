@@ -5,6 +5,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
@@ -33,8 +34,10 @@ class NoopBrowserHandle:
 
 ProcessFactory = Callable[..., subprocess.Popen]
 KillProcessGroup = Callable[[int, int], None]
+ProcessGroupExists = Callable[[int], bool]
 Clock = Callable[[], float]
 Sleep = Callable[[float], None]
+_BROWSER_CLOSE_PHASE_TIMEOUT_SECONDS = 0.6
 
 
 class DedicatedBrowserHandle:
@@ -47,39 +50,77 @@ class DedicatedBrowserHandle:
         close_timeout_seconds: float,
         *,
         kill_process_group: KillProcessGroup = os.killpg,
+        process_group_exists: ProcessGroupExists | None = None,
+        clock: Clock | None = None,
+        sleep: Sleep | None = None,
     ) -> None:
         self._process = process
         self.process_group_id = process_group_id
         self.close_timeout_seconds = close_timeout_seconds
         self._kill_process_group = kill_process_group
+        self._process_group_exists = process_group_exists or _process_group_exists
+        self._clock = clock or time.monotonic
+        self._sleep = sleep or time.sleep
         self._closed = False
 
     def close(self) -> None:
         if self._closed:
             return
 
+        deadline = self._clock() + (self.close_timeout_seconds * 3)
         try:
             if self._process.poll() is not None:
+                self._ensure_owned_process_group_exited(deadline)
                 self._closed = True
                 return
 
-            self._kill_process_group(self.process_group_id, signal.SIGTERM)
+            # The page gets the first chance to close itself after media cleanup.
             try:
-                self._process.wait(timeout=self.close_timeout_seconds)
+                self._process.wait(timeout=self._phase_timeout(deadline))
+                self._ensure_owned_process_group_exited(deadline)
+                self._closed = True
+                return
             except subprocess.TimeoutExpired:
+                pass
+
+            # TERM only the owned browser main PID. Sending TERM to every Chromium
+            # child at once causes Brave/Crashpad to report a SIGTRAP crash.
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=self._phase_timeout(deadline))
+            except subprocess.TimeoutExpired:
+                # A stuck tree gets hard-killed without generating a crash core.
                 self._kill_process_group(self.process_group_id, signal.SIGKILL)
                 try:
-                    self._process.wait(timeout=self.close_timeout_seconds)
+                    self._process.wait(timeout=self._phase_timeout(deadline))
                 except subprocess.TimeoutExpired as kill_exc:
                     raise BrowserLaunchError(
                         "browser process group did not exit after KILL"
                     ) from kill_exc
+
+            self._ensure_owned_process_group_exited(deadline)
+            self._closed = True
         except Exception as exc:
             raise BrowserLaunchError(
                 f"failed to close Brave process group: {type(exc).__name__}"
             ) from exc
-        finally:
-            self._closed = True
+
+    def _phase_timeout(self, deadline: float) -> float:
+        return min(
+            self.close_timeout_seconds,
+            max(0.001, deadline - self._clock()),
+        )
+
+    def _ensure_owned_process_group_exited(self, deadline: float) -> None:
+        if not self._process_group_exists(self.process_group_id):
+            return
+
+        self._kill_process_group(self.process_group_id, signal.SIGKILL)
+        while self._process_group_exists(self.process_group_id):
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise RuntimeError("owned Brave process group did not exit")
+            self._sleep(min(0.01, remaining))
 
 
 class DedicatedBraveLauncher:
@@ -135,6 +176,11 @@ class DedicatedBraveLauncher:
             f"--app={resolved_loopback_url}",
             "--no-first-run",
             "--disable-default-apps",
+            "--disable-background-mode",
+            # This isolated app profile opens only the loopback voice page. Auto-accept
+            # its real microphone request so wake activation never depends on a hidden
+            # browser permission prompt.
+            "--use-fake-ui-for-media-stream",
         ]
         process = self._process_factory(
             args,
@@ -151,7 +197,7 @@ class DedicatedBraveLauncher:
         return DedicatedBrowserHandle(
             process=process,
             process_group_id=process.pid,
-            close_timeout_seconds=self._start_timeout_seconds,
+            close_timeout_seconds=_BROWSER_CLOSE_PHASE_TIMEOUT_SECONDS,
             kill_process_group=self._kill_process_group,
         )
 
@@ -180,6 +226,14 @@ def _ensure_dedicated_profile(profile_path: Path) -> None:
         profile_path.chmod(stat.S_IRWXU)
     except OSError as exc:
         raise BrowserLaunchError(f"could not prepare Brave profile directory: {exc}") from exc
+
+
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def _validate_loopback_base_url(url: str) -> str:

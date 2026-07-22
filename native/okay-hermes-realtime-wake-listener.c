@@ -421,8 +421,6 @@ static void wake_model_destroy(struct wake_model *model)
         model->ort->ReleaseMemoryInfo(model->memory_info);
     if (model->session_options != NULL && model->ort->ReleaseSessionOptions != NULL)
         model->ort->ReleaseSessionOptions(model->session_options);
-    if (model->allocator != NULL && model->ort->ReleaseAllocator != NULL)
-        model->ort->ReleaseAllocator(model->allocator);
     if (model->output_name != NULL && model->ort->AllocatorFree != NULL) {
         OrtStatus *status = model->ort->AllocatorFree(model->allocator, model->output_name);
         if (status != NULL && model->ort->ReleaseStatus != NULL)

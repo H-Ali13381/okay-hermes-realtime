@@ -131,6 +131,17 @@ def test_handler_argv_preserves_separator_tail() -> None:
     assert "options->handler_argc = 1" in parse_options_body
 
 
+def test_wake_model_frees_names_without_releasing_ort_owned_default_allocator() -> None:
+    source = read_source()
+    init_body = function_source(source, "wake_model_init")
+    destroy_body = function_source(source, "wake_model_destroy")
+
+    assert "GetAllocatorWithDefaultOptions" in init_body
+    assert "AllocatorFree(model->allocator, model->input_name)" in destroy_body
+    assert "AllocatorFree(model->allocator, model->output_name)" in destroy_body
+    assert "ReleaseAllocator" not in destroy_body
+
+
 def test_fake_onnx_root_and_build_binary_help_self_test(tmp_path: Path) -> None:
     onnx_root = compile_fake_onnx_root(tmp_path)
     output = tmp_path / "okay-hermes-realtime-wake-listener"

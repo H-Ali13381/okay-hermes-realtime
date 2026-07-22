@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 
 ControlState = Literal["idle", "launching", "connecting", "live", "stopping"]
 ActivationStatus = Literal["opened", "busy", "failed"]
+StatusObserver = Callable[[ControlState], None]
 
 
 class StaleControlMessage(ValueError):
@@ -101,10 +102,11 @@ class VoiceSessionController:
         token_store: LaunchTokenStore | None = None,
         lock: asyncio.Lock | None = None,
         capability_broker: CapabilityBroker | None = None,
-        browser_ack_timeout_seconds: float = 0.25,
+        browser_ack_timeout_seconds: float = 1.0,
         teardown_step_timeout_seconds: float = 2.0,
         farewell_timeout_seconds: float = 1.5,
         trace_directory: Path | None = None,
+        status_observer: StatusObserver | None = None,
     ) -> None:
         self._launcher = launcher
         self._session_id_factory = session_id_factory or (lambda: secrets.token_urlsafe(16))
@@ -115,6 +117,8 @@ class VoiceSessionController:
         self._teardown_step_timeout_seconds = teardown_step_timeout_seconds
         self._farewell_timeout_seconds = farewell_timeout_seconds
         self._trace_directory = trace_directory
+        self._status_observer = status_observer
+        self._last_notified_status: ControlState | None = None
 
         self._active_session: _WakeSession | None = None
         self._last_closed_session_id: str | None = None
@@ -186,6 +190,7 @@ class VoiceSessionController:
             session.teardown = self._build_teardown_coordinator(session)
 
             self._active_session = session
+            self._notify_status()
             self._terminal_futures[session_id] = terminal_future
             self._outbound_messages[session_id] = asyncio.Queue(maxsize=64)
             self._farewell_events[session_id] = asyncio.Event()
@@ -206,6 +211,7 @@ class VoiceSessionController:
                 self._outbound_messages.pop(session_id, None)
                 self._farewell_events.pop(session_id, None)
                 _transition(session, SessionPhase.FAILED)
+                self._notify_status()
                 self._terminal_futures.pop(session_id, None)
                 self._terminal_results[session_id] = session.resolved_result
                 with contextlib.suppress(Exception):
@@ -583,6 +589,7 @@ class VoiceSessionController:
                     session.interruptions.traces
                 )
                 self._active_session = None
+                self._notify_status()
                 self._last_closed_session_id = session.session_id
                 self._outbound_messages.pop(session.session_id, None)
                 self._function_call_parsers.pop(session.session_id, None)
@@ -622,6 +629,7 @@ class VoiceSessionController:
         active = self._require_active_session(session.session_id)
         if active.state.phase is not SessionPhase.STOPPING:
             _transition(active, SessionPhase.STOPPING)
+            self._notify_status()
         if active.stop_reason is None:
             active.stop_reason = request.reason
         if not active.teardown_marked:
@@ -700,10 +708,12 @@ class VoiceSessionController:
 
             if isinstance(message, PageReadyMessage):
                 _transition(active, SessionPhase.CONNECTING)
+                self._notify_status()
                 return None
 
             if isinstance(message, PageStartedMessage):
                 _transition(active, SessionPhase.LIVE)
+                self._notify_status()
                 return None
 
             if isinstance(message, TimingMessage):
@@ -805,6 +815,14 @@ class VoiceSessionController:
         if active is None or active.session_id != session_id:
             raise StaleControlMessage("stale session id")
         return active
+
+    def _notify_status(self) -> None:
+        status = self.status
+        if status == self._last_notified_status:
+            return
+        self._last_notified_status = status
+        if self._status_observer is not None:
+            self._status_observer(status)
 
 
 def _append_activation_query(url: str, token: str) -> str:

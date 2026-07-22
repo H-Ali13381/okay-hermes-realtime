@@ -31,6 +31,9 @@ dev = [
 [tool.uv]
 package = true
 
+[tool.hatch.build]
+exclude = ["/artifacts"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/realtime_action_spike"]
 include = ["src/realtime_action_spike/web/**"]

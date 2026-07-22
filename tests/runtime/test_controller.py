@@ -154,12 +154,14 @@ async def test_failed_activation_invalidates_token_and_releases_slot() -> None:
 @pytest.mark.asyncio
 async def test_control_message_flow_tracks_state_and_idempotent_stop_teardown() -> None:
     launcher = DeterministicLauncher()
+    observed_statuses: list[str] = []
     controller = VoiceSessionController(
         launcher,
         token_store=LaunchTokenStore(
             token_factory=SequenceFactory(["token-1"]),
         ),
         session_id_factory=SequenceFactory(["local-session-01"]),
+        status_observer=observed_statuses.append,
     )
 
     activation = await controller.activate("http://127.0.0.1:8765/voice")
@@ -209,6 +211,7 @@ async def test_control_message_flow_tracks_state_and_idempotent_stop_teardown() 
     assert closed_first.outcome == closed_second.outcome
     assert launcher.handles[0].closed_calls == 1
     assert controller.status == "idle"
+    assert observed_statuses == ["launching", "connecting", "live", "stopping", "idle"]
 
 
 @pytest.mark.asyncio

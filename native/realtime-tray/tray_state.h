@@ -63,16 +63,18 @@ inline DaemonState stateFromInputs(
         controllerHealth == ControllerHealth::Error) {
         return DaemonState::Error;
     }
-    if (!controllerActive && !wakewordActive) {
-        return DaemonState::Off;
-    }
-    if (controllerActive && wakewordActive &&
+    const bool coherentRuntimeMode =
+        (controllerActive && wakewordActive) || (!controllerActive && !wakewordActive);
+    if (coherentRuntimeMode && captureHealth == CaptureHealth::Healthy &&
         controllerHealth == ControllerHealth::ConversationActive) {
         return DaemonState::ConversationActive;
     }
-    if (controllerActive && wakewordActive && captureHealth == CaptureHealth::Healthy &&
+    if (coherentRuntimeMode && captureHealth == CaptureHealth::Healthy &&
         controllerHealth == ControllerHealth::Ready) {
         return DaemonState::On;
+    }
+    if (!controllerActive && !wakewordActive) {
+        return DaemonState::Off;
     }
     return DaemonState::Starting;
 }

@@ -43,7 +43,7 @@ class Settings(BaseModel):
 
     activation_socket_path: str = ""
 
-    brave_bin: str = "/usr/bin/brave-origin-nightly"
+    brave_bin: str = "/opt/brave.com/brave-origin-nightly/brave"
     voice_browser_profile: str = "~/.local/share/okay-hermes-realtime/brave-profile"
     voice_page_url: str = "http://127.0.0.1:8765/voice"
     voice_browser_start_timeout_seconds: float = 10.0
@@ -104,7 +104,9 @@ class Settings(BaseModel):
                 "gateway_host": os.getenv("GATEWAY_HOST", "127.0.0.1"),
                 "gateway_port": os.getenv("GATEWAY_PORT", "8765"),
                 "activation_socket_path": activation_socket_path,
-                "brave_bin": os.getenv("BRAVE_BIN", "/usr/bin/brave-origin-nightly"),
+                "brave_bin": os.getenv(
+                    "BRAVE_BIN", "/opt/brave.com/brave-origin-nightly/brave"
+                ),
                 "voice_browser_profile": os.getenv(
                     "VOICE_BROWSER_PROFILE",
                     "~/.local/share/okay-hermes-realtime/brave-profile",
