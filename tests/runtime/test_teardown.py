@@ -140,6 +140,7 @@ async def test_duplicate_teardown_runs_once_and_first_request_wins() -> None:
         "close_sideband",
         "close_browser",
         "persist_trace",
+        "finalize",
     ],
 )
 async def test_teardown_continues_to_finalize_after_each_step_failure(
