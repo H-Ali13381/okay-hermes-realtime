@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .activation_socket import ActivationSocket
 from .browser import (
     BrowserHandle,
     BrowserLaunchError,
@@ -11,6 +12,7 @@ from .controller import (
     ActivationResult,
     BrowserLauncher,
     StaleControlMessage,
+    TerminalSessionResult,
     VoiceSessionController,
 )
 from .protocol import (
@@ -35,6 +37,7 @@ from .tokens import LaunchTokenStore
 __all__ = [
     "ActivationMessage",
     "ActivationResult",
+    "ActivationSocket",
     "BrowserHandle",
     "BrowserLaunchError",
     "BrowserLauncher",
@@ -56,6 +59,7 @@ __all__ = [
     "StopMessage",
     "StopReason",
     "TeardownCompleteMessage",
+    "TerminalSessionResult",
     "TimingEvent",
     "TimingEventSource",
     "TimingMessage",

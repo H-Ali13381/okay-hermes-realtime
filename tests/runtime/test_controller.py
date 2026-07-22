@@ -6,7 +6,9 @@ import pytest
 
 from realtime_action_spike.runtime.browser import BrowserHandle, NoopBrowserHandle
 from realtime_action_spike.runtime.controller import (
+    SessionOutcome,
     StaleControlMessage,
+    TerminalSessionResult,
     VoiceSessionController,
 )
 from realtime_action_spike.runtime.protocol import (
@@ -250,3 +252,177 @@ async def test_activation_creates_distinct_session_id_and_launch_token() -> None
     assert activation.session_id == "session-distinct"
     assert activation.token == "token-distinct"
     assert activation.token != activation.session_id
+
+
+@pytest.mark.asyncio
+async def test_wait_for_terminal_result_returns_completed_outcome() -> None:
+    launcher = DeterministicLauncher()
+    controller = VoiceSessionController(
+        launcher,
+        token_store=LaunchTokenStore(
+            token_factory=SequenceFactory(["token-terminal-1"]),
+        ),
+        session_id_factory=SequenceFactory(["local-session-01"]),
+    )
+
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id is not None
+
+    waiter = asyncio.create_task(controller.wait_for_terminal_result(session_id))
+
+    ready = encode_loopback_message(PageReadyMessage(type="page_ready", session_id=session_id))
+    assert await controller.process_control_message(session_id, ready) is None
+    started = encode_loopback_message(
+        PageStartedMessage(type="page_started", session_id=session_id)
+    )
+    await controller.process_control_message(session_id, started)
+    teardown = encode_loopback_message(
+        TeardownCompleteMessage(type="teardown_complete", session_id=session_id)
+    )
+    await controller.process_control_message(session_id, teardown)
+
+    result = await waiter
+    assert result == TerminalSessionResult(
+        session_id=session_id,
+        outcome=SessionOutcome.COMPLETED,
+        error=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_waiter_cancellation_does_not_cancel_shared_terminal_future() -> None:
+    controller = VoiceSessionController(
+        DeterministicLauncher(),
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-terminal-2"])),
+        session_id_factory=SequenceFactory(["local-session-02"]),
+    )
+
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id is not None
+
+    waiter = asyncio.create_task(controller.wait_for_terminal_result(session_id))
+    waiter.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    ready = encode_loopback_message(PageReadyMessage(type="page_ready", session_id=session_id))
+    await controller.process_control_message(session_id, ready)
+    started = encode_loopback_message(
+        PageStartedMessage(type="page_started", session_id=session_id)
+    )
+    teardown = encode_loopback_message(
+        TeardownCompleteMessage(type="teardown_complete", session_id=session_id)
+    )
+    stop_msg = encode_loopback_message(
+        StopMessage(type="stop", session_id=session_id, reason=StopReason.TRANSPORT_FAILURE)
+    )
+    await controller.process_control_message(session_id, started)
+    await controller.process_control_message(session_id, stop_msg)
+    await controller.process_control_message(session_id, teardown)
+
+    result = await controller.wait_for_terminal_result(session_id)
+    assert result.outcome == SessionOutcome.FAILED
+
+
+@pytest.mark.asyncio
+async def test_launch_failure_resolves_terminal_result_and_releases_slot() -> None:
+    launcher = FailingLauncher(RuntimeError("launch failed"))
+    controller = VoiceSessionController(
+        launcher,
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-fail-2"])),
+        session_id_factory=SequenceFactory(["session-fail-2"]),
+    )
+
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    assert activation.status == "failed"
+
+    result = await controller.wait_for_terminal_result(activation.session_id or "")
+    assert result == TerminalSessionResult(
+        session_id="session-fail-2",
+        outcome=SessionOutcome.FAILED,
+        error="activation failed",
+    )
+    assert controller.status == "idle"
+
+
+@pytest.mark.asyncio
+async def test_stale_control_message_cannot_resolve_newer_session_terminal_future() -> None:
+    launcher = DeterministicLauncher()
+    controller = VoiceSessionController(
+        launcher,
+        token_store=LaunchTokenStore(
+            token_factory=SequenceFactory(["token-1", "token-2"]),
+        ),
+        session_id_factory=SequenceFactory(["session-first-01", "session-second-02"]),
+    )
+
+    first = await controller.activate("http://127.0.0.1:8765/voice")
+    first_id = first.session_id or ""
+
+    await controller.process_control_message(
+        first_id,
+        encode_loopback_message(PageReadyMessage(type="page_ready", session_id=first_id)),
+    )
+    await controller.process_control_message(
+        first_id,
+        encode_loopback_message(
+            PageStartedMessage(type="page_started", session_id=first_id)
+        ),
+    )
+    await controller.process_control_message(
+        first_id,
+        encode_loopback_message(
+            StopMessage(type="stop", session_id=first_id, reason=StopReason.BUTTON)
+        ),
+    )
+    await controller.process_control_message(
+        first_id,
+        encode_loopback_message(
+            TeardownCompleteMessage(type="teardown_complete", session_id=first_id)
+        ),
+    )
+
+    first_result = await controller.wait_for_terminal_result(first_id)
+    assert first_result.outcome == SessionOutcome.COMPLETED
+
+    stale_stop = encode_loopback_message(
+        StopMessage(type="stop", session_id=first_id, reason=StopReason.BUTTON)
+    )
+    with pytest.raises(StaleControlMessage):
+        await controller.process_control_message(first_id, stale_stop)
+
+    second = await controller.activate("http://127.0.0.1:8765/voice")
+    second_id = second.session_id or ""
+    await controller.process_control_message(
+        second_id,
+        encode_loopback_message(
+            PageReadyMessage(type="page_ready", session_id=second_id)
+        ),
+    )
+
+    second_waiter = asyncio.create_task(controller.wait_for_terminal_result(second_id))
+
+    await controller.process_control_message(
+        second_id,
+        encode_loopback_message(
+            PageStartedMessage(type="page_started", session_id=second_id)
+        ),
+    )
+    await controller.process_control_message(
+        second_id,
+        encode_loopback_message(
+            StopMessage(type="stop", session_id=second_id, reason=StopReason.BUTTON)
+        ),
+    )
+    await controller.process_control_message(
+        second_id,
+        encode_loopback_message(
+            TeardownCompleteMessage(type="teardown_complete", session_id=second_id)
+        ),
+    )
+
+    result = await second_waiter
+    assert result.outcome == SessionOutcome.COMPLETED

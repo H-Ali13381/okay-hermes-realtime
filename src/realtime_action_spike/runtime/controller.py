@@ -15,6 +15,7 @@ from .protocol import (
     SessionClosedMessage,
     SessionOutcome,
     StopMessage,
+    StopReason,
     TeardownCompleteMessage,
     TimingMessage,
     parse_loopback_message,
@@ -42,6 +43,14 @@ class ActivationResult:
     status: ActivationStatus
     session_id: str | None = None
     token: str | None = None
+    error: str | None = None
+
+
+@dataclass
+class TerminalSessionResult:
+    session_id: str
+    outcome: SessionOutcome
+    error: str | None = None
 
 
 @dataclass
@@ -50,7 +59,9 @@ class _WakeSession:
     token: str
     state: SessionState
     trace: SessionTrace
-    browser_handle: BrowserHandle
+    browser_handle: BrowserHandle | None
+    stop_reason: StopReason | None = None
+    resolved_result: TerminalSessionResult | None = None
 
 
 class VoiceSessionController:
@@ -71,6 +82,8 @@ class VoiceSessionController:
 
         self._active_session: _WakeSession | None = None
         self._last_closed_session_id: str | None = None
+        self._terminal_futures: dict[str, asyncio.Future[TerminalSessionResult]] = {}
+        self._terminal_results: dict[str, TerminalSessionResult] = {}
 
     @property
     def token_store(self) -> LaunchTokenStore:
@@ -108,27 +121,66 @@ class VoiceSessionController:
             session_id = self._session_id_factory()
             token = self._token_store.issue(session_id)
             state = SessionState(session_id=session_id)
-            state.transition_to(SessionPhase.LAUNCHING)
+            terminal_future: asyncio.Future[TerminalSessionResult] = (
+                asyncio.get_running_loop().create_future()
+            )
             trace = SessionTrace(session_id=session_id)
 
+            state.transition_to(SessionPhase.LAUNCHING)
+            session = _WakeSession(
+                session_id=session_id,
+                token=token,
+                state=state,
+                trace=trace,
+                browser_handle=None,
+            )
+
+            self._active_session = session
+            self._terminal_futures[session_id] = terminal_future
             self._last_closed_session_id = None
+
             try:
                 browser_handle = self._launcher.launch(
                     _append_activation_query(launch_base_url, token)
                 )
             except Exception:
-                self._token_store.invalidate(token)
-                state.transition_to(SessionPhase.FAILED)
-                return ActivationResult(status="failed", session_id=session_id, token=token)
+                session.browser_handle = None
+                session.resolved_result = TerminalSessionResult(
+                    session_id=session_id,
+                    outcome=SessionOutcome.FAILED,
+                    error="activation failed",
+                )
+                self._active_session = None
+                _transition(session, SessionPhase.FAILED)
+                self._terminal_futures.pop(session_id, None)
+                self._terminal_results[session_id] = session.resolved_result
+                with contextlib.suppress(Exception):
+                    if not terminal_future.done():
+                        terminal_future.set_result(session.resolved_result)
 
-            self._active_session = _WakeSession(
-                session_id=session_id,
-                token=token,
-                state=state,
-                trace=trace,
-                browser_handle=browser_handle,
-            )
+                self._token_store.invalidate(token)
+                return ActivationResult(
+                    status="failed",
+                    session_id=session_id,
+                    token=token,
+                    error="activation failed",
+                )
+
+            session.browser_handle = browser_handle
             return ActivationResult(status="opened", session_id=session_id, token=token)
+
+    async def wait_for_terminal_result(self, session_id: str) -> TerminalSessionResult:
+        """Wait for the terminal outcome tied to an exact local session id."""
+
+        async with self._lock:
+            if session_id in self._terminal_results:
+                return self._terminal_results[session_id]
+
+            future = self._terminal_futures.get(session_id)
+            if future is None:
+                raise ValueError("unknown session id")
+
+        return await asyncio.shield(future)
 
     def validate_activation_token(self, token: str) -> str | None:
         return self._token_store.validate(token)
@@ -157,12 +209,17 @@ class VoiceSessionController:
 
             if active is None:
                 if session_id == self._last_closed_session_id and isinstance(
-                    message, TeardownCompleteMessage
+                    message,
+                    TeardownCompleteMessage,
                 ):
+                    resolved = self._terminal_results.get(session_id)
+                    outcome = (
+                        resolved.outcome if resolved is not None else SessionOutcome.COMPLETED
+                    )
                     return SessionClosedMessage(
                         type="session_closed",
                         session_id=session_id,
-                        outcome=SessionOutcome.COMPLETED,
+                        outcome=outcome,
                     )
                 raise StaleControlMessage("no active session")
 
@@ -187,26 +244,98 @@ class VoiceSessionController:
                 return None
 
             if isinstance(message, StopMessage):
+                active.stop_reason = message.reason
                 _transition(active, SessionPhase.STOPPING)
                 return None
 
             if isinstance(message, TeardownCompleteMessage):
                 if active.state.phase != SessionPhase.STOPPING:
                     _transition(active, SessionPhase.STOPPING)
-                _transition(active, SessionPhase.CLOSED)
-
-                self._active_session = None
-                self._last_closed_session_id = session_id
-
-                with contextlib.suppress(Exception):
-                    active.browser_handle.close()
-                return SessionClosedMessage(
-                    type="session_closed",
-                    session_id=session_id,
-                    outcome=SessionOutcome.COMPLETED,
+                return self._close_active_session_locked(
+                    active,
                 )
 
         raise RuntimeError("unreachable")
+
+    async def close_active_session(
+        self,
+        *,
+        outcome: SessionOutcome = SessionOutcome.CANCELLED,
+        error: str | None = None,
+    ) -> None:
+        """Stop and mark the current active session during service shutdown."""
+
+        async with self._lock:
+            active = self._active_session
+            if active is None:
+                return
+            self._active_session = None
+            self._last_closed_session_id = active.session_id
+
+            browser_handle = active.browser_handle
+            if browser_handle is not None:
+                with contextlib.suppress(Exception):
+                    browser_handle.close()
+
+            resolved = self._resolve_terminal_result(
+                active,
+                outcome=outcome,
+                error=error,
+            )
+            # Keep terminal outcome accessible after cleanup for shutdown completion.
+            self._terminal_results[active.session_id] = resolved
+
+    def _close_active_session_locked(self, session: _WakeSession) -> SessionClosedMessage:
+        outcome = self._resolve_session_outcome(session)
+        resolved = self._resolve_terminal_result(
+            session,
+            outcome=outcome,
+            error=None,
+        )
+
+        self._active_session = None
+        self._last_closed_session_id = session.session_id
+
+        if session.browser_handle is not None:
+            with contextlib.suppress(Exception):
+                session.browser_handle.close()
+
+        return SessionClosedMessage(
+            type="session_closed",
+            session_id=session.session_id,
+            outcome=resolved.outcome,
+        )
+
+    def _resolve_session_outcome(self, session: _WakeSession) -> SessionOutcome:
+        if session.stop_reason is StopReason.TRANSPORT_FAILURE:
+            return SessionOutcome.FAILED
+        if session.stop_reason is StopReason.TIMEOUT:
+            return SessionOutcome.TIMED_OUT
+        if session.stop_reason is StopReason.NATIVE_CANCEL:
+            return SessionOutcome.CANCELLED
+        return SessionOutcome.COMPLETED
+
+    def _resolve_terminal_result(
+        self,
+        session: _WakeSession,
+        *,
+        outcome: SessionOutcome,
+        error: str | None = None,
+    ) -> TerminalSessionResult:
+        if session.resolved_result is not None:
+            return session.resolved_result
+
+        result = TerminalSessionResult(session_id=session.session_id, outcome=outcome, error=error)
+        session.resolved_result = result
+        self._terminal_results[session.session_id] = result
+
+        future = self._terminal_futures.pop(session.session_id, None)
+        if future is not None and not future.done():
+            future.set_result(result)
+
+        self._token_store.invalidate(session.token)
+
+        return result
 
 
 def _append_activation_query(url: str, token: str) -> str:

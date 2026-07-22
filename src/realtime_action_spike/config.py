@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from .capabilities import build_openai_tools
 
@@ -40,10 +41,37 @@ class Settings(BaseModel):
     gateway_host: str = "127.0.0.1"
     gateway_port: int = Field(default=8765, ge=1, le=65_535)
 
+    activation_socket_path: str = ""
+
     brave_bin: str = "/usr/bin/brave-origin-nightly"
     voice_browser_profile: str = "~/.local/share/okay-hermes-realtime/brave-profile"
     voice_page_url: str = "http://127.0.0.1:8765/voice"
     voice_browser_start_timeout_seconds: float = 10.0
+
+    @staticmethod
+    def default_activation_socket_path(xdg_runtime_dir: str | None = None) -> str:
+        runtime_dir = xdg_runtime_dir or os.getenv("XDG_RUNTIME_DIR")
+        if not runtime_dir:
+            runtime_dir = f"/run/user/{os.getuid()}"
+        return str(Path(runtime_dir) / "okay-hermes-realtime" / "activation.sock")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_activation_path(cls, data: object) -> object:
+        if isinstance(data, dict):
+            value = data.get("activation_socket_path")
+            if isinstance(value, str) and value:
+                resolved = Path(value)
+                if not resolved.is_absolute():
+                    raise ValueError("ACTIVATION_SOCKET_PATH must be absolute")
+                return data
+        return data
+
+    @property
+    def resolved_activation_socket_path(self) -> str:
+        if self.activation_socket_path:
+            return str(Path(self.activation_socket_path).expanduser())
+        return self.default_activation_socket_path()
 
     @field_validator("voice_page_url")
     @classmethod
@@ -63,6 +91,10 @@ class Settings(BaseModel):
     def from_env(cls) -> Settings:
         load_dotenv()
         key = os.getenv("OPENAI_API_KEY") or None
+        activation_socket_path = os.getenv(
+            "ACTIVATION_SOCKET_PATH",
+            cls.default_activation_socket_path(),
+        )
         return cls.model_validate(
             {
                 "openai_api_key": key,
@@ -71,6 +103,7 @@ class Settings(BaseModel):
                 "realtime_reasoning_effort": os.getenv("REALTIME_REASONING_EFFORT", "minimal"),
                 "gateway_host": os.getenv("GATEWAY_HOST", "127.0.0.1"),
                 "gateway_port": os.getenv("GATEWAY_PORT", "8765"),
+                "activation_socket_path": activation_socket_path,
                 "brave_bin": os.getenv("BRAVE_BIN", "/usr/bin/brave-origin-nightly"),
                 "voice_browser_profile": os.getenv(
                     "VOICE_BROWSER_PROFILE",
