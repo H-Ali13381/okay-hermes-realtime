@@ -111,7 +111,8 @@ def test_js_uses_openai_realtime_webrtc_transport() -> None:
     assert 'transport.on("connection_change"' in start_block
     assert 'transport.on("error"' in start_block
     assert 'if (cause?.type === "error") return' in start_block
-    assert "await transport.connect" in start_block
+    assert "const connectPromise = transport.connect" in start_block
+    assert "await connectPromise" in start_block
     assert "new RTCPeerConnection" not in start_block
     assert "createDataChannel" not in start_block
     assert 'fetch("/session"' not in script
@@ -171,6 +172,11 @@ def test_ui_contract_keeps_cleanup_guards() -> None:
 def test_activation_mode_uses_same_origin_control_websocket_and_auto_start() -> None:
     script = _read(JS_PATH)
     html = _read(INDEX_PATH)
+    start_block = _extract_block(
+        script,
+        "async function startConversation() {",
+        "function stopConversation(options = {}) {",
+    )
 
     assert "new URLSearchParams(window.location.search)" in script
     assert 'searchParams.get("activation")' in script
@@ -181,6 +187,9 @@ def test_activation_mode_uses_same_origin_control_websocket_and_auto_start() -> 
     assert 'type: "realtime_connected"' in script
     assert "provider_call_id: providerCallId" in script
     assert 'type: "page_started"' in script
+    assert start_block.index("const connectPromise = transport.connect") < start_block.index(
+        'type: "realtime_connected"'
+    ) < start_block.index("await connectPromise")
     assert "startConversation()" in script
     assert 'type: "stop"' in script
     assert 'type: "teardown_complete"' in script

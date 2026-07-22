@@ -22596,6 +22596,25 @@ async function fetchClientSecret() {
   }
   return payload;
 }
+async function waitForProviderCallId(transport, connectPromise) {
+  const deadline = performance.now() + 1e4;
+  while (realtimeTransport === transport) {
+    if (typeof transport.callId === "string" && transport.callId) {
+      return transport.callId;
+    }
+    if (performance.now() >= deadline) {
+      throw new Error("Realtime transport did not expose a call ID");
+    }
+    const outcome = await Promise.race([
+      connectPromise.then(() => "connected"),
+      new Promise((resolve) => setTimeout(() => resolve("poll"), 20))
+    ]);
+    if (outcome === "connected") {
+      throw new Error("Realtime transport connected without a call ID");
+    }
+  }
+  throw new Error("Realtime transport was replaced during connection");
+}
 async function startConversation() {
   clearError();
   resetTranscript();
@@ -22647,25 +22666,25 @@ async function startConversation() {
       recordRealtimeError(detail);
       showError(detail.message);
     });
-    await transport.connect({
+    const connectPromise = transport.connect({
       apiKey: clientSecret.value,
       model: clientSecret.session.model,
       initialSessionConfig: {
         providerData: clientSecret.session
       }
     });
-    if (realtimeTransport !== transport) return;
     if (localSessionId) {
-      const providerCallId = transport.callId;
-      if (typeof providerCallId !== "string" || !providerCallId) {
-        throw new Error("Realtime transport did not expose a call ID");
-      }
+      const providerCallId = await waitForProviderCallId(transport, connectPromise);
       if (!sendControlMessage({
         type: "realtime_connected",
         provider_call_id: providerCallId
       })) {
         throw new Error("Could not bind the Realtime call to the local controller");
       }
+    }
+    await connectPromise;
+    if (realtimeTransport !== transport) return;
+    if (localSessionId) {
       sendControlMessage({ type: "page_started" });
     }
     stopButton.disabled = false;
