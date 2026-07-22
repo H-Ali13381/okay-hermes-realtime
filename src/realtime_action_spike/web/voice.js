@@ -77,7 +77,55 @@ function controlTimingData(name, data) {
       interrupted_response_id: data.interruptedResponseId,
     };
   }
+  if (name === "realtime_response_done") {
+    return {
+      response_id: data.responseId,
+      status: data.status,
+      output_types: data.outputTypes,
+      suppressed_response_id: data.suppressedResponseId,
+      pending_restore_response_id: data.pendingRestoreResponseId,
+      remote_audio_muted: data.remoteAudioMuted,
+    };
+  }
+  if (name === "realtime_error") {
+    return {
+      error_type: data.errorType,
+      code: data.code,
+      message: data.message,
+    };
+  }
   return {};
+}
+
+function boundedDiagnosticText(value, maxLength = 512) {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.replace(/[\u0000-\u001f\u007f]+/gu, " ").trim();
+  if (!normalized) return undefined;
+  return normalized.slice(0, maxLength);
+}
+
+function recordRealtimeResponseDone(event) {
+  const response = event.response || {};
+  if (typeof response.id !== "string" || typeof response.status !== "string") return;
+  recordTiming("realtime_response_done", {
+    responseId: response.id,
+    status: response.status,
+    outputTypes: (response.output || [])
+      .map((item) => boundedDiagnosticText(item?.type, 64))
+      .filter(Boolean)
+      .slice(0, 16),
+    suppressedResponseId: interruptionState?.suppressedResponseId || undefined,
+    pendingRestoreResponseId: interruptionState?.pendingRestoreResponseId || undefined,
+    remoteAudioMuted: remoteAudio.muted,
+  });
+}
+
+function recordRealtimeError(error) {
+  recordTiming("realtime_error", {
+    errorType: boundedDiagnosticText(error?.type, 128),
+    code: boundedDiagnosticText(error?.code, 128),
+    message: boundedDiagnosticText(error?.message) || "Unspecified Realtime error",
+  });
 }
 
 function recordTiming(name, data = {}) {
@@ -589,11 +637,13 @@ async function handleRealtimeEvent(event, sessionContext) {
   } else if (event.type === "conversation.item.truncated") {
     handleResponseTruncation(event, sessionContext);
   } else if (event.type === "response.done") {
+    recordRealtimeResponseDone(event);
     handleResponseCancellation(event, sessionContext);
     setStatus("connected", "Connected — speak naturally");
   } else if (event.type === "action_state") {
     handleActionState(event);
   } else if (event.type === "error") {
+    recordRealtimeError(event.error);
     showError(event.error?.message || "The Realtime session returned an error.");
   }
 }

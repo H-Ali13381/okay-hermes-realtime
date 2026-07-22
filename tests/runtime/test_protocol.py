@@ -371,6 +371,67 @@ def test_timing_name_keys_are_narrow_and_required() -> None:
         )
 
 
+def test_realtime_diagnostic_timings_are_bounded_and_narrow() -> None:
+    session_id = "local-session-01"
+    response = parse_loopback_message(
+        {
+            "type": "timing",
+            "session_id": session_id,
+            "name": "realtime_response_done",
+            "monotonic_ms": 10.0,
+            "data": {
+                "response_id": "resp-123",
+                "status": "failed",
+                "output_types": ["message"],
+                "suppressed_response_id": "resp-122",
+                "pending_restore_response_id": "resp-123",
+                "remote_audio_muted": True,
+            },
+        }
+    )
+    assert isinstance(response, TimingMessage)
+
+    error = parse_loopback_message(
+        {
+            "type": "timing",
+            "session_id": session_id,
+            "name": "realtime_error",
+            "monotonic_ms": 11.0,
+            "data": {
+                "error_type": "invalid_request_error",
+                "code": "unsupported_tool",
+                "message": "No matching media tool was supplied",
+            },
+        }
+    )
+    assert isinstance(error, TimingMessage)
+
+    for invalid_data in (
+        {"error_type": "provider", "message": "x" * 513},
+        {"error_type": "provider", "raw_event": {}},
+        {
+            "response_id": "resp-123",
+            "status": "unknown",
+            "output_types": [],
+            "remote_audio_muted": False,
+        },
+    ):
+        with pytest.raises((ValidationError, ValueError)):
+            parse_loopback_message(
+                {
+                    "type": "timing",
+                    "session_id": session_id,
+                    "name": (
+                        "realtime_response_done"
+                        if "response_id" in invalid_data
+                        else "realtime_error"
+                    ),
+                    "monotonic_ms": 12.0,
+                    "data": invalid_data,
+                }
+            )
+
+
 def test_sdp_offer_and_answer_timing_only_accept_sha256_hashes() -> None:
     session_id = "local-session-01"
     valid_hash = "ab" * 32

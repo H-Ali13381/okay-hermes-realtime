@@ -147,6 +147,8 @@ def test_js_has_sanitized_timing_markers() -> None:
         "sdp_offer_created",
         "sdp_answer_applied",
         "webrtc_transport_failure",
+        "realtime_response_done",
+        "realtime_error",
     ]:
         assert f'"{marker}"' in script
 
