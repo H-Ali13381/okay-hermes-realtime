@@ -1,3 +1,4 @@
+import { canApplySessionAnswer } from "./startup_guard.mjs";
 import {
   createInterruptionState,
   reduceInterruption,
@@ -715,6 +716,7 @@ async function startConversation() {
     interruptionState = createInterruptionState(sessionId);
     renderInterruptionDiagnostics();
     const answerSdp = await sdpResponse.text();
+    if (!canApplySessionAnswer(peerConnection, pc)) return;
     const answer = { type: "answer", sdp: answerSdp };
     await pc.setRemoteDescription(answer);
     recordTiming("sdp_answer_applied", {

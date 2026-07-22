@@ -182,14 +182,17 @@ class DedicatedBraveLauncher:
             # browser permission prompt.
             "--use-fake-ui-for-media-stream",
         ]
-        process = self._process_factory(
-            args,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            shell=False,
-            start_new_session=True,
-        )
+        process_options: dict[str, object] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "shell": False,
+            "start_new_session": True,
+        }
+        vendor_environment = _vendor_brave_environment(self._resolved_brave_binary)
+        if vendor_environment is not None:
+            process_options["env"] = vendor_environment
+        process = self._process_factory(args, **process_options)
 
         if process.poll() is not None:
             raise BrowserLaunchError("Brave process exited immediately after startup request")
@@ -200,6 +203,23 @@ class DedicatedBraveLauncher:
             close_timeout_seconds=_BROWSER_CLOSE_PHASE_TIMEOUT_SECONDS,
             kill_process_group=self._kill_process_group,
         )
+
+
+def _vendor_brave_environment(binary: str) -> dict[str, str] | None:
+    executable = Path(binary)
+    wrapper = executable.with_name("brave-origin")
+    if executable.name != "brave" or not wrapper.is_file():
+        return None
+
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "CHROME_WRAPPER": str(wrapper.resolve()),
+            "CHROME_VERSION_EXTRA": "nightly",
+            "GNOME_DISABLE_CRASH_DIALOG": "SET_BY_GOOGLE_CHROME",
+        }
+    )
+    return environment
 
 
 def _resolve_executable(binary: str) -> str:
