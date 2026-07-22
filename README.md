@@ -1,6 +1,6 @@
 # Okay Hermes Realtime — Stage 1 replacement candidate
 
-An OpenAI-specific, independently installable replacement candidate for Okay Hermes Voice (OHV). A native wake listener and tray launch a dedicated Brave app window; microphone and model audio stay on OpenAI Realtime WebRTC while the local controller owns session scope, sideband events, tool authorization, interruption timing, and teardown.
+An OpenAI-specific, independently installable replacement candidate for Okay Hermes Voice (OHV). A native wake listener and tray launch a dedicated Brave app window; OpenAI's maintained `OpenAIRealtimeWebRTC` transport owns microphone, model audio, interruption, and response sequencing while the local controller owns session scope, sideband tools, authorization, traces, and teardown.
 
 This branch does not modify or reuse the OHV runtime. It has separate units, binaries, config, state, browser profile, and installer paths.
 
@@ -28,9 +28,9 @@ Implemented and exercised:
 - native Qt tray with Turn ON, Turn OFF, Open Voice Page, status, and diagnostics;
 - dedicated Brave app profile and real microphone capture;
 - OpenAI `gpt-realtime-2.1-mini` WebRTC conversation;
-- server-side OpenAI sideband connection and provider call-handle binding;
+- server-side OpenAI sideband connection bound from the SDK's authenticated call ID;
 - controller-owned `assistant_get_current_time` and `voice_end_session` execution;
-- interruption playback suppression and timing traces;
+- SDK-owned interruption handling with passive browser/provider diagnostics;
 - bounded, idempotent teardown and wake rearm;
 - deterministic lifecycle, race, replay, failure, and installer tests.
 
@@ -38,7 +38,7 @@ This remains an OpenAI-only prototype. It is not a generic realtime-provider lay
 
 ## Quick install
 
-Prerequisites: Linux user systemd, PipeWire/WirePlumber, Brave Origin Nightly, Qt 6 development packages, CMake/Ninja, a wakeword ONNX model, ONNX Runtime, `uv`, and an OpenAI API project with Realtime access.
+Runtime prerequisites: Linux user systemd, PipeWire/WirePlumber, Brave Origin Nightly, Qt 6 development packages, CMake/Ninja, a wakeword ONNX model, ONNX Runtime, `uv`, and an OpenAI API project with Realtime access. Rebuilding the committed browser bundle additionally requires Node.js and npm.
 
 ```bash
 MODEL=/absolute/path/to/okay-hermes.onnx
@@ -110,7 +110,7 @@ The installer refuses collisions unless `--force` is explicit and records replac
 ## Security boundary
 
 - `OPENAI_API_KEY` remains in the mode-0600 server config and never enters browser JavaScript.
-- The page receives an opaque one-use local activation scope, not the provider call ID.
+- The page receives a short-lived OpenAI `ek_...` client secret and the SDK's call ID. The standard API key never enters browser JavaScript, and the call ID is sent only over the activation-authenticated loopback control socket.
 - The controller validates session IDs, sideband events, function names, and bounded JSON arguments.
 - Tool execution is allowlisted; model-generated shell/code is never evaluated.
 - Late/stale events and changed-payload call-ID reuse are rejected.
@@ -118,20 +118,14 @@ The installer refuses collisions unless `--force` is explicit and records replac
 
 ## Interruption diagnostics
 
-Per-response traces can include:
+The current diagnostics include:
 
-- `response_id`;
-- `user_speech_onset_ms`;
-- `speech_started_received_ns`;
-- `provider_audio_start_ms`;
-- `playback_suppressed_ns`;
-- `response_cancelled_ns`;
-- `truncation_observed_ns`;
-- `listening_restored_ns`;
-- `next_response_first_audio_ns`;
-- derived `speech_start_to_audible_silence_ms` when both endpoints exist.
+- SDK connection-state changes;
+- response completion status and output types;
+- structured Realtime error type, code, and bounded message;
+- browser-observed time from speech start to provider cancellation, output-buffer clear, and next response audio in the visible diagnostics panel.
 
-Missing observations remain missing; the runtime does not substitute plausible zeroes.
+The application does not mute, pause, or manually resume model audio. Missing observations remain missing; the runtime does not substitute plausible zeroes or claim an audible-silence measurement it did not observe.
 
 ## Verification
 
@@ -139,8 +133,9 @@ Missing observations remain missing; the runtime does not substitute plausible z
 uv run pytest -q
 uv run ruff check .
 uv run python -m compileall -q src scripts
-node --test tests/web/*.test.mjs
-uv build
+npm ci
+npm run check:web
+bash scripts/build-package.sh
 cmake -S native/realtime-tray -B /tmp/okay-hermes-realtime-tray-final -G Ninja
 cmake --build /tmp/okay-hermes-realtime-tray-final
 ORT=/absolute/path/to/onnxruntime

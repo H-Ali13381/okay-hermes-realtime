@@ -11,7 +11,11 @@ from starlette.websockets import WebSocketDisconnect
 
 from realtime_action_spike.config import Settings, build_realtime_session
 from realtime_action_spike.gateway import (
+    LOCAL_CLIENT_HEADER,
+    LOCAL_CLIENT_HEADER_VALUE,
+    LOCAL_CONTROLLER_SESSION_HEADER,
     OPENAI_REALTIME_CALLS_URL,
+    OPENAI_REALTIME_CLIENT_SECRETS_URL,
     _relay_control_websocket,
     create_app,
 )
@@ -23,6 +27,7 @@ from realtime_action_spike.runtime.protocol import (
     LoopbackMessage,
     PageReadyMessage,
     PageStartedMessage,
+    RealtimeConnectedMessage,
     SessionOutcome,
     StopMessage,
     StopReason,
@@ -159,6 +164,55 @@ class DisconnectController:
         self.teardown_calls.append({"session_id": session_id, **kwargs})
 
 
+class RealtimeBindingWebSocket:
+    def __init__(self, payload: str) -> None:
+        self.payload = payload
+        self.received = False
+        self.close_codes: list[int] = []
+
+    async def receive_text(self) -> str:
+        if not self.received:
+            self.received = True
+            return self.payload
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def send_text(self, _payload: str) -> None:
+        return None
+
+    async def close(self, code: int = 1000) -> None:
+        self.close_codes.append(code)
+
+
+class BindingOrderController:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.processed = asyncio.Event()
+
+    async def wait_for_outbound_message(self, _session_id: str) -> LoopbackMessage:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def process_control_message(self, _session_id: str, _raw: str) -> None:
+        self.events.append("processed")
+        self.processed.set()
+
+
+class BindingFailureController(BindingOrderController):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.teardown_calls: list[dict[str, object]] = []
+
+    async def request_teardown(self, session_id: str, **kwargs: object) -> None:
+        self.teardown_calls.append({"session_id": session_id, **kwargs})
+
+
+class DisconnectingSendWebSocket(BlockingControlWebSocket):
+    async def send_text(self, payload: str) -> None:
+        del payload
+        raise WebSocketDisconnect()
+
+
 def settings(api_key: str | None = "test-secret-key") -> Settings:
     return Settings(openai_api_key=api_key)
 
@@ -236,6 +290,104 @@ def test_session_endpoint_requires_server_side_api_key() -> None:
 
     assert response.status_code == 503
     assert response.json()["detail"] == "OPENAI_API_KEY is not configured on the gateway"
+
+
+def test_client_secret_endpoint_mints_ephemeral_token_with_server_owned_session() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            200,
+            json={
+                "value": "ek_ephemeral_browser_token",
+                "expires_at": 1_796_000_000,
+                "session": {"type": "realtime"},
+            },
+        )
+    )
+    controller, session_id, _token = _activated_controller()
+    client = TestClient(create_app(settings(), upstream_client=upstream, controller=controller))
+
+    response = client.post(
+        "/client-secret",
+        headers={
+            LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE,
+            LOCAL_CONTROLLER_SESSION_HEADER: session_id,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload == {
+        "value": "ek_ephemeral_browser_token",
+        "expires_at": 1_796_000_000,
+        "session": build_realtime_session(settings()),
+    }
+    assert "test-secret-key" not in response.text
+    assert upstream.calls == [
+        {
+            "url": OPENAI_REALTIME_CLIENT_SECRETS_URL,
+            "headers": {
+                "Authorization": "Bearer test-secret-key",
+                "OpenAI-Safety-Identifier": upstream.calls[0]["headers"][
+                    "OpenAI-Safety-Identifier"
+                ],
+                "Content-Type": "application/json",
+            },
+            "json": {"session": build_realtime_session(settings())},
+        }
+    ]
+
+
+def test_client_secret_rejects_stale_controller_session() -> None:
+    controller, _session_id, _token = _activated_controller()
+    client = TestClient(create_app(settings(), controller=controller))
+
+    response = client.post(
+        "/client-secret",
+        headers={
+            LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE,
+            LOCAL_CONTROLLER_SESSION_HEADER: "local-session-stale",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Local voice session is no longer active"}
+
+
+def test_client_secret_rejects_requests_without_voice_client_header() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            200,
+            json={"value": "ek_test_ephemeral", "expires_at": 1_800_000_000},
+        )
+    )
+
+    response = TestClient(create_app(settings(), upstream_client=upstream)).post(
+        "/client-secret"
+    )
+
+    assert response.status_code == 403
+    assert upstream.calls == []
+
+
+def test_manual_client_secret_disables_tools_without_sideband() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            200,
+            json={"value": "ek_manual_ephemeral", "expires_at": 1_800_000_000},
+        )
+    )
+
+    response = TestClient(create_app(settings(), upstream_client=upstream)).post(
+        "/client-secret",
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
+    )
+
+    assert response.status_code == 200
+    session = response.json()["session"]
+    assert session["tools"] == []
+    assert session["tool_choice"] == "none"
+    assert "Manual diagnostic mode cannot execute tools" in session["instructions"]
+    assert upstream.calls[0]["json"] == {"session": session}
 
 
 def test_session_endpoint_rejects_wrong_media_type() -> None:
@@ -592,6 +744,97 @@ async def test_control_relay_delivers_server_stop_without_blocking_receive() -> 
         relay.cancel()
         with pytest.raises(asyncio.CancelledError):
             await relay
+
+
+@pytest.mark.asyncio
+async def test_control_relay_binds_sideband_before_processing_realtime_connected() -> None:
+    events: list[str] = []
+    controller = BindingOrderController(events)
+    message = RealtimeConnectedMessage(
+        type="realtime_connected",
+        session_id="local-binding-01",
+        provider_call_id="call_provider_01",
+    )
+    websocket = RealtimeBindingWebSocket(encode_loopback_message(message))
+
+    async def bind(local_session_id: str, provider_call_id: str) -> None:
+        assert local_session_id == "local-binding-01"
+        assert provider_call_id == "call_provider_01"
+        events.append("bound")
+
+    relay = asyncio.create_task(
+        _relay_control_websocket(
+            websocket,  # type: ignore[arg-type]
+            controller,  # type: ignore[arg-type]
+            "local-binding-01",
+            bind_realtime_call=bind,
+        )
+    )
+    try:
+        await asyncio.wait_for(controller.processed.wait(), timeout=1.0)
+        assert events == ["bound", "processed"]
+    finally:
+        relay.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await relay
+
+
+@pytest.mark.asyncio
+async def test_control_relay_treats_disconnect_during_send_as_terminal() -> None:
+    action = ActionStateMessage(
+        type="action_state",
+        session_id="local-send-close-01",
+        capability="assistant_get_current_time",
+        state="completed",
+        message="Current time retrieved",
+    )
+
+    await asyncio.wait_for(
+        _relay_control_websocket(
+            DisconnectingSendWebSocket(),  # type: ignore[arg-type]
+            OutboundController(action),  # type: ignore[arg-type]
+            "local-send-close-01",
+        ),
+        timeout=1.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_control_relay_tears_down_when_sideband_binding_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    controller = BindingFailureController()
+    message = RealtimeConnectedMessage(
+        type="realtime_connected",
+        session_id="local-binding-failure-01",
+        provider_call_id="call_provider_failure_01",
+    )
+    websocket = RealtimeBindingWebSocket(encode_loopback_message(message))
+
+    async def fail_binding(_local_session_id: str, _provider_call_id: str) -> None:
+        raise RuntimeError("provider sideband unavailable secret-value")
+
+    await asyncio.wait_for(
+        _relay_control_websocket(
+            websocket,  # type: ignore[arg-type]
+            controller,  # type: ignore[arg-type]
+            "local-binding-failure-01",
+            bind_realtime_call=fail_binding,
+        ),
+        timeout=1.0,
+    )
+
+    assert websocket.close_codes == [1011]
+    assert controller.teardown_calls == [
+        {
+            "session_id": "local-binding-failure-01",
+            "outcome": SessionOutcome.FAILED,
+            "reason": StopReason.TRANSPORT_FAILURE,
+            "error": "sideband connection failed",
+        }
+    ]
+    assert "error_type=RuntimeError" in caplog.text
+    assert "secret-value" not in caplog.text
 
 
 @pytest.mark.asyncio

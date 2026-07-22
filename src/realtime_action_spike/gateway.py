@@ -6,8 +6,10 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import re
 import secrets
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -28,13 +30,23 @@ from .openai.calls import (
 )
 from .runtime.browser import NoopBrowserHandle
 from .runtime.controller import StaleControlMessage, VoiceSessionController
-from .runtime.protocol import SessionOutcome, StopMessage, StopReason
+from .runtime.protocol import (
+    RealtimeConnectedMessage,
+    SessionOutcome,
+    StopMessage,
+    StopReason,
+    parse_loopback_message,
+)
 from .runtime.tokens import LaunchTokenStore
 
 OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
+OPENAI_REALTIME_CLIENT_SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets"
 OPENAI_REALTIME_SESSION_HEADER = "X-OpenAI-Realtime-Session-ID"
+LOCAL_CLIENT_HEADER = "X-Okay-Hermes-Client"
+LOCAL_CLIENT_HEADER_VALUE = "voice-page-v1"
 LOCAL_CONTROLLER_SESSION_HEADER = "X-Okay-Hermes-Session-ID"
 _LOCAL_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,128}$")
+logger = logging.getLogger(__name__)
 
 
 class AsyncPostClient(Protocol):
@@ -102,14 +114,46 @@ async def _post_to_openai(
         return await client.post(OPENAI_REALTIME_CALLS_URL, **request_kwargs)
 
 
+async def _post_client_secret(
+    *,
+    settings: Settings,
+    session: dict[str, Any],
+    upstream_client: AsyncPostClient | None,
+) -> httpx.Response:
+    api_key = settings.api_key_value()
+    assert api_key is not None
+    request_kwargs = {
+        "headers": {
+            "Authorization": f"Bearer {api_key}",
+            "OpenAI-Safety-Identifier": _safety_identifier(),
+            "Content-Type": "application/json",
+        },
+        "json": {"session": session},
+    }
+    if upstream_client is not None:
+        return await upstream_client.post(OPENAI_REALTIME_CLIENT_SECRETS_URL, **request_kwargs)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        return await client.post(OPENAI_REALTIME_CLIENT_SECRETS_URL, **request_kwargs)
+
+
 async def _relay_control_websocket(
     websocket: WebSocket,
     controller: VoiceSessionController,
     session_id: str,
+    *,
+    bind_realtime_call: Callable[[str, str], Awaitable[None]] | None = None,
 ) -> None:
+    async def send_text(payload: str) -> bool:
+        try:
+            await websocket.send_text(payload)
+        except (RuntimeError, WebSocketDisconnect):
+            return False
+        return True
+
     receive_task = asyncio.create_task(websocket.receive_text())
     outbound_task = asyncio.create_task(controller.wait_for_outbound_message(session_id))
     server_stop_sent = False
+    realtime_call_bound = False
     try:
         while True:
             done, _pending = await asyncio.wait(
@@ -131,9 +175,33 @@ async def _relay_control_websocket(
                     return
 
                 try:
+                    message = parse_loopback_message(raw_message)
+                    if isinstance(message, RealtimeConnectedMessage):
+                        if bind_realtime_call is None or realtime_call_bound:
+                            raise ValueError("realtime call binder is unavailable")
+                        try:
+                            await bind_realtime_call(session_id, message.provider_call_id)
+                        except Exception as exc:
+                            logger.error(
+                                "realtime sideband binding failed session_id=%s error_type=%s",
+                                session_id,
+                                type(exc).__name__,
+                            )
+                            with contextlib.suppress(StaleControlMessage, TimeoutError):
+                                await controller.request_teardown(
+                                    session_id,
+                                    outcome=SessionOutcome.FAILED,
+                                    reason=StopReason.TRANSPORT_FAILURE,
+                                    error="sideband connection failed",
+                                )
+                            with contextlib.suppress(RuntimeError, WebSocketDisconnect):
+                                await websocket.close(code=1011)
+                            return
+                        realtime_call_bound = True
                     closed = await controller.process_control_message(session_id, raw_message)
                 except (StaleControlMessage, ValueError):
-                    await websocket.close(code=4403)
+                    with contextlib.suppress(RuntimeError, WebSocketDisconnect):
+                        await websocket.close(code=4403)
                     return
 
                 if closed is not None:
@@ -149,14 +217,17 @@ async def _relay_control_websocket(
                             )
                         except (TimeoutError, StaleControlMessage):
                             break
-                        await websocket.send_text(outbound.model_dump_json())
+                        if not await send_text(outbound.model_dump_json()):
+                            return
                         server_stop_sent = isinstance(outbound, StopMessage)
                         if not server_stop_sent:
                             outbound_task = asyncio.create_task(
                                 controller.wait_for_outbound_message(session_id)
                             )
-                    await websocket.send_text(closed.model_dump_json())
-                    await websocket.close()
+                    if not await send_text(closed.model_dump_json()):
+                        return
+                    with contextlib.suppress(RuntimeError, WebSocketDisconnect):
+                        await websocket.close()
                     return
                 receive_task = asyncio.create_task(websocket.receive_text())
 
@@ -165,7 +236,8 @@ async def _relay_control_websocket(
                     outbound = outbound_task.result()
                 except StaleControlMessage:
                     return
-                await websocket.send_text(outbound.model_dump_json())
+                if not await send_text(outbound.model_dump_json()):
+                    return
                 server_stop_sent = server_stop_sent or isinstance(outbound, StopMessage)
                 outbound_task = asyncio.create_task(
                     controller.wait_for_outbound_message(session_id)
@@ -190,8 +262,6 @@ def create_app(
     index_html = web_root / "index.html"
     call_handle_registry = call_handle_registry or _InMemoryRealtimeCallHandleRegistry()
     web_assets = {
-        "connection_lifecycle.mjs": "text/javascript",
-        "interruption_state.mjs": "text/javascript",
         "voice.css": "text/css",
         "voice.js": "text/javascript",
     }
@@ -268,7 +338,25 @@ def create_app(
             await websocket.close(code=4403)
             return
 
-        await _relay_control_websocket(websocket, _controller, session_id)
+        async def bind_realtime_call(local_session_id: str, provider_call_id: str) -> None:
+            api_key = settings.api_key_value()
+            if api_key is None:
+                raise ValueError("OPENAI_API_KEY is not configured")
+            try:
+                await _controller.start_realtime_sideband(
+                    local_session_id=local_session_id,
+                    call_id=provider_call_id,
+                    api_key=api_key,
+                )
+            except StaleControlMessage as exc:
+                raise ValueError("Local voice session is no longer active") from exc
+
+        await _relay_control_websocket(
+            websocket,
+            _controller,
+            session_id,
+            bind_realtime_call=bind_realtime_call,
+        )
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -279,6 +367,83 @@ def create_app(
             "capabilities": [capability.name for capability in CAPABILITIES],
             "controller_status": _controller.status,
         }
+
+    @app.post("/client-secret")
+    async def create_client_secret(request: Request) -> Response:
+        if not _is_loopback_client(request):
+            raise HTTPException(status_code=403, detail="Only local clients can create sessions")
+        if request.headers.get(LOCAL_CLIENT_HEADER) != LOCAL_CLIENT_HEADER_VALUE:
+            raise HTTPException(status_code=403, detail="Invalid local voice client")
+        if settings.api_key_value() is None:
+            raise HTTPException(
+                status_code=503,
+                detail="OPENAI_API_KEY is not configured on the gateway",
+            )
+
+        local_session_id = request.headers.get(LOCAL_CONTROLLER_SESSION_HEADER)
+        if local_session_id is not None:
+            if _LOCAL_SESSION_ID_RE.fullmatch(local_session_id) is None:
+                raise HTTPException(status_code=400, detail="Invalid local session binding")
+            if _controller.active_session_id != local_session_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Local voice session is no longer active",
+                )
+
+        session = build_realtime_session(settings)
+        if local_session_id is None:
+            session = {
+                **session,
+                "instructions": (
+                    f"{session['instructions']}\n\n"
+                    "Manual diagnostic mode cannot execute tools or external actions. "
+                    "Respond conversationally and do not claim to perform actions."
+                ),
+                "tools": [],
+                "tool_choice": "none",
+            }
+
+        try:
+            upstream = await _post_client_secret(
+                settings=settings,
+                session=session,
+                upstream_client=upstream_client,
+            )
+        except httpx.HTTPError:
+            return JSONResponse(
+                status_code=502,
+                content={"detail": "OpenAI Realtime client secret request failed"},
+            )
+        if not upstream.is_success:
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "detail": "OpenAI Realtime client secret creation failed",
+                    "upstream_status": upstream.status_code,
+                },
+            )
+
+        try:
+            payload = upstream.json()
+            value = payload["value"]
+            expires_at = payload["expires_at"]
+            if not isinstance(value, str) or not value.startswith("ek_"):
+                raise ValueError
+            if not isinstance(expires_at, int):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return JSONResponse(
+                status_code=502,
+                content={"detail": "OpenAI returned an invalid client secret"},
+            )
+
+        return JSONResponse(
+            content={
+                "value": value,
+                "expires_at": expires_at,
+                "session": session,
+            }
+        )
 
     @app.post("/session")
     async def create_realtime_session(request: Request) -> Response:

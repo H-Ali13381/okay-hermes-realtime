@@ -23,6 +23,7 @@ from .protocol import (
     LoopbackMessage,
     PageReadyMessage,
     PageStartedMessage,
+    RealtimeConnectedMessage,
     SessionClosedMessage,
     SessionOutcome,
     StopMessage,
@@ -749,6 +750,10 @@ class VoiceSessionController:
                     active.startup_deadline.cancel()
                     active.startup_deadline = None
                 self._notify_status()
+                return None
+
+            if isinstance(message, RealtimeConnectedMessage):
+                active.trace.record("realtime_connected", source="browser", data={})
                 return None
 
             if isinstance(message, TimingMessage):

@@ -39,6 +39,7 @@ class SessionOutcome(StrEnum):
 
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,128}$")
+_PROVIDER_CALL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PROVIDER_RESPONSE_ID_RE = re.compile(r"^[A-Za-z0-9._~-]{1,256}$")
 _SECRET_KEY_NAMES = {
@@ -111,6 +112,24 @@ class PageStartedMessage(_StrictBaseModel):
     @classmethod
     def _validate_session_id(cls, value: str) -> str:
         return _validate_session_id(value)
+
+
+class RealtimeConnectedMessage(_StrictBaseModel):
+    type: Literal["realtime_connected"] = "realtime_connected"
+    session_id: str
+    provider_call_id: str
+
+    @field_validator("session_id")
+    @classmethod
+    def _validate_session_id(cls, value: str) -> str:
+        return _validate_session_id(value)
+
+    @field_validator("provider_call_id")
+    @classmethod
+    def _validate_provider_call_id(cls, value: str) -> str:
+        if _PROVIDER_CALL_ID_RE.fullmatch(value) is None:
+            raise ValueError("provider_call_id must be a bounded opaque identifier")
+        return value
 
 
 class TimingMessage(_StrictBaseModel):
@@ -203,6 +222,7 @@ LoopbackMessage = Annotated[
     ActivationMessage
     | PageReadyMessage
     | PageStartedMessage
+    | RealtimeConnectedMessage
     | TimingMessage
     | StopMessage
     | TeardownCompleteMessage
