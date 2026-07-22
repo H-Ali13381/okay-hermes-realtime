@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import json
+import logging
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -40,6 +42,8 @@ from .teardown import (
 )
 from .timing import JsonValue, SessionTrace, sanitize_timing_data
 from .tokens import LaunchTokenStore
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from realtime_action_spike.openai.interruption import (
@@ -748,11 +752,24 @@ class VoiceSessionController:
                 return None
 
             if isinstance(message, TimingMessage):
+                diagnostic_data = sanitize_timing_data(message.data)
                 active.trace.record(
                     message.name.value,
                     source="browser",
-                    data=sanitize_timing_data(message.data),
+                    data=diagnostic_data,
                     monotonic_ns=int(message.monotonic_ms * 1_000_000),
+                )
+                logger.info(
+                    "session_diagnostic %s",
+                    json.dumps(
+                        {
+                            "session_id": session_id,
+                            "name": message.name.value,
+                            "data": diagnostic_data,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
                 )
                 return None
 

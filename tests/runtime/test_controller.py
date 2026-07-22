@@ -215,6 +215,39 @@ async def test_control_message_flow_tracks_state_and_idempotent_stop_teardown() 
 
 
 @pytest.mark.asyncio
+async def test_realtime_diagnostics_are_logged_while_session_is_active(caplog) -> None:
+    controller = VoiceSessionController(
+        DeterministicLauncher(),
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-log"])),
+        session_id_factory=SequenceFactory(["local-session-log"]),
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id is not None
+    caplog.set_level("INFO", logger="realtime_action_spike.runtime.controller")
+
+    marker = encode_loopback_message(
+        TimingMessage(
+            type="timing",
+            session_id=session_id,
+            name=TimingName.REALTIME_ERROR,
+            monotonic_ms=12.0,
+            data={"error_type": "provider_error", "message": "response failed"},
+        )
+    )
+    assert await controller.process_control_message(session_id, marker) is None
+
+    diagnostic_records = [
+        record.message for record in caplog.records if "session_diagnostic" in record.message
+    ]
+    assert len(diagnostic_records) == 1
+    assert '"name":"realtime_error"' in diagnostic_records[0]
+    assert '"message":"response failed"' in diagnostic_records[0]
+    assert "token-log" not in diagnostic_records[0]
+    await controller.close_active_session()
+
+
+@pytest.mark.asyncio
 async def test_stale_session_messages_are_rejected_after_newer_session_starts() -> None:
     launcher = DeterministicLauncher()
     controller = VoiceSessionController(

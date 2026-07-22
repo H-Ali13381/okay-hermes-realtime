@@ -19,6 +19,8 @@ class TimingName(StrEnum):
     SDP_OFFER_CREATED = "sdp_offer_created"
     SDP_ANSWER_APPLIED = "sdp_answer_applied"
     TRANSPORT_FAILURE = "transport_failure"
+    REALTIME_RESPONSE_DONE = "realtime_response_done"
+    REALTIME_ERROR = "realtime_error"
 
 
 class StopReason(StrEnum):
@@ -348,12 +350,64 @@ def _validate_timing_message_data(name: TimingName, data: dict[str, Any]) -> Non
             raise ValueError("state must be a string")
         return
 
+    if name == TimingName.REALTIME_RESPONSE_DONE:
+        allowed = {
+            "response_id",
+            "status",
+            "output_types",
+            "suppressed_response_id",
+            "pending_restore_response_id",
+            "remote_audio_muted",
+        }
+        provided = set(data.keys())
+        if unknown := provided - allowed:
+            raise ValueError(f"unexpected timing data keys: {sorted(unknown)}")
+        required = {"response_id", "status", "output_types", "remote_audio_muted"}
+        if missing := required - provided:
+            raise ValueError(f"response diagnostic fields are required: {sorted(missing)}")
+        _validate_provider_response_id(data["response_id"], "response_id")
+        for field_name in ("suppressed_response_id", "pending_restore_response_id"):
+            if field_name in data:
+                _validate_provider_response_id(data[field_name], field_name)
+        if data["status"] not in {"completed", "cancelled", "failed", "incomplete"}:
+            raise ValueError("invalid realtime response status")
+        _validate_diagnostic_strings(data["output_types"], "output_types", max_items=16)
+        if not isinstance(data["remote_audio_muted"], bool):
+            raise ValueError("remote_audio_muted must be a bool")
+        return
+
+    if name == TimingName.REALTIME_ERROR:
+        allowed = {"error_type", "code", "message"}
+        provided = set(data.keys())
+        if unknown := provided - allowed:
+            raise ValueError(f"unexpected timing data keys: {sorted(unknown)}")
+        if not provided:
+            raise ValueError("at least one realtime error field is required")
+        for field_name in provided:
+            max_length = 512 if field_name == "message" else 128
+            _validate_diagnostic_text(data[field_name], field_name, max_length=max_length)
+        return
+
     raise ValueError(f"unsupported timing name: {name}")
 
 
 def _validate_provider_response_id(value: Any, field_name: str) -> None:
     if not isinstance(value, str) or not _PROVIDER_RESPONSE_ID_RE.fullmatch(value):
         raise ValueError(f"{field_name} must be a bounded provider response identifier")
+
+
+def _validate_diagnostic_text(value: Any, field_name: str, *, max_length: int) -> None:
+    if not isinstance(value, str) or not value or len(value) > max_length:
+        raise ValueError(f"{field_name} must be a bounded non-empty string")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError(f"{field_name} must not contain control characters")
+
+
+def _validate_diagnostic_strings(value: Any, field_name: str, *, max_items: int) -> None:
+    if not isinstance(value, list) or len(value) > max_items:
+        raise ValueError(f"{field_name} must be a bounded list")
+    for item in value:
+        _validate_diagnostic_text(item, field_name, max_length=64)
 
 
 def parse_loopback_message(
