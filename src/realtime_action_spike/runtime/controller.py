@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
+from .browser import BrowserHandle
 from .protocol import (
     PageReadyMessage,
     PageStartedMessage,
@@ -32,7 +34,7 @@ class StaleControlMessage(ValueError):
 class BrowserLauncher(Protocol):
     """Protocol for launching the browser control URL."""
 
-    def launch(self, loopback_url: str) -> object: ...  # pragma: no cover - protocol shim
+    def launch(self, loopback_url: str) -> BrowserHandle: ...  # pragma: no cover - protocol shim
 
 
 @dataclass
@@ -48,6 +50,7 @@ class _WakeSession:
     token: str
     state: SessionState
     trace: SessionTrace
+    browser_handle: BrowserHandle
 
 
 class VoiceSessionController:
@@ -107,22 +110,24 @@ class VoiceSessionController:
             state = SessionState(session_id=session_id)
             state.transition_to(SessionPhase.LAUNCHING)
             trace = SessionTrace(session_id=session_id)
+
+            self._last_closed_session_id = None
+            try:
+                browser_handle = self._launcher.launch(
+                    _append_activation_query(launch_base_url, token)
+                )
+            except Exception:
+                self._token_store.invalidate(token)
+                state.transition_to(SessionPhase.FAILED)
+                return ActivationResult(status="failed", session_id=session_id, token=token)
+
             self._active_session = _WakeSession(
                 session_id=session_id,
                 token=token,
                 state=state,
                 trace=trace,
+                browser_handle=browser_handle,
             )
-            self._last_closed_session_id = None
-
-            try:
-                self._launcher.launch(_append_activation_query(launch_base_url, token))
-            except Exception:
-                self._token_store.invalidate(token)
-                state.transition_to(SessionPhase.FAILED)
-                self._active_session = None
-                return ActivationResult(status="failed", session_id=session_id, token=token)
-
             return ActivationResult(status="opened", session_id=session_id, token=token)
 
     def validate_activation_token(self, token: str) -> str | None:
@@ -151,9 +156,8 @@ class VoiceSessionController:
             active = self._active_session
 
             if active is None:
-                if (
-                    session_id == self._last_closed_session_id
-                    and isinstance(message, TeardownCompleteMessage)
+                if session_id == self._last_closed_session_id and isinstance(
+                    message, TeardownCompleteMessage
                 ):
                     return SessionClosedMessage(
                         type="session_closed",
@@ -193,6 +197,9 @@ class VoiceSessionController:
 
                 self._active_session = None
                 self._last_closed_session_id = session_id
+
+                with contextlib.suppress(Exception):
+                    active.browser_handle.close()
                 return SessionClosedMessage(
                     type="session_closed",
                     session_id=session_id,

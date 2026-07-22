@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+from .browser import (
+    BrowserHandle,
+    BrowserLaunchError,
+    DedicatedBraveLauncher,
+    DedicatedBrowserHandle,
+    NoopBrowserHandle,
+)
 from .controller import (
     ActivationResult,
     BrowserLauncher,
@@ -28,10 +35,15 @@ from .tokens import LaunchTokenStore
 __all__ = [
     "ActivationMessage",
     "ActivationResult",
+    "BrowserHandle",
+    "BrowserLaunchError",
     "BrowserLauncher",
+    "DedicatedBraveLauncher",
+    "DedicatedBrowserHandle",
     "JsonValue",
     "LaunchTokenStore",
     "LoopbackMessage",
+    "NoopBrowserHandle",
     "PageReadyMessage",
     "PageStartedMessage",
     "SessionClosedMessage",

@@ -22,6 +22,7 @@ from .capabilities import (
     UnknownCapabilityError,
 )
 from .config import Settings, build_realtime_session
+from .runtime.browser import NoopBrowserHandle
 from .runtime.controller import StaleControlMessage, VoiceSessionController
 from .runtime.tokens import LaunchTokenStore
 
@@ -107,8 +108,8 @@ def create_app(
     voice_js = web_root / "voice.js"
 
     class _DiagnosticLauncher:
-        def launch(self, loopback_url: str) -> None:
-            return None
+        def launch(self, loopback_url: str) -> NoopBrowserHandle:
+            return NoopBrowserHandle()
 
     _controller = (
         controller

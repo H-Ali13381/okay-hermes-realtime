@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from realtime_action_spike.runtime.browser import BrowserHandle, NoopBrowserHandle
 from realtime_action_spike.runtime.controller import (
     StaleControlMessage,
     VoiceSessionController,
@@ -22,14 +23,20 @@ from realtime_action_spike.runtime.protocol import (
 from realtime_action_spike.runtime.tokens import LaunchTokenStore
 
 
+class FakeBrowserHandle(NoopBrowserHandle):
+    pass
+
+
 class DeterministicLauncher:
     def __init__(self) -> None:
         self.launched_urls: list[str] = []
-        self.calls = 0
+        self.handles: list[FakeBrowserHandle] = []
 
-    def launch(self, loopback_url: str) -> None:
-        self.calls += 1
+    def launch(self, loopback_url: str) -> BrowserHandle:
         self.launched_urls.append(loopback_url)
+        handle = FakeBrowserHandle()
+        self.handles.append(handle)
+        return handle
 
 
 class FailingLauncher:
@@ -37,7 +44,7 @@ class FailingLauncher:
         self.error = error
         self.calls = 0
 
-    def launch(self, loopback_url: str) -> None:
+    def launch(self, loopback_url: str) -> BrowserHandle:
         self.calls += 1
         raise self.error
 
@@ -71,7 +78,6 @@ async def test_activate_is_single_session_under_concurrency() -> None:
 
     opened = [status for status in statuses if status.status == "opened"]
     assert len(opened) == 1
-    assert statuses[0].session_id is not None or statuses[1].session_id is not None
 
 
 @pytest.mark.asyncio
@@ -91,7 +97,7 @@ async def test_busy_activation_is_reported_and_launcher_not_called_for_second_re
     assert first.status == "opened"
     assert first.session_id == "local-session-01"
     assert second.status == "busy"
-    assert launcher.calls == 1
+    assert len(launcher.handles) == 1
 
 
 @pytest.mark.asyncio
@@ -130,9 +136,7 @@ async def test_control_message_flow_tracks_state_and_idempotent_stop_teardown() 
 
     assert controller.status == "launching"
 
-    ready = encode_loopback_message(
-        PageReadyMessage(type="page_ready", session_id=session_id)
-    )
+    ready = encode_loopback_message(PageReadyMessage(type="page_ready", session_id=session_id))
     assert await controller.process_control_message(session_id, ready) is None
     assert controller.status == "connecting"
 
@@ -171,13 +175,15 @@ async def test_control_message_flow_tracks_state_and_idempotent_stop_teardown() 
     assert closed_first.session_id == session_id
     assert closed_second.session_id == session_id
     assert closed_first.outcome == closed_second.outcome
+    assert launcher.handles[0].closed_calls == 1
     assert controller.status == "idle"
 
 
 @pytest.mark.asyncio
 async def test_stale_session_messages_are_rejected_after_newer_session_starts() -> None:
+    launcher = DeterministicLauncher()
     controller = VoiceSessionController(
-        DeterministicLauncher(),
+        launcher,
         token_store=LaunchTokenStore(
             token_factory=SequenceFactory(["token-a", "token-b"]),
         ),
@@ -223,6 +229,9 @@ async def test_stale_session_messages_are_rejected_after_newer_session_starts() 
 
     assert second_session_id is not None
     assert controller.active_session_id == second_session_id
+    assert second_session_id == "local-session-bb"
+    assert launcher.handles[0].closed_calls == 1
+    assert launcher.handles[1].closed_calls == 0
 
 
 @pytest.mark.asyncio

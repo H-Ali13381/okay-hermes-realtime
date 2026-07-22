@@ -14,6 +14,7 @@ import realtime_action_spike.gateway as gateway_module
 from realtime_action_spike.capabilities import CapabilityBroker
 from realtime_action_spike.config import Settings, build_realtime_session
 from realtime_action_spike.gateway import OPENAI_REALTIME_CALLS_URL, create_app
+from realtime_action_spike.runtime.browser import NoopBrowserHandle
 from realtime_action_spike.runtime.controller import VoiceSessionController
 from realtime_action_spike.runtime.protocol import (
     PageReadyMessage,
@@ -55,9 +56,13 @@ class OutOfOrderUpstreamClient:
 class CapturingLauncher:
     def __init__(self) -> None:
         self.urls: list[str] = []
+        self.handles: list[NoopBrowserHandle] = []
 
-    def launch(self, loopback_url: str) -> None:
+    def launch(self, loopback_url: str) -> NoopBrowserHandle:
         self.urls.append(loopback_url)
+        handle = NoopBrowserHandle()
+        self.handles.append(handle)
+        return handle
 
 
 class CountingBroker(CapabilityBroker):
@@ -128,9 +133,7 @@ def test_session_configuration_uses_fast_natural_voice_defaults() -> None:
         "create_response": True,
         "interrupt_response": True,
     }
-    assert session["audio"]["input"]["transcription"] == {
-        "model": "gpt-4o-mini-transcribe"
-    }
+    assert session["audio"]["input"]["transcription"] == {"model": "gpt-4o-mini-transcribe"}
     assert session["tool_choice"] == "auto"
     assert len(session["tools"]) == 6
     assert "Do not claim an action succeeded before its tool result" in session["instructions"]
@@ -275,9 +278,7 @@ def test_execute_endpoint_replays_same_openai_call_id_without_reexecuting() -> N
     assert first.status_code == 200
     assert second.status_code == 200
     assert second.json() == first.json()
-    assert broker.calls == [
-        ("media_play", {"query": "Daft Punk", "media_type": "music"})
-    ]
+    assert broker.calls == [("media_play", {"query": "Daft Punk", "media_type": "music"})]
 
 
 def test_execute_replay_uses_immutable_serialized_result() -> None:

@@ -38,6 +38,8 @@ uv run python scripts/run.py
 
 Open `http://127.0.0.1:8501`, press **Start conversation**, allow microphone access once, and speak normally. The session remains active until Stop, a failed connection, or a `voice_end_session` action completes.
 
+If Brave opens in app-mode and prompts for microphone access, allow it once so the dedicated profile remembers the decision on later runs.
+
 A ChatGPT/Codex subscription token is not a standard OpenAI API key. The Realtime API must be enabled for the API project, and usage is billed to that project.
 
 ## Useful test phrases
