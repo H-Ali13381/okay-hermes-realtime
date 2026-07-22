@@ -207,6 +207,12 @@ class BindingFailureController(BindingOrderController):
         self.teardown_calls.append({"session_id": session_id, **kwargs})
 
 
+class RejectedSidebandError(RuntimeError):
+    def __init__(self, status_code: int) -> None:
+        self.response = type("Response", (), {"status_code": status_code})()
+        super().__init__("provider rejected secret-value")
+
+
 class DisconnectingSendWebSocket(BlockingControlWebSocket):
     async def send_text(self, payload: str) -> None:
         del payload
@@ -812,7 +818,7 @@ async def test_control_relay_tears_down_when_sideband_binding_fails(
     websocket = RealtimeBindingWebSocket(encode_loopback_message(message))
 
     async def fail_binding(_local_session_id: str, _provider_call_id: str) -> None:
-        raise RuntimeError("provider sideband unavailable secret-value")
+        raise RejectedSidebandError(403)
 
     await asyncio.wait_for(
         _relay_control_websocket(
@@ -833,7 +839,7 @@ async def test_control_relay_tears_down_when_sideband_binding_fails(
             "error": "sideband connection failed",
         }
     ]
-    assert "error_type=RuntimeError" in caplog.text
+    assert "error_type=RejectedSidebandError status_code=403" in caplog.text
     assert "secret-value" not in caplog.text
 
 

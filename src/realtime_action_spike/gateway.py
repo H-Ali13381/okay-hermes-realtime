@@ -49,6 +49,14 @@ _LOCAL_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,128}$")
 logger = logging.getLogger(__name__)
 
 
+def _safe_http_status(error: Exception) -> int | None:
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int) and 100 <= status_code <= 599:
+        return status_code
+    return None
+
+
 class AsyncPostClient(Protocol):
     async def post(self, url: str, **kwargs: Any) -> httpx.Response: ...
 
@@ -183,9 +191,11 @@ async def _relay_control_websocket(
                             await bind_realtime_call(session_id, message.provider_call_id)
                         except Exception as exc:
                             logger.error(
-                                "realtime sideband binding failed session_id=%s error_type=%s",
+                                "realtime sideband binding failed session_id=%s "
+                                "error_type=%s status_code=%s",
                                 session_id,
                                 type(exc).__name__,
+                                _safe_http_status(exc),
                             )
                             with contextlib.suppress(StaleControlMessage, TimeoutError):
                                 await controller.request_teardown(
