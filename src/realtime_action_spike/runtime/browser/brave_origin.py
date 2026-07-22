@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import stat
@@ -54,6 +55,7 @@ class DedicatedBraveLauncher:
             self._loopback_base_url,
         )
         _ensure_dedicated_profile(self._brave_profile)
+        _clear_stale_singleton_lock(self._brave_profile)
 
         args = [
             self._resolved_brave_binary,
@@ -132,3 +134,50 @@ def _ensure_dedicated_profile(profile_path: Path) -> None:
         profile_path.chmod(stat.S_IRWXU)
     except OSError as exc:
         raise BrowserLaunchError(f"could not prepare Brave profile directory: {exc}") from exc
+
+
+_SINGLETON_LOCK_FILES = ("SingletonLock", "SingletonCookie", "SingletonSocket")
+
+
+def _clear_stale_singleton_lock(profile_path: Path) -> None:
+    """Remove Chromium singleton lock files left by a dead owner.
+
+    Chromium writes ``SingletonLock`` as a symlink of the form ``<host>-<pid>``.
+    When a prior dedicated browser dies without cleaning up, the stale lock makes
+    the next launch hand the URL to a nonexistent instance and exit immediately,
+    so the controller only ever sees a browser-startup timeout. Clear the lock
+    only when its owning PID is dead; never disturb a live instance.
+    """
+
+    lock_path = profile_path / "SingletonLock"
+    if not lock_path.is_symlink():
+        return
+
+    owner_pid = _parse_singleton_lock_pid(os.readlink(lock_path))
+    if owner_pid is not None and _pid_is_alive(owner_pid):
+        raise BrowserLaunchError("dedicated Brave profile is already in use by a live instance")
+
+    for name in _SINGLETON_LOCK_FILES:
+        candidate = profile_path / name
+        if candidate.is_symlink() or candidate.exists():
+            with contextlib.suppress(OSError):
+                candidate.unlink()
+
+
+def _parse_singleton_lock_pid(target: str) -> int | None:
+    _, separator, pid_text = target.rpartition("-")
+    if not separator or not pid_text.isdigit():
+        return None
+    return int(pid_text)
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True

@@ -46,6 +46,21 @@ from .tokens import LaunchTokenStore
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_close_code(error: Exception) -> int | None:
+    """Extract a websocket close code from a sideband failure, if present."""
+
+    for attribute in ("code", "status_code"):
+        value = getattr(error, attribute, None)
+        if isinstance(value, int):
+            return value
+    for frame_attribute in ("rcvd", "sent"):
+        frame = getattr(error, frame_attribute, None)
+        code = getattr(frame, "code", None)
+        if isinstance(code, int):
+            return code
+    return None
+
 if TYPE_CHECKING:
     from realtime_action_spike.openai.interruption import (
         InterruptionEvent,
@@ -521,6 +536,16 @@ class VoiceSessionController:
         await sideband.send_json(payload)
 
     async def _handle_sideband_failure(self, local_session_id: str, _error: Exception) -> None:
+        logger.warning(
+            "sideband_failure %s",
+            json.dumps(
+                {
+                    "session_id": local_session_id,
+                    "error_type": type(_error).__name__,
+                    "status_code": _safe_close_code(_error),
+                }
+            ),
+        )
         await self._detach_sideband(local_session_id)
 
         active = self._active_session

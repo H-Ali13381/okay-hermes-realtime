@@ -432,3 +432,62 @@ def test_handle_close_fallback_only_targets_owned_process_group() -> None:
     assert kill.calls == [(1234, signal.SIGKILL)]
     assert all(group == process.pid for group, _ in kill.calls)
     assert all(sig == signal.SIGKILL for _, sig in kill.calls)
+
+
+def test_launch_clears_stale_singleton_lock_from_dead_owner(tmp_path: Path) -> None:
+    binary = make_executable(tmp_path / "brave-bin")
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    # Simulate a prior voice-browser that died without cleaning its singleton lock.
+    dead_pid = _find_unused_pid()
+    (profile / "SingletonLock").symlink_to(f"localhost-host-{dead_pid}")
+    (profile / "SingletonCookie").symlink_to("16376446489542904688")
+    (profile / "SingletonSocket").symlink_to("/tmp/org.chromium.Chromium.X/SingletonSocket")
+
+    launcher = DedicatedBraveLauncher(
+        brave_binary=str(binary),
+        brave_profile=str(profile),
+        loopback_base_url="http://127.0.0.1:8765/voice",
+        process_factory=ProcessFactory(process=FakeProcess(pid=555)),
+    )
+
+    launcher.launch(launcher._build_loopback_url("secret-token"))
+
+    assert not (profile / "SingletonLock").exists()
+    assert not (profile / "SingletonLock").is_symlink()
+    assert not (profile / "SingletonCookie").is_symlink()
+    assert not (profile / "SingletonSocket").is_symlink()
+
+
+def test_launch_refuses_when_singleton_lock_owner_is_alive(tmp_path: Path) -> None:
+    binary = make_executable(tmp_path / "brave-bin")
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    # This process is alive, so the lock must be respected, never removed.
+    (profile / "SingletonLock").symlink_to(f"localhost-host-{os.getpid()}")
+
+    launcher = DedicatedBraveLauncher(
+        brave_binary=str(binary),
+        brave_profile=str(profile),
+        loopback_base_url="http://127.0.0.1:8765/voice",
+        process_factory=ProcessFactory(process=FakeProcess(pid=555)),
+    )
+
+    with pytest.raises(BrowserLaunchError, match="already in use"):
+        launcher.launch(launcher._build_loopback_url("secret-token"))
+
+    assert (profile / "SingletonLock").is_symlink()
+
+
+def _find_unused_pid() -> int:
+    candidate = 400_000
+    while candidate < 500_000:
+        try:
+            os.kill(candidate, 0)
+        except ProcessLookupError:
+            return candidate
+        except PermissionError:  # pragma: no cover - alive but not ours
+            candidate += 1
+            continue
+        candidate += 1
+    raise RuntimeError("could not find an unused pid for the test")
