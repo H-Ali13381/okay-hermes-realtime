@@ -99,6 +99,26 @@ class CallHandleRegistry:
         self.calls.clear()
 
 
+class SidebandStartController:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, str]] = []
+
+    async def start_realtime_sideband(
+        self,
+        *,
+        local_session_id: str,
+        call_id: str,
+        api_key: str,
+    ) -> None:
+        self.calls.append(
+            {
+                "local_session_id": local_session_id,
+                "call_id": call_id,
+                "api_key": api_key,
+            }
+        )
+
+
 class MutableResultBroker(CapabilityBroker):
     def __init__(self) -> None:
         self.execution_count = 0
@@ -252,6 +272,50 @@ def test_session_endpoint_relays_sdp_and_server_owned_configuration() -> None:
     assert call["files"]["sdp"] == (None, "v=0\r\nmock-offer", "application/sdp")
     session_json = call["files"]["session"][1]
     assert json.loads(session_json)["model"] == "gpt-realtime-2.1-mini"
+
+
+def test_session_endpoint_starts_sideband_for_exact_controller_session() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_sideband"},
+        )
+    )
+    registry = CallHandleRegistry()
+    controller = SidebandStartController()
+    client = TestClient(
+        create_app(
+            settings(),
+            upstream_client=upstream,
+            call_handle_registry=registry,
+            controller=controller,  # type: ignore[arg-type]
+        )
+    )
+
+    response = client.post(
+        "/session",
+        content="v=0\r\nmock-offer",
+        headers={
+            "Content-Type": "application/sdp",
+            "X-Okay-Hermes-Session-ID": "local-session-1234",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-openai-realtime-session-id"] == "local-session-1234"
+    assert controller.calls == [
+        {
+            "local_session_id": "local-session-1234",
+            "call_id": "call_sideband",
+            "api_key": "test-secret-key",
+        }
+    ]
+    handle = registry.get("local-session-1234")
+    assert handle is not None
+    assert handle.call_id == "call_sideband"
+    assert "test-secret-key" not in response.text
+    assert "call_sideband" not in response.text
 
 
 def test_session_binding_rejects_malformed_location_without_clearing_existing_binding() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 from contextlib import suppress
 from pathlib import Path
@@ -33,7 +34,9 @@ from .runtime.tokens import LaunchTokenStore
 
 OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
 OPENAI_REALTIME_SESSION_HEADER = "X-OpenAI-Realtime-Session-ID"
+LOCAL_CONTROLLER_SESSION_HEADER = "X-Okay-Hermes-Session-ID"
 MAX_OPENAI_CALLS_PER_SESSION = 512
+_LOCAL_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,128}$")
 
 
 class AsyncPostClient(Protocol):
@@ -255,6 +258,13 @@ def create_app(
         if media_type != "application/sdp":
             raise HTTPException(status_code=415, detail="Content-Type must be application/sdp")
 
+        local_session_id = request.headers.get(LOCAL_CONTROLLER_SESSION_HEADER)
+        if (
+            local_session_id is not None
+            and _LOCAL_SESSION_ID_RE.fullmatch(local_session_id) is None
+        ):
+            raise HTTPException(status_code=400, detail="Invalid local session binding")
+
         try:
             sdp = (await request.body()).decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -309,7 +319,27 @@ def create_app(
                 },
             )
 
-        active_session_id = secrets.token_urlsafe(24)
+        if local_session_id is not None:
+            api_key = settings.api_key_value()
+            assert api_key is not None
+            try:
+                await _controller.start_realtime_sideband(
+                    local_session_id=local_session_id,
+                    call_id=handle.call_id,
+                    api_key=api_key,
+                )
+            except StaleControlMessage:
+                return JSONResponse(
+                    status_code=409,
+                    content={"detail": "Local voice session is no longer active"},
+                )
+            except Exception:
+                return JSONResponse(
+                    status_code=502,
+                    content={"detail": "OpenAI Realtime sideband connection failed"},
+                )
+
+        active_session_id = local_session_id or secrets.token_urlsafe(24)
         execution_results_by_call_id.clear()
         call_handle_registry.clear()
         call_handle_registry.set(active_session_id, handle)
