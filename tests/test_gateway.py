@@ -14,6 +14,7 @@ import realtime_action_spike.gateway as gateway_module
 from realtime_action_spike.capabilities import CapabilityBroker
 from realtime_action_spike.config import Settings, build_realtime_session
 from realtime_action_spike.gateway import OPENAI_REALTIME_CALLS_URL, create_app
+from realtime_action_spike.openai.calls import RealtimeCallHandle
 from realtime_action_spike.runtime.browser import NoopBrowserHandle
 from realtime_action_spike.runtime.controller import VoiceSessionController
 from realtime_action_spike.runtime.protocol import (
@@ -50,7 +51,11 @@ class OutOfOrderUpstreamClient:
         if call_number == 1:
             self.first_started.set()
             await self.release_first.wait()
-        return httpx.Response(201, text=f"v=0\r\nanswer-{call_number}")
+        return httpx.Response(
+            201,
+            text=f"v=0\r\nanswer-{call_number}",
+            headers={"Location": f"/v1/realtime/calls/call-{call_number}"},
+        )
 
 
 class CapturingLauncher:
@@ -78,6 +83,20 @@ class CountingBroker(CapabilityBroker):
             "execution": "local",
             "result": {"execution_count": len(self.calls)},
         }
+
+
+class CallHandleRegistry:
+    def __init__(self) -> None:
+        self.calls: dict[str, RealtimeCallHandle] = {}
+
+    def get(self, local_session_id: str) -> RealtimeCallHandle | None:
+        return self.calls.get(local_session_id)
+
+    def set(self, local_session_id: str, handle: RealtimeCallHandle) -> None:
+        self.calls = {local_session_id: handle}
+
+    def clear(self) -> None:
+        self.calls.clear()
 
 
 class MutableResultBroker(CapabilityBroker):
@@ -114,7 +133,13 @@ def start_openai_realtime_session(client: TestClient, offer: str = "mock-offer")
 def started_execution_client(
     broker: CapabilityBroker | None = None,
 ) -> tuple[TestClient, str]:
-    upstream = StubUpstreamClient(httpx.Response(201, text="v=0\r\nmock-answer"))
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_stable"},
+        )
+    )
     client = TestClient(create_app(settings(), upstream_client=upstream, broker=broker))
     return client, start_openai_realtime_session(client)
 
@@ -187,10 +212,16 @@ def test_session_endpoint_relays_sdp_and_server_owned_configuration() -> None:
         httpx.Response(
             201,
             text="v=0\r\nmock-answer",
-            headers={"x-request-id": "req_realtime_test"},
+            headers={
+                "Location": "/v1/realtime/calls/call_endpoint",
+                "x-request-id": "req_realtime_test",
+            },
         )
     )
-    client = TestClient(create_app(settings(), upstream_client=upstream))
+    registry = CallHandleRegistry()
+    client = TestClient(
+        create_app(settings(), upstream_client=upstream, call_handle_registry=registry)
+    )
 
     response = client.post(
         "/session",
@@ -202,10 +233,17 @@ def test_session_endpoint_relays_sdp_and_server_owned_configuration() -> None:
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/sdp")
-    assert response.headers["x-openai-request-id"] == "req_realtime_test"
     assert response.headers["x-openai-realtime-session-id"]
+    assert "x-openai-request-id" not in response.headers
     assert response.text == "v=0\r\nmock-answer"
     assert len(upstream.calls) == 1
+
+    session_id = response.headers["x-openai-realtime-session-id"]
+    handle = registry.get(session_id)
+    assert handle is not None
+    assert handle.call_id == "call_endpoint"
+    assert handle.request_id == "req_realtime_test"
+    assert handle.sdp_answer == "v=0\r\nmock-answer"
 
     call = upstream.calls[0]
     assert call["url"] == OPENAI_REALTIME_CALLS_URL
@@ -214,6 +252,43 @@ def test_session_endpoint_relays_sdp_and_server_owned_configuration() -> None:
     assert call["files"]["sdp"] == (None, "v=0\r\nmock-offer", "application/sdp")
     session_json = call["files"]["session"][1]
     assert json.loads(session_json)["model"] == "gpt-realtime-2.1-mini"
+
+
+def test_session_binding_rejects_malformed_location_without_clearing_existing_binding() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_current"},
+        )
+    )
+    registry = CallHandleRegistry()
+    client = TestClient(
+        create_app(settings(), upstream_client=upstream, call_handle_registry=registry)
+    )
+    session_id = start_openai_realtime_session(client, "first-offer")
+    bound_before = registry.get(session_id)
+    assert bound_before is not None
+    assert bound_before.call_id == "call_current"
+
+    upstream.response = httpx.Response(
+        201,
+        text="v=0\r\nmalformed-answer",
+        headers={},
+    )
+    second = client.post(
+        "/session",
+        content="v=0\r\nbad-offer",
+        headers={"Content-Type": "application/sdp"},
+    )
+    after_failure = registry.get(session_id)
+
+    assert second.status_code == 502
+    assert after_failure is not None
+    assert after_failure.call_id == "call_current"
+    assert second.json()["detail"] == "OpenAI Realtime session creation failed"
+    assert "call_current" not in second.text
+    assert "Location" not in second.text
 
 
 def test_upstream_failure_is_sanitized_and_preserves_request_id() -> None:
@@ -236,9 +311,9 @@ def test_upstream_failure_is_sanitized_and_preserves_request_id() -> None:
     assert response.json() == {
         "detail": "OpenAI Realtime session creation failed",
         "upstream_status": 401,
-        "request_id": "req_failed_test",
     }
     assert "test-secret-key" not in response.text
+    assert "req_failed_test" not in response.text
 
 
 def test_execute_endpoint_returns_allowlisted_result_with_call_id() -> None:
@@ -357,9 +432,26 @@ def test_execute_endpoint_rejects_changed_payload_for_reused_openai_call_id() ->
 
 def test_successful_realtime_session_resets_openai_call_id_scope() -> None:
     broker = CountingBroker()
-    upstream = StubUpstreamClient(httpx.Response(201, text="v=0\r\nmock-answer"))
-    client = TestClient(create_app(settings(), upstream_client=upstream, broker=broker))
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_stable"},
+        )
+    )
+    registry = CallHandleRegistry()
+    client = TestClient(
+        create_app(
+            settings(),
+            upstream_client=upstream,
+            broker=broker,
+            call_handle_registry=registry,
+        )
+    )
     first_session_id = start_openai_realtime_session(client, "first-offer")
+    first_session_handle = registry.get(first_session_id)
+    assert first_session_handle is not None
+    assert first_session_handle.call_id == "call_stable"
     execution = {
         "session_id": first_session_id,
         "call_id": "call_scoped_to_session",
@@ -368,6 +460,11 @@ def test_successful_realtime_session_resets_openai_call_id_scope() -> None:
     }
 
     before_new_session = client.post("/execute", json=execution)
+    upstream.response = httpx.Response(
+        201,
+        text="v=0\r\nmock-answer-2",
+        headers={"Location": "/v1/realtime/calls/call_rebound"},
+    )
     second_session_id = start_openai_realtime_session(client, "new-offer")
     stale_session = client.post("/execute", json=execution)
     execution["session_id"] = second_session_id
@@ -375,6 +472,10 @@ def test_successful_realtime_session_resets_openai_call_id_scope() -> None:
 
     assert before_new_session.status_code == 200
     assert second_session_id != first_session_id
+    assert registry.get(first_session_id) is None
+    second_session_handle = registry.get(second_session_id)
+    assert second_session_handle is not None
+    assert second_session_handle.call_id == "call_rebound"
     assert stale_session.status_code == 409
     assert stale_session.json()["error"]["type"] == "stale_session"
     assert after_new_session.status_code == 200
@@ -382,9 +483,16 @@ def test_successful_realtime_session_resets_openai_call_id_scope() -> None:
     assert after_new_session.json()["result"]["execution_count"] == 2
 
 
+
 def test_failed_session_creation_preserves_current_execution_scope() -> None:
     broker = CountingBroker()
-    upstream = StubUpstreamClient(httpx.Response(201, text="v=0\r\nmock-answer"))
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_stable"},
+        )
+    )
     client = TestClient(create_app(settings(), upstream_client=upstream, broker=broker))
     session_id = start_openai_realtime_session(client)
     execution = {
@@ -452,7 +560,13 @@ def test_older_session_completion_cannot_replace_newer_openai_scope() -> None:
 
 def test_execute_requires_the_current_openai_realtime_session_scope() -> None:
     broker = CountingBroker()
-    upstream = StubUpstreamClient(httpx.Response(201, text="v=0\r\nmock-answer"))
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_stable"},
+        )
+    )
     client = TestClient(create_app(settings(), upstream_client=upstream, broker=broker))
     request = {
         "session_id": "stale-session",
@@ -480,7 +594,13 @@ def test_execute_requires_the_current_openai_realtime_session_scope() -> None:
 def test_openai_realtime_session_rejects_new_calls_at_safety_limit(monkeypatch) -> None:
     monkeypatch.setattr(gateway_module, "MAX_OPENAI_CALLS_PER_SESSION", 2, raising=False)
     broker = CountingBroker()
-    upstream = StubUpstreamClient(httpx.Response(201, text="v=0\r\nmock-answer"))
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_stable"},
+        )
+    )
     client = TestClient(create_app(settings(), upstream_client=upstream, broker=broker))
     session = client.post(
         "/session",

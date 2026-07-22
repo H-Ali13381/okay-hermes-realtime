@@ -22,6 +22,11 @@ from .capabilities import (
     UnknownCapabilityError,
 )
 from .config import Settings, build_realtime_session
+from .openai.calls import (
+    RealtimeCallHandle,
+    RealtimeCallHandleParseError,
+    parse_realtime_call_handle,
+)
 from .runtime.browser import NoopBrowserHandle
 from .runtime.controller import StaleControlMessage, VoiceSessionController
 from .runtime.tokens import LaunchTokenStore
@@ -33,6 +38,31 @@ MAX_OPENAI_CALLS_PER_SESSION = 512
 
 class AsyncPostClient(Protocol):
     async def post(self, url: str, **kwargs: Any) -> httpx.Response: ...
+
+
+class RealtimeCallHandleRegistry(Protocol):
+    def get(self, local_session_id: str) -> RealtimeCallHandle | None:
+        ...
+
+    def set(self, local_session_id: str, handle: RealtimeCallHandle) -> None:
+        ...
+
+    def clear(self) -> None:
+        ...
+
+
+class _InMemoryRealtimeCallHandleRegistry:
+    def __init__(self) -> None:
+        self._handles: dict[str, RealtimeCallHandle] = {}
+
+    def get(self, local_session_id: str) -> RealtimeCallHandle | None:
+        return self._handles.get(local_session_id)
+
+    def set(self, local_session_id: str, handle: RealtimeCallHandle) -> None:
+        self._handles = {local_session_id: handle}
+
+    def clear(self) -> None:
+        self._handles.clear()
 
 
 class ExecutionRequest(BaseModel):
@@ -99,6 +129,7 @@ def create_app(
     upstream_client: AsyncPostClient | None = None,
     broker: CapabilityBroker | None = None,
     controller: VoiceSessionController | None = None,
+    call_handle_registry: RealtimeCallHandleRegistry | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     broker = broker or CapabilityBroker()
@@ -106,6 +137,7 @@ def create_app(
     index_html = web_root / "index.html"
     voice_css = web_root / "voice.css"
     voice_js = web_root / "voice.js"
+    call_handle_registry = call_handle_registry or _InMemoryRealtimeCallHandleRegistry()
 
     class _DiagnosticLauncher:
         def launch(self, loopback_url: str) -> NoopBrowserHandle:
@@ -138,6 +170,7 @@ def create_app(
         return HTMLResponse(content=html.replace("</head>", marker + "</head>", 1))
 
     app = FastAPI(title="OpenAI Realtime Action Spike Gateway", version="0.1.0")
+    app.state.get_realtime_call_handle = call_handle_registry.get
 
     @app.get("/voice", include_in_schema=False)
     async def voice_page(activation: str | None = None) -> HTMLResponse:
@@ -250,26 +283,38 @@ def create_app(
                 content={"detail": "OpenAI Realtime session attempt was superseded"},
             )
 
-        request_id = upstream.headers.get("x-request-id")
         if not upstream.is_success:
             return JSONResponse(
                 status_code=502,
                 content={
                     "detail": "OpenAI Realtime session creation failed",
                     "upstream_status": upstream.status_code,
-                    "request_id": request_id,
+                },
+            )
+
+        try:
+            handle = parse_realtime_call_handle(
+                location=upstream.headers.get("Location"),
+                headers=upstream.headers,
+                sdp_answer=upstream.text,
+            )
+        except RealtimeCallHandleParseError:
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "detail": "OpenAI Realtime session creation failed",
                 },
             )
 
         active_session_id = secrets.token_urlsafe(24)
         execution_results_by_call_id.clear()
-        headers = {OPENAI_REALTIME_SESSION_HEADER: active_session_id}
-        if request_id:
-            headers["X-OpenAI-Request-ID"] = request_id
+        call_handle_registry.clear()
+        call_handle_registry.set(active_session_id, handle)
+
         return Response(
-            content=upstream.text,
+            content=handle.sdp_answer,
             media_type="application/sdp",
-            headers=headers,
+            headers={OPENAI_REALTIME_SESSION_HEADER: active_session_id},
         )
 
     @app.post("/execute")
