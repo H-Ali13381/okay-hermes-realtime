@@ -9,7 +9,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
+from realtime_action_spike.capabilities import CapabilityBroker
+from realtime_action_spike.openai.events import FunctionCallEventParser
 from realtime_action_spike.openai.sideband import RealtimeSidebandClient, SidebandEvent
+from realtime_action_spike.openai.tool_loop import ToolActionState, ToolCall, TrustedToolLoop
 
 from .browser import BrowserHandle
 from .protocol import (
@@ -86,11 +89,13 @@ class VoiceSessionController:
         session_id_factory: Callable[[], str] | None = None,
         token_store: LaunchTokenStore | None = None,
         lock: asyncio.Lock | None = None,
+        capability_broker: CapabilityBroker | None = None,
     ) -> None:
         self._launcher = launcher
         self._session_id_factory = session_id_factory or (lambda: secrets.token_urlsafe(16))
         self._token_store = token_store or LaunchTokenStore()
         self._lock = lock or asyncio.Lock()
+        self._capability_broker = capability_broker or CapabilityBroker()
 
         self._active_session: _WakeSession | None = None
         self._last_closed_session_id: str | None = None
@@ -98,6 +103,9 @@ class VoiceSessionController:
         self._terminal_results: dict[str, TerminalSessionResult] = {}
         self._last_closed_interruption_traces: tuple[InterruptionTrace, ...] = ()
         self._sideband_clients: dict[str, RealtimeSidebandClient] = {}
+        self._function_call_parsers: dict[str, FunctionCallEventParser] = {}
+        self._tool_loops: dict[str, TrustedToolLoop] = {}
+        self._close_after_response: set[str] = set()
         self._outbound_messages: dict[str, asyncio.Queue[ActionStateMessage]] = {}
 
     @property
@@ -314,6 +322,17 @@ class VoiceSessionController:
         async def on_terminal_failure(local_session_id: str, error: Exception) -> None:
             await self._handle_sideband_failure(local_session_id, error)
 
+        async def publish_tool_action(action: ToolActionState) -> None:
+            await self.publish_action_state(
+                ActionStateMessage(
+                    type="action_state",
+                    session_id=local_session_id,
+                    capability=action.capability,
+                    state=action.state,
+                    message=action.message,
+                )
+            )
+
         sideband = RealtimeSidebandClient(
             local_session_id=local_session_id,
             call_id=call_id,
@@ -322,11 +341,23 @@ class VoiceSessionController:
             on_terminal_failure=on_terminal_failure,
             websocket_connect=websocket_connect,
         )
+        parser = FunctionCallEventParser()
+        tool_loop = TrustedToolLoop(
+            broker=self._capability_broker,
+            send_provider_event=lambda payload: self.send_sideband_event(
+                local_session_id,
+                payload,
+            ),
+            publish_action_state=publish_tool_action,
+        )
 
         async with self._lock:
             self._require_active_session(local_session_id)
             previous_sideband = self._sideband_clients.pop(local_session_id, None)
             self._sideband_clients[local_session_id] = sideband
+            self._function_call_parsers[local_session_id] = parser
+            self._tool_loops[local_session_id] = tool_loop
+            self._close_after_response.discard(local_session_id)
 
         if previous_sideband is not None:
             await previous_sideband.close()
@@ -338,6 +369,9 @@ class VoiceSessionController:
                 current = self._sideband_clients.get(local_session_id)
                 if current is sideband:
                     self._sideband_clients.pop(local_session_id, None)
+                    self._function_call_parsers.pop(local_session_id, None)
+                    self._tool_loops.pop(local_session_id, None)
+                    self._close_after_response.discard(local_session_id)
             await sideband.close()
             raise
 
@@ -352,6 +386,30 @@ class VoiceSessionController:
             self._require_active_session(local_session_id)
             if not isinstance(payload, dict):
                 raise TypeError("sideband event payload must be an object")
+            parser = self._function_call_parsers.get(local_session_id)
+            tool_loop = self._tool_loops.get(local_session_id)
+            if parser is None or tool_loop is None:
+                raise RuntimeError("sideband tool loop is not connected")
+
+        requests = parser.consume(payload)
+        for request in requests:
+            result = await tool_loop.handle(
+                ToolCall(
+                    call_id=request.call_id,
+                    name=request.name,
+                    arguments=dict(request.arguments),
+                )
+            )
+            if result.close_after_farewell:
+                async with self._lock:
+                    self._require_active_session(local_session_id)
+                    self._close_after_response.add(local_session_id)
+
+        if payload.get("type") == "response.done":
+            async with self._lock:
+                should_close = local_session_id in self._close_after_response
+            if should_close:
+                await self.close_active_session(outcome=SessionOutcome.COMPLETED)
 
     async def send_sideband_event(
         self,
@@ -382,6 +440,9 @@ class VoiceSessionController:
 
     async def _detach_sideband(self, local_session_id: str) -> None:
         sideband = self._sideband_clients.pop(local_session_id, None)
+        self._function_call_parsers.pop(local_session_id, None)
+        self._tool_loops.pop(local_session_id, None)
+        self._close_after_response.discard(local_session_id)
         if sideband is None:
             return
         await sideband.close()
@@ -471,6 +532,9 @@ class VoiceSessionController:
             if active is None:
                 return
             sideband = self._sideband_clients.pop(active.session_id, None)
+            self._function_call_parsers.pop(active.session_id, None)
+            self._tool_loops.pop(active.session_id, None)
+            self._close_after_response.discard(active.session_id)
             self._last_closed_interruption_traces = copy.deepcopy(
                 active.interruptions.traces
             )
@@ -512,6 +576,9 @@ class VoiceSessionController:
         )
         self._active_session = None
         self._last_closed_session_id = session.session_id
+        self._function_call_parsers.pop(session.session_id, None)
+        self._tool_loops.pop(session.session_id, None)
+        self._close_after_response.discard(session.session_id)
         self._outbound_messages.pop(session.session_id, None)
 
         if session.browser_handle is not None:

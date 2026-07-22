@@ -8,11 +8,11 @@ import pytest
 
 from realtime_action_spike.capabilities import ExecutionContractError, UnknownCapabilityError
 from realtime_action_spike.openai.tool_loop import (
+    ToolActionState,
     ToolCall,
     ToolCallConflictError,
     TrustedToolLoop,
 )
-from realtime_action_spike.runtime.protocol import ActionStateMessage
 
 
 @dataclass
@@ -44,20 +44,19 @@ async def make_loop() -> tuple[
     TrustedToolLoop,
     RecordingBroker,
     list[dict[str, Any]],
-    list[ActionStateMessage],
+    list[ToolActionState],
 ]:
     broker = RecordingBroker([])
     provider_events: list[dict[str, Any]] = []
-    action_states: list[ActionStateMessage] = []
+    action_states: list[ToolActionState] = []
 
     async def send_provider(event: dict[str, Any]) -> None:
         provider_events.append(event)
 
-    async def publish_action(message: ActionStateMessage) -> None:
+    async def publish_action(message: ToolActionState) -> None:
         action_states.append(message)
 
     loop = TrustedToolLoop(
-        local_session_id="local-actions-01",
         broker=broker,
         send_provider_event=send_provider,
         publish_action_state=publish_action,
@@ -101,7 +100,7 @@ async def test_success_executes_once_and_sends_exact_output_then_continuation() 
     assert result.output == expected_output
     assert result.close_after_farewell is False
     assert [message.state for message in action_states] == ["running", "completed"]
-    assert all("call_id" not in message.model_dump() for message in action_states)
+    assert all(not hasattr(message, "call_id") for message in action_states)
 
 
 @pytest.mark.asyncio
@@ -201,7 +200,7 @@ async def test_voice_end_session_sends_output_without_response_continuation() ->
 async def test_replay_resumes_partial_delivery_without_reexecution() -> None:
     broker = RecordingBroker([])
     provider_events: list[dict[str, Any]] = []
-    action_states: list[ActionStateMessage] = []
+    action_states: list[ToolActionState] = []
     fail_continuation_once = True
 
     async def send_provider(event: dict[str, Any]) -> None:
@@ -211,11 +210,10 @@ async def test_replay_resumes_partial_delivery_without_reexecution() -> None:
             raise ConnectionError("sideband send failed")
         provider_events.append(event)
 
-    async def publish_action(message: ActionStateMessage) -> None:
+    async def publish_action(message: ToolActionState) -> None:
         action_states.append(message)
 
     loop = TrustedToolLoop(
-        local_session_id="local-actions-01",
         broker=broker,
         send_provider_event=send_provider,
         publish_action_state=publish_action,

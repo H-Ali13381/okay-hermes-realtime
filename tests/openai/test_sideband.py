@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -393,9 +394,37 @@ class _Launcher:
         return NoopBrowserHandle()
 
 
-def _controller(*session_ids: str) -> VoiceSessionController:
+@dataclass
+class _ToolBroker:
+    calls: list[tuple[str, dict[str, object]]] = field(default_factory=list)
+
+    def execute(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
+        self.calls.append((name, arguments))
+        if name == "voice_end_session":
+            return {
+                "ok": True,
+                "capability": name,
+                "execution": "local",
+                "result": {"end_session": True},
+            }
+        return {
+            "ok": True,
+            "capability": name,
+            "execution": "local",
+            "result": {"spoken_time": "10:15 PM"},
+        }
+
+
+def _controller(
+    *session_ids: str,
+    broker: _ToolBroker | None = None,
+) -> VoiceSessionController:
     sequence = iter(session_ids)
-    return VoiceSessionController(_Launcher(), session_id_factory=lambda: next(sequence))
+    return VoiceSessionController(
+        _Launcher(),
+        session_id_factory=lambda: next(sequence),
+        capability_broker=broker,
+    )
 
 
 async def _finish_session(controller: VoiceSessionController, session_id: str) -> None:
@@ -454,4 +483,80 @@ async def test_controller_sideband_failure_resolves_sanitized_terminal_result() 
     assert result.error == "sideband connection failed"
     assert "call_secret" not in result.error
     assert "api-secret" not in result.error
+    assert ws.closed
+
+
+async def test_controller_executes_completed_sideband_tool_and_continues_once() -> None:
+    broker = _ToolBroker()
+    controller = _controller("local-tools-01", broker=broker)
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    assert activation.session_id == "local-tools-01"
+    ws = _FakeWebSocket(messages=deque())
+    await controller.start_realtime_sideband(
+        local_session_id="local-tools-01",
+        call_id="call_session",
+        api_key="server-secret",
+        websocket_connect=_Connector(ws),
+    )
+
+    event = {
+        "type": "response.function_call_arguments.done",
+        "call_id": "call_time_01",
+        "name": "assistant_get_current_time",
+        "arguments": '{"timezone":"UTC"}',
+    }
+    await controller.process_sideband_event("local-tools-01", event)
+    await controller.process_sideband_event("local-tools-01", event)
+
+    assert broker.calls == [("assistant_get_current_time", {"timezone": "UTC"})]
+    sent = [json.loads(payload) for payload in ws.received]
+    assert [payload["type"] for payload in sent] == [
+        "conversation.item.create",
+        "response.create",
+    ]
+    output = json.loads(sent[0]["item"]["output"])
+    assert output["call_id"] == "call_time_01"
+    assert output["ok"] is True
+    running = await controller.wait_for_outbound_message("local-tools-01")
+    completed = await controller.wait_for_outbound_message("local-tools-01")
+    assert [running.state, completed.state] == ["running", "completed"]
+    assert "call_id" not in running.model_dump()
+    await controller.close_active_session()
+
+
+async def test_voice_end_session_closes_after_current_response_done() -> None:
+    broker = _ToolBroker()
+    controller = _controller("local-end-tool-01", broker=broker)
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    assert activation.session_id == "local-end-tool-01"
+    ws = _FakeWebSocket(messages=deque())
+    await controller.start_realtime_sideband(
+        local_session_id="local-end-tool-01",
+        call_id="call_session",
+        api_key="server-secret",
+        websocket_connect=_Connector(ws),
+    )
+
+    await controller.process_sideband_event(
+        "local-end-tool-01",
+        {
+            "type": "response.function_call_arguments.done",
+            "call_id": "call_end_01",
+            "name": "voice_end_session",
+            "arguments": "{}",
+        },
+    )
+
+    assert controller.active_session_id == "local-end-tool-01"
+    assert [json.loads(payload)["type"] for payload in ws.received] == [
+        "conversation.item.create"
+    ]
+    await controller.process_sideband_event(
+        "local-end-tool-01",
+        {"type": "response.done", "response": {"output": []}},
+    )
+    result = await controller.wait_for_terminal_result("local-end-tool-01")
+
+    assert result.outcome is SessionOutcome.COMPLETED
+    assert controller.active_session_id is None
     assert ws.closed

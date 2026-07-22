@@ -7,14 +7,14 @@ import json
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from realtime_action_spike.capabilities import ExecutionContractError, UnknownCapabilityError
-from realtime_action_spike.runtime.protocol import ActionStateMessage
 
 _MAX_CALLS_PER_SESSION = 512
 _CALL_ID_RE = re.compile(r"^[A-Za-z0-9._~-]{1,200}$")
 _CAPABILITY_RE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
+ToolActionStatus = Literal["running", "completed", "failed", "closing"]
 
 
 class CapabilityExecutor(Protocol):
@@ -38,6 +38,13 @@ class ToolCall:
     call_id: str
     name: str
     arguments: str | dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolActionState:
+    capability: str
+    state: ToolActionStatus
+    message: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,15 +74,13 @@ class TrustedToolLoop:
     def __init__(
         self,
         *,
-        local_session_id: str,
         broker: CapabilityExecutor,
         send_provider_event: Callable[[dict[str, Any]], Awaitable[None]],
-        publish_action_state: Callable[[ActionStateMessage], Awaitable[None]],
+        publish_action_state: Callable[[ToolActionState], Awaitable[None]],
         max_calls: int = _MAX_CALLS_PER_SESSION,
     ) -> None:
         if max_calls < 1:
             raise ValueError("max_calls must be positive")
-        self._local_session_id = local_session_id
         self._broker = broker
         self._send_provider_event = send_provider_event
         self._publish_action_state = publish_action_state
@@ -101,9 +106,7 @@ class TrustedToolLoop:
                 raise ToolCallLimitError("Realtime session reached its execution safety limit")
 
             await self._publish_action_state(
-                ActionStateMessage(
-                    type="action_state",
-                    session_id=self._local_session_id,
+                ToolActionState(
                     capability=call.name,
                     state="running",
                 )
@@ -133,7 +136,7 @@ class TrustedToolLoop:
             )
             return result
 
-    def _execute(self, call: ToolCall) -> tuple[dict[str, Any], str, str]:
+    def _execute(self, call: ToolCall) -> tuple[dict[str, Any], ToolActionStatus, str]:
         try:
             broker_result = self._broker.execute(call.name, call.arguments)
         except UnknownCapabilityError as exc:
@@ -168,7 +171,7 @@ class TrustedToolLoop:
         call: ToolCall,
         record: _ExecutionRecord,
         *,
-        final_state: str | None = None,
+        final_state: ToolActionStatus | None = None,
         final_message: str | None = None,
     ) -> None:
         if not record.output_sent:
@@ -204,9 +207,7 @@ class TrustedToolLoop:
                     final_state = "failed"
                     final_message = "Capability is not available"
             await self._publish_action_state(
-                ActionStateMessage(
-                    type="action_state",
-                    session_id=self._local_session_id,
+                ToolActionState(
                     capability=call.name,
                     state=final_state,
                     message=final_message,
