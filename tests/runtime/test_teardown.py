@@ -243,3 +243,46 @@ async def test_caller_cancellation_does_not_cancel_shared_teardown() -> None:
     assert report.browser_acknowledged is True
     assert recorder.events.count("mark_stopping") == 1
     assert recorder.events.count("finalize") == 1
+
+
+@pytest.mark.asyncio
+async def test_unshielded_shutdown_cancellation_finalizes_and_leaves_no_task() -> None:
+    recorder = HookRecorder()
+    entered = asyncio.Event()
+
+    async def blocked_sideband_close() -> None:
+        recorder.events.append("close_sideband")
+        entered.set()
+        await asyncio.Event().wait()
+
+    hooks = recorder.hooks()
+    coordinator = TeardownCoordinator(
+        TeardownHooks(
+            mark_stopping=hooks.mark_stopping,
+            request_browser_stop=hooks.request_browser_stop,
+            close_sideband=blocked_sideband_close,
+            close_browser=hooks.close_browser,
+            persist_trace=hooks.persist_trace,
+            finalize=hooks.finalize,
+        ),
+        acknowledgement_timeout=0.01,
+        step_timeout=1.0,
+    )
+    recorder.coordinator = coordinator
+    request = TeardownRequest(
+        outcome=SessionOutcome.CANCELLED,
+        reason=StopReason.NATIVE_CANCEL,
+    )
+
+    shutdown = asyncio.create_task(coordinator.run(request, shield=False))
+    await asyncio.wait_for(entered.wait(), timeout=0.1)
+    shutdown.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await shutdown
+
+    shared_task = coordinator.start(request)
+    assert shared_task.done()
+    assert shared_task.cancelled()
+    assert recorder.events.count("finalize") == 1
+    assert "close_browser" not in recorder.events
+    assert "persist_trace" not in recorder.events

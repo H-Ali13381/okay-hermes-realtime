@@ -646,6 +646,7 @@ class VoiceSessionController:
         outcome: SessionOutcome,
         reason: StopReason,
         error: str | None = None,
+        shield: bool = True,
     ) -> TeardownReport:
         """Run the exact-session teardown once; the first terminal request wins."""
 
@@ -653,7 +654,7 @@ class VoiceSessionController:
         async with self._lock:
             session = self._require_active_session(session_id)
             coordinator = self._begin_teardown_locked(session, request)
-        return await coordinator.run(request)
+        return await coordinator.run(request, shield=shield)
 
     async def interruption_traces(self, session_id: str) -> tuple[InterruptionTrace, ...]:
         """Return an isolated snapshot for the active or most recently closed session."""
@@ -764,6 +765,7 @@ class VoiceSessionController:
             outcome=outcome,
             reason=reason,
             error=error,
+            shield=False,
         )
 
     @staticmethod

@@ -109,6 +109,16 @@ def test_systemd_signal_connections_retry_and_commands_are_async() -> None:
     assert ".call(" not in source
 
 
+def test_turn_off_stops_wakeword_then_controller_through_systemd() -> None:
+    source = CPP_PATH.read_text(encoding="utf-8")
+    stop_block = source.split("void stopServices() {", maxsplit=1)[1].split(
+        "void openVoicePage() {",
+        maxsplit=1,
+    )[0]
+
+    assert 'runSystemdCommandsAsync("StopUnit", {kWakewordUnit, kControllerUnit})' in stop_block
+
+
 def test_cmake_links_all_event_driven_backends() -> None:
     cmake = CMAKE_PATH.read_text(encoding="utf-8")
 

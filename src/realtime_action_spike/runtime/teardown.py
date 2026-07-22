@@ -77,45 +77,72 @@ class TeardownCoordinator:
             self._task = asyncio.create_task(self._run(request))
         return self._task
 
-    async def run(self, request: TeardownRequest) -> TeardownReport:
-        return await asyncio.shield(self.start(request))
+    async def run(
+        self,
+        request: TeardownRequest,
+        *,
+        shield: bool = True,
+    ) -> TeardownReport:
+        task = self.start(request)
+        if shield:
+            return await asyncio.shield(task)
+        return await task
 
     async def _run(self, request: TeardownRequest) -> TeardownReport:
         failures: list[TeardownStepFailure] = []
-        await self._run_step(
-            "mark_stopping",
-            lambda: self._hooks.mark_stopping(request),
-            failures,
-        )
-        browser_stop_requested = await self._run_step(
-            "request_browser_stop",
-            lambda: self._hooks.request_browser_stop(request),
-            failures,
-        )
-
         browser_acknowledged = False
-        if browser_stop_requested:
-            try:
-                await asyncio.wait_for(
-                    self._browser_acknowledged.wait(),
-                    timeout=self._acknowledgement_timeout,
-                )
-                browser_acknowledged = True
-            except TimeoutError:
-                failures.append(TeardownStepFailure(step="browser_ack", kind="timeout"))
+        finalization_task: asyncio.Task[bool] | None = None
 
-        await self._run_step("close_sideband", self._hooks.close_sideband, failures)
-        await self._run_step("close_browser", self._hooks.close_browser, failures)
-        await self._run_step(
-            "persist_trace",
-            lambda: self._hooks.persist_trace(tuple(failures)),
-            failures,
-        )
-        await self._run_step(
-            "finalize",
-            lambda: self._hooks.finalize(request, tuple(failures)),
-            failures,
-        )
+        try:
+            await self._run_step(
+                "mark_stopping",
+                lambda: self._hooks.mark_stopping(request),
+                failures,
+            )
+            browser_stop_requested = await self._run_step(
+                "request_browser_stop",
+                lambda: self._hooks.request_browser_stop(request),
+                failures,
+            )
+
+            if browser_stop_requested:
+                try:
+                    await asyncio.wait_for(
+                        self._browser_acknowledged.wait(),
+                        timeout=self._acknowledgement_timeout,
+                    )
+                    browser_acknowledged = True
+                except TimeoutError:
+                    failures.append(TeardownStepFailure(step="browser_ack", kind="timeout"))
+
+            await self._run_step("close_sideband", self._hooks.close_sideband, failures)
+            await self._run_step("close_browser", self._hooks.close_browser, failures)
+            await self._run_step(
+                "persist_trace",
+                lambda: self._hooks.persist_trace(tuple(failures)),
+                failures,
+            )
+            finalization_task = asyncio.create_task(
+                self._run_step(
+                    "finalize",
+                    lambda: self._hooks.finalize(request, tuple(failures)),
+                    failures,
+                )
+            )
+            await asyncio.shield(finalization_task)
+        except asyncio.CancelledError:
+            failures.append(TeardownStepFailure(step="teardown_cancelled", kind="error"))
+            if finalization_task is None:
+                finalization_task = asyncio.create_task(
+                    self._run_step(
+                        "finalize",
+                        lambda: self._hooks.finalize(request, tuple(failures)),
+                        failures,
+                    )
+                )
+            await asyncio.shield(finalization_task)
+            raise
+
         return TeardownReport(
             request=request,
             browser_acknowledged=browser_acknowledged,
