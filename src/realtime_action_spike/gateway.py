@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -126,6 +127,53 @@ async def _post_to_openai(
         return await client.post(OPENAI_REALTIME_CALLS_URL, **request_kwargs)
 
 
+async def _relay_control_websocket(
+    websocket: WebSocket,
+    controller: VoiceSessionController,
+    session_id: str,
+) -> None:
+    receive_task = asyncio.create_task(websocket.receive_text())
+    outbound_task = asyncio.create_task(controller.wait_for_outbound_message(session_id))
+    try:
+        while True:
+            done, _pending = await asyncio.wait(
+                {receive_task, outbound_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if receive_task in done:
+                try:
+                    raw_message = receive_task.result()
+                except WebSocketDisconnect:
+                    return
+
+                try:
+                    closed = await controller.process_control_message(session_id, raw_message)
+                except (StaleControlMessage, ValueError):
+                    await websocket.close(code=4403)
+                    return
+
+                if closed is not None:
+                    await websocket.send_text(closed.model_dump_json())
+                    await websocket.close()
+                    return
+                receive_task = asyncio.create_task(websocket.receive_text())
+
+            if outbound_task in done:
+                try:
+                    outbound = outbound_task.result()
+                except StaleControlMessage:
+                    return
+                await websocket.send_text(outbound.model_dump_json())
+                outbound_task = asyncio.create_task(
+                    controller.wait_for_outbound_message(session_id)
+                )
+    finally:
+        receive_task.cancel()
+        outbound_task.cancel()
+        await asyncio.gather(receive_task, outbound_task, return_exceptions=True)
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -218,22 +266,7 @@ def create_app(
             await websocket.close(code=4403)
             return
 
-        while True:
-            try:
-                raw_message = await websocket.receive_text()
-            except WebSocketDisconnect:
-                return
-
-            try:
-                closed = await _controller.process_control_message(session_id, raw_message)
-            except (StaleControlMessage, ValueError):
-                await websocket.close(code=4403)
-                return
-
-            if closed is not None:
-                await websocket.send_text(closed.model_dump_json())
-                await websocket.close()
-                return
+        await _relay_control_websocket(websocket, _controller, session_id)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:

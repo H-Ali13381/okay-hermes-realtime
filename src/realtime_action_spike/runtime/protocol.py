@@ -176,6 +176,26 @@ class SessionClosedMessage(_StrictBaseModel):
         return _validate_session_id(value)
 
 
+class ActionStateMessage(_StrictBaseModel):
+    type: Literal["action_state"] = "action_state"
+    session_id: str
+    capability: str = Field(pattern=r"^[a-z][a-z0-9_]{0,127}$")
+    state: Literal["running", "completed", "failed", "closing"]
+    message: str | None = Field(default=None, min_length=1, max_length=240)
+
+    @field_validator("session_id")
+    @classmethod
+    def _validate_session_id(cls, value: str) -> str:
+        return _validate_session_id(value)
+
+    @field_validator("message")
+    @classmethod
+    def _validate_message(cls, value: str | None) -> str | None:
+        if value is not None and any(ord(character) < 32 for character in value):
+            raise ValueError("action message must not contain control characters")
+        return value
+
+
 LoopbackMessage = Annotated[
     ActivationMessage
     | PageReadyMessage
@@ -183,7 +203,8 @@ LoopbackMessage = Annotated[
     | TimingMessage
     | StopMessage
     | TeardownCompleteMessage
-    | SessionClosedMessage,
+    | SessionClosedMessage
+    | ActionStateMessage,
     Field(discriminator="type"),
 ]
 

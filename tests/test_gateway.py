@@ -13,11 +13,16 @@ from starlette.websockets import WebSocketDisconnect
 import realtime_action_spike.gateway as gateway_module
 from realtime_action_spike.capabilities import CapabilityBroker
 from realtime_action_spike.config import Settings, build_realtime_session
-from realtime_action_spike.gateway import OPENAI_REALTIME_CALLS_URL, create_app
+from realtime_action_spike.gateway import (
+    OPENAI_REALTIME_CALLS_URL,
+    _relay_control_websocket,
+    create_app,
+)
 from realtime_action_spike.openai.calls import RealtimeCallHandle
 from realtime_action_spike.runtime.browser import NoopBrowserHandle
 from realtime_action_spike.runtime.controller import VoiceSessionController
 from realtime_action_spike.runtime.protocol import (
+    ActionStateMessage,
     PageReadyMessage,
     PageStartedMessage,
     StopMessage,
@@ -117,6 +122,36 @@ class SidebandStartController:
                 "api_key": api_key,
             }
         )
+
+
+class OutboundController:
+    def __init__(self, message: ActionStateMessage) -> None:
+        self.message = message
+        self.delivered = False
+
+    async def wait_for_outbound_message(self, _session_id: str) -> ActionStateMessage:
+        if not self.delivered:
+            self.delivered = True
+            return self.message
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def process_control_message(self, _session_id: str, _raw: str) -> None:
+        return None
+
+
+class BlockingControlWebSocket:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self.message_sent = asyncio.Event()
+
+    async def receive_text(self) -> str:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def send_text(self, payload: str) -> None:
+        self.sent.append(payload)
+        self.message_sent.set()
 
 
 class MutableResultBroker(CapabilityBroker):
@@ -802,6 +837,34 @@ def test_control_websocket_consumes_token_and_closes_session() -> None:
     ):
         replay.receive_text()
     assert raised.value.code == 4403
+
+
+@pytest.mark.asyncio
+async def test_control_relay_delivers_action_state_without_browser_traffic() -> None:
+    action = ActionStateMessage(
+        type="action_state",
+        session_id="local-session-01",
+        capability="assistant_get_current_time",
+        state="completed",
+        message="Current time retrieved",
+    )
+    controller = OutboundController(action)
+    websocket = BlockingControlWebSocket()
+    relay = asyncio.create_task(
+        _relay_control_websocket(
+            websocket,  # type: ignore[arg-type]
+            controller,  # type: ignore[arg-type]
+            "local-session-01",
+        )
+    )
+
+    try:
+        await asyncio.wait_for(websocket.message_sent.wait(), timeout=1.0)
+        assert websocket.sent == [action.model_dump_json()]
+    finally:
+        relay.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await relay
 
 
 def test_internal_open_is_loopback_only_and_response_is_sanitized() -> None:

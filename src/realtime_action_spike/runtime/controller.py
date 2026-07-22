@@ -13,6 +13,7 @@ from realtime_action_spike.openai.sideband import RealtimeSidebandClient, Sideba
 
 from .browser import BrowserHandle
 from .protocol import (
+    ActionStateMessage,
     PageReadyMessage,
     PageStartedMessage,
     SessionClosedMessage,
@@ -97,6 +98,7 @@ class VoiceSessionController:
         self._terminal_results: dict[str, TerminalSessionResult] = {}
         self._last_closed_interruption_traces: tuple[InterruptionTrace, ...] = ()
         self._sideband_clients: dict[str, RealtimeSidebandClient] = {}
+        self._outbound_messages: dict[str, asyncio.Queue[ActionStateMessage]] = {}
 
     @property
     def token_store(self) -> LaunchTokenStore:
@@ -154,6 +156,7 @@ class VoiceSessionController:
 
             self._active_session = session
             self._terminal_futures[session_id] = terminal_future
+            self._outbound_messages[session_id] = asyncio.Queue(maxsize=64)
             self._last_closed_session_id = None
             self._last_closed_interruption_traces = ()
             try:
@@ -168,6 +171,7 @@ class VoiceSessionController:
                     error="activation failed",
                 )
                 self._active_session = None
+                self._outbound_messages.pop(session_id, None)
                 _transition(session, SessionPhase.FAILED)
                 self._terminal_futures.pop(session_id, None)
                 self._terminal_results[session_id] = session.resolved_result
@@ -185,6 +189,24 @@ class VoiceSessionController:
 
             session.browser_handle = browser_handle
             return ActivationResult(status="opened", session_id=session_id, token=token)
+
+    async def publish_action_state(self, message: ActionStateMessage) -> None:
+        """Queue a sanitized action-state message for the exact active page."""
+
+        async with self._lock:
+            self._require_active_session(message.session_id)
+            queue = self._outbound_messages[message.session_id]
+            if queue.full():
+                queue.get_nowait()
+            queue.put_nowait(message)
+
+    async def wait_for_outbound_message(self, session_id: str) -> ActionStateMessage:
+        """Wait for the next sanitized controller-to-page message."""
+
+        async with self._lock:
+            self._require_active_session(session_id)
+            queue = self._outbound_messages[session_id]
+        return await queue.get()
 
     async def wait_for_terminal_result(self, session_id: str) -> TerminalSessionResult:
         """Wait for the terminal outcome tied to an exact local session id."""
@@ -454,6 +476,7 @@ class VoiceSessionController:
             )
             self._active_session = None
             self._last_closed_session_id = active.session_id
+            self._outbound_messages.pop(active.session_id, None)
 
             browser_handle = active.browser_handle
             if browser_handle is not None:
@@ -489,6 +512,7 @@ class VoiceSessionController:
         )
         self._active_session = None
         self._last_closed_session_id = session.session_id
+        self._outbound_messages.pop(session.session_id, None)
 
         if session.browser_handle is not None:
             with contextlib.suppress(Exception):

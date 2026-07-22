@@ -16,6 +16,7 @@ from realtime_action_spike.runtime.controller import (
     VoiceSessionController,
 )
 from realtime_action_spike.runtime.protocol import (
+    ActionStateMessage,
     PageReadyMessage,
     PageStartedMessage,
     SessionClosedMessage,
@@ -538,3 +539,37 @@ async def test_controller_retains_completed_session_interruption_traces() -> Non
     traces = await controller.interruption_traces(session_id)
     assert len(traces) == 1
     assert traces[0].response_id == "resp-1"
+
+
+@pytest.mark.asyncio
+async def test_action_state_queue_is_fifo_and_exact_session_scoped() -> None:
+    controller = VoiceSessionController(
+        DeterministicLauncher(),
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-actions"])),
+        session_id_factory=SequenceFactory(["local-actions-01"]),
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    assert activation.session_id == "local-actions-01"
+    running = ActionStateMessage(
+        type="action_state",
+        session_id="local-actions-01",
+        capability="assistant_get_current_time",
+        state="running",
+    )
+    completed = ActionStateMessage(
+        type="action_state",
+        session_id="local-actions-01",
+        capability="assistant_get_current_time",
+        state="completed",
+        message="Current time retrieved",
+    )
+
+    await controller.publish_action_state(running)
+    await controller.publish_action_state(completed)
+
+    assert await controller.wait_for_outbound_message("local-actions-01") == running
+    assert await controller.wait_for_outbound_message("local-actions-01") == completed
+    with pytest.raises(StaleControlMessage):
+        await controller.publish_action_state(
+            completed.model_copy(update={"session_id": "local-stale-02"})
+        )

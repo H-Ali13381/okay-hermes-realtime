@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from realtime_action_spike.runtime.protocol import (
+    ActionStateMessage,
     ActivationMessage,
     LoopbackMessage,
     PageReadyMessage,
@@ -61,10 +62,39 @@ def test_valid_session_bound_messages_round_trip() -> None:
             session_id=session_id,
             outcome=SessionOutcome.COMPLETED,
         ),
+        ActionStateMessage(
+            type="action_state",
+            session_id=session_id,
+            capability="assistant_get_current_time",
+            state="completed",
+            message="Current time retrieved",
+        ),
     ]
 
     for message in messages:
         assert parse_loopback_message(encode_loopback_message(message)) == message
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"call_id": "call_provider_secret"},
+        {"arguments": {"timezone": "UTC"}},
+        {"api_key": "secret"},
+        {"result": {"iso_time": "2026-07-21T22:00:00Z"}},
+    ],
+)
+def test_action_state_rejects_provider_and_execution_material(extra: dict[str, object]) -> None:
+    payload: dict[str, object] = {
+        "type": "action_state",
+        "session_id": "local-session-01",
+        "capability": "assistant_get_current_time",
+        "state": "completed",
+        **extra,
+    }
+
+    with pytest.raises(ValidationError):
+        parse_loopback_message(payload)
 
 
 def test_parse_accepts_bytes_and_string_payloads() -> None:
