@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import re
@@ -27,6 +28,7 @@ from .openai.calls import (
 )
 from .runtime.browser import NoopBrowserHandle
 from .runtime.controller import StaleControlMessage, VoiceSessionController
+from .runtime.protocol import SessionOutcome, StopReason
 from .runtime.tokens import LaunchTokenStore
 
 OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
@@ -118,6 +120,13 @@ async def _relay_control_websocket(
                 try:
                     raw_message = receive_task.result()
                 except WebSocketDisconnect:
+                    with contextlib.suppress(StaleControlMessage):
+                        await controller.request_teardown(
+                            session_id,
+                            outcome=SessionOutcome.FAILED,
+                            reason=StopReason.TRANSPORT_FAILURE,
+                            error="control websocket disconnected",
+                        )
                     return
 
                 try:

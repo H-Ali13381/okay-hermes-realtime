@@ -23,6 +23,7 @@ from realtime_action_spike.runtime.protocol import (
     LoopbackMessage,
     PageReadyMessage,
     PageStartedMessage,
+    SessionOutcome,
     StopMessage,
     StopReason,
     TeardownCompleteMessage,
@@ -135,6 +136,27 @@ class BlockingControlWebSocket:
     async def send_text(self, payload: str) -> None:
         self.sent.append(payload)
         self.message_sent.set()
+
+
+class DisconnectingControlWebSocket:
+    async def receive_text(self) -> str:
+        raise WebSocketDisconnect()
+
+    async def send_text(self, _payload: str) -> None:
+        raise AssertionError("disconnect path must not send")
+
+
+class DisconnectController:
+    def __init__(self) -> None:
+        self.teardown_calls: list[dict[str, object]] = []
+        self._never = asyncio.Event()
+
+    async def wait_for_outbound_message(self, _session_id: str) -> LoopbackMessage:
+        await self._never.wait()
+        raise AssertionError("unreachable")
+
+    async def request_teardown(self, session_id: str, **kwargs: object) -> None:
+        self.teardown_calls.append({"session_id": session_id, **kwargs})
 
 
 def settings(api_key: str | None = "test-secret-key") -> Settings:
@@ -558,6 +580,26 @@ async def test_control_relay_delivers_server_stop_without_blocking_receive() -> 
         relay.cancel()
         with pytest.raises(asyncio.CancelledError):
             await relay
+
+
+@pytest.mark.asyncio
+async def test_control_disconnect_requests_failed_transport_teardown() -> None:
+    controller = DisconnectController()
+
+    await _relay_control_websocket(
+        DisconnectingControlWebSocket(),  # type: ignore[arg-type]
+        controller,  # type: ignore[arg-type]
+        "local-disconnect-01",
+    )
+
+    assert controller.teardown_calls == [
+        {
+            "session_id": "local-disconnect-01",
+            "outcome": SessionOutcome.FAILED,
+            "reason": StopReason.TRANSPORT_FAILURE,
+            "error": "control websocket disconnected",
+        }
+    ]
 
 
 def test_internal_open_is_loopback_only_and_response_is_sanitized() -> None:
