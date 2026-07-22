@@ -168,7 +168,7 @@ def test_session_configuration_uses_fast_natural_voice_defaults() -> None:
     }
     assert session["audio"]["input"]["transcription"] == {"model": "gpt-4o-mini-transcribe"}
     assert session["tool_choice"] == "auto"
-    assert len(session["tools"]) == 6
+    assert len(session["tools"]) == 2
     assert "Do not claim an action succeeded before its tool result" in session["instructions"]
 
 
@@ -184,11 +184,7 @@ def test_health_reports_model_and_missing_key_without_secret_material() -> None:
         "model": "gpt-realtime-2.1-mini",
         "capabilities": [
             "assistant_get_current_time",
-            "assistant_start_timer",
-            "media_play",
-            "media_control",
             "voice_end_session",
-            "agent_delegate_task",
         ],
         "controller_status": "idle",
     }

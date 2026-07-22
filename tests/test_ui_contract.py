@@ -86,7 +86,7 @@ def test_assets_are_split_files() -> None:
     assert ".voice-card" in css
 
 
-def test_js_preserves_webrtc_relay_and_function_execution_paths() -> None:
+def test_js_preserves_webrtc_relay_without_browser_execution() -> None:
     script = _read(JS_PATH)
 
     assert "navigator.mediaDevices.getUserMedia" in script
@@ -97,9 +97,13 @@ def test_js_preserves_webrtc_relay_and_function_execution_paths() -> None:
     assert "pc.setRemoteDescription" in script
     assert 'fetch("/session"' in script
     assert 'headers: { "Content-Type": "application/sdp" }' in script
-    assert 'fetch("/execute"' in script
-    assert "conversation.item.create" in script
-    assert "function_call_output" in script
+    assert 'type: "response.create"' not in script
+    assert "conversation.item.create" not in script
+    assert "function_call_output" not in script
+    assert "executeFunctionCall" not in script
+    assert "handleActionState" in script
+    assert "sanitizeActionState" in script
+    assert "action_state" in script
 
 
 def test_js_keeps_same_origin_and_session_state_guards() -> None:
@@ -107,11 +111,11 @@ def test_js_keeps_same_origin_and_session_state_guards() -> None:
 
     assert "GATEWAY_ORIGIN" not in script
     assert "__GATEWAY_ORIGIN__" not in script
-    assert "peerConnection !== sessionContext.pc" in script
-    assert "dataChannel !== sessionContext.dc" in script
-    assert "openAIRealtimeSessionId !== sessionContext.sessionId" in script
+    assert "peerConnection !== pc" in script
+    assert "dataChannel !== dc" in script
+    assert "sessionContext.sessionId" in script
+    assert "openAIRealtimeSessionId === sessionContext.sessionId" in script
     assert "/session" in script
-    assert "/execute" in script
 
 
 def test_js_has_sanitized_timing_markers() -> None:

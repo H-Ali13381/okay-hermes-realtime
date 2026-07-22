@@ -37,14 +37,12 @@ let dataChannel = null;
 let localStream = null;
 let openAIRealtimeSessionId = null;
 let receivedExecutionCount = 0;
-let disconnectAfterResponse = false;
 let transportFailureTimer = null;
 let isStopping = false;
 let controllerSocket = null;
 let controllerSessionClosed = false;
 let teardownSent = false;
 let interruptionState = null;
-const handledCallIds = new Set();
 const transcriptTurns = new Map();
 const responseIdByItemId = new Map();
 
@@ -122,6 +120,9 @@ function openControllerSocket() {
       if (event.type === "session_closed") {
         controllerSessionClosed = true;
         socket.close();
+      }
+      if (event.type === "action_state") {
+        handleActionState(event);
       }
     } catch (_error) {
       failConversation("Controller returned an invalid message");
@@ -314,48 +315,51 @@ function summarizeEvent(event) {
   );
 }
 
-function createExecutionCard(item, parsedArguments) {
+function createActionStateCard(state) {
   clearEmptyState(executionList);
   receivedExecutionCount += 1;
   executionCount.textContent = `${receivedExecutionCount} received`;
 
   const card = document.createElement("article");
   card.className = "execution";
+
   const head = document.createElement("div");
   head.className = "execution-head";
   const name = document.createElement("div");
   name.className = "execution-name";
-  name.textContent = item.name;
-  const state = document.createElement("div");
-  state.className = "execution-state";
-  state.textContent = "requested";
-  head.append(name, state);
+  name.textContent = "Action state";
+  const label = document.createElement("div");
+  label.className = "execution-state";
+  label.textContent = "received";
+  head.append(name, label);
 
-  const argumentsBlock = document.createElement("pre");
-  argumentsBlock.textContent = formatJson({
-    call_id: item.call_id,
-    arguments: parsedArguments,
-  });
-
-  const result = document.createElement("pre");
-  result.className = "execution-result";
-  result.textContent = "Waiting for local broker…";
-  card.append(head, argumentsBlock, result);
+  const payload = document.createElement("pre");
+  payload.className = "execution-result";
+  payload.textContent = formatJson(state);
+  card.append(head, payload);
   executionList.prepend(card);
-  return { state, result };
 }
 
-function updateExecutionCard(card, output) {
-  card.state.textContent = output.ok ? "completed" : "rejected";
-  card.state.classList.add(output.ok ? "ok" : "error");
-  card.result.textContent = formatJson(output);
-}
-
-function sendRealtimeEvent(event, channel = dataChannel) {
-  if (!channel || channel.readyState !== "open") {
-    throw new Error("Realtime data channel is not open");
+function sanitizeActionState(rawState) {
+  if (!rawState || typeof rawState !== "object") {
+    return rawState;
   }
-  channel.send(JSON.stringify(event));
+
+  const keys = ["type", "call_id", "capability", "execution", "ok", "error", "result"];
+  const sanitized = {};
+  for (const key of keys) {
+    if (key in rawState) {
+      sanitized[key] = rawState[key];
+    }
+  }
+
+  return sanitized;
+}
+
+function handleActionState(eventData) {
+  const actionState = eventData?.action_state;
+  const payload = sanitizeActionState(actionState ?? eventData);
+  createActionStateCard(payload);
 }
 
 function interruptionContextIsCurrent(sessionContext) {
@@ -528,76 +532,6 @@ function handleResponseTruncation(event, sessionContext) {
   );
 }
 
-async function executeFunctionCall(item, sessionContext) {
-  const callId = item.call_id;
-  if (!callId || handledCallIds.has(callId)) return;
-  handledCallIds.add(callId);
-
-  let parsedArguments = item.arguments;
-  try {
-    parsedArguments = JSON.parse(item.arguments || "{}");
-  } catch (_error) {
-    parsedArguments = item.arguments;
-  }
-  const card = createExecutionCard(item, parsedArguments);
-
-  let output;
-  try {
-    const response = await fetch("/execute", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session_id: sessionContext.sessionId,
-        call_id: callId,
-        name: item.name,
-        arguments: item.arguments || "{}",
-      }),
-    });
-    output = await response.json();
-    if (!response.ok && !output.error) {
-      output = {
-        ok: false,
-        call_id: callId,
-        error: { type: "gateway_error", message: `Gateway returned ${response.status}` },
-      };
-    }
-  } catch (error) {
-    output = {
-      ok: false,
-      call_id: callId,
-      error: { type: "gateway_unreachable", message: error.message },
-    };
-  }
-
-  if (
-    peerConnection !== sessionContext.pc ||
-    dataChannel !== sessionContext.dc ||
-    openAIRealtimeSessionId !== sessionContext.sessionId
-  ) {
-    card.state.textContent = "discarded";
-    card.state.classList.add("error");
-    card.result.textContent = "Originating Realtime session ended before result delivery.";
-    return;
-  }
-
-  updateExecutionCard(card, output);
-  sendRealtimeEvent(
-    {
-      type: "conversation.item.create",
-      item: {
-        type: "function_call_output",
-        call_id: callId,
-        output: JSON.stringify(output),
-      },
-    },
-    sessionContext.dc,
-  );
-  sendRealtimeEvent({ type: "response.create" }, sessionContext.dc);
-
-  if (output.ok && output.result?.end_session) {
-    disconnectAfterResponse = true;
-  }
-}
 
 async function handleRealtimeEvent(event, sessionContext) {
   appendEvent(event);
@@ -637,32 +571,11 @@ async function handleRealtimeEvent(event, sessionContext) {
     handleResponseFirstAudio(event, sessionContext);
   } else if (event.type === "conversation.item.truncated") {
     handleResponseTruncation(event, sessionContext);
-  } else if (event.type === "response.function_call_arguments.done") {
-    await executeFunctionCall(
-      {
-        type: "function_call",
-        call_id: event.call_id,
-        name: event.name,
-        arguments: event.arguments,
-        item_id: event.item_id,
-      },
-      sessionContext,
-    );
   } else if (event.type === "response.done") {
     handleResponseCancellation(event, sessionContext);
-    const functionCalls = (event.response?.output || []).filter(
-      (item) => item.type === "function_call"
-    );
-    if (functionCalls.length > 0) {
-      for (const item of functionCalls) {
-        await executeFunctionCall(item, sessionContext);
-      }
-    } else if (disconnectAfterResponse) {
-      disconnectAfterResponse = false;
-      window.setTimeout(stopConversation, 500);
-    } else {
-      setStatus("connected", "Connected — speak naturally");
-    }
+    setStatus("connected", "Connected — speak naturally");
+  } else if (event.type === "action_state") {
+    handleActionState(event);
   } else if (event.type === "error") {
     showError(event.error?.message || "The Realtime session returned an error.");
   }
@@ -819,9 +732,7 @@ function stopConversation(options = {}) {
   openAIRealtimeSessionId = null;
   interruptionState = null;
   renderInterruptionDiagnostics();
-  handledCallIds.clear();
   responseIdByItemId.clear();
-  disconnectAfterResponse = false;
   startButton.disabled = false;
   stopButton.disabled = true;
   voiceCard.dataset.active = "false";
