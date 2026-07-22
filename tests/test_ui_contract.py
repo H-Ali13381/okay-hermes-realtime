@@ -114,7 +114,9 @@ def test_js_uses_openai_realtime_webrtc_transport() -> None:
     assert "const connectPromise = transport.connect" in start_block
     assert "await connectPromise" in start_block
     assert (
-        'url: localSessionId ? `/session?local_session_id=${encodeURIComponent(localSessionId)}`'
+        "url: localSessionId"
+        " ? `${window.location.origin}/session?local_session_id="
+        "${encodeURIComponent(localSessionId)}`"
         in start_block
     )
     assert "new RTCPeerConnection" not in start_block

@@ -22650,7 +22650,7 @@ async function startConversation() {
     const connectPromise = transport.connect({
       apiKey: clientSecret.value,
       model: clientSecret.session.model,
-      url: localSessionId ? `/session?local_session_id=${encodeURIComponent(localSessionId)}` : void 0,
+      url: localSessionId ? `${window.location.origin}/session?local_session_id=${encodeURIComponent(localSessionId)}` : void 0,
       initialSessionConfig: {
         providerData: clientSecret.session
       }

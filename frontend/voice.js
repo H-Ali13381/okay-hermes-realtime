@@ -557,7 +557,7 @@ async function startConversation() {
       apiKey: clientSecret.value,
       model: clientSecret.session.model,
       url: localSessionId
-        ? `/session?local_session_id=${encodeURIComponent(localSessionId)}`
+        ? `${window.location.origin}/session?local_session_id=${encodeURIComponent(localSessionId)}`
         : undefined,
       initialSessionConfig: {
         providerData: clientSecret.session,
