@@ -4,10 +4,12 @@ import asyncio
 import contextlib
 import copy
 import secrets
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+
+from realtime_action_spike.openai.sideband import RealtimeSidebandClient, SidebandEvent
 
 from .browser import BrowserHandle
 from .protocol import (
@@ -94,6 +96,7 @@ class VoiceSessionController:
         self._terminal_futures: dict[str, asyncio.Future[TerminalSessionResult]] = {}
         self._terminal_results: dict[str, TerminalSessionResult] = {}
         self._last_closed_interruption_traces: tuple[InterruptionTrace, ...] = ()
+        self._sideband_clients: dict[str, RealtimeSidebandClient] = {}
 
     @property
     def token_store(self) -> LaunchTokenStore:
@@ -268,6 +271,99 @@ class VoiceSessionController:
             )
             return True
 
+    async def start_realtime_sideband(
+        self,
+        *,
+        local_session_id: str,
+        call_id: str,
+        api_key: str,
+        websocket_connect: Callable[[str, dict[str, str]], Any] | None = None,
+    ) -> None:
+        """Start a server-side sideband connection for the exact local session."""
+
+        async def on_event(event: SidebandEvent) -> None:
+            try:
+                await self.process_sideband_event(event.local_session_id, event.payload)
+            except StaleControlMessage:
+                await self._detach_sideband(event.local_session_id)
+            except Exception as error:  # pragma: no cover - defensive path
+                await self._handle_sideband_failure(event.local_session_id, error)
+
+        async def on_terminal_failure(local_session_id: str, error: Exception) -> None:
+            await self._handle_sideband_failure(local_session_id, error)
+
+        sideband = RealtimeSidebandClient(
+            local_session_id=local_session_id,
+            call_id=call_id,
+            api_key=api_key,
+            on_event=on_event,
+            on_terminal_failure=on_terminal_failure,
+            websocket_connect=websocket_connect,
+        )
+
+        async with self._lock:
+            self._require_active_session(local_session_id)
+            previous_sideband = self._sideband_clients.pop(local_session_id, None)
+            self._sideband_clients[local_session_id] = sideband
+
+        if previous_sideband is not None:
+            await previous_sideband.close()
+
+        try:
+            await sideband.connect()
+        except Exception:
+            async with self._lock:
+                current = self._sideband_clients.get(local_session_id)
+                if current is sideband:
+                    self._sideband_clients.pop(local_session_id, None)
+            await sideband.close()
+            raise
+
+    async def process_sideband_event(
+        self,
+        local_session_id: str,
+        payload: Any,
+    ) -> None:
+        """Apply one sideband event for an exact local session."""
+
+        async with self._lock:
+            self._require_active_session(local_session_id)
+            if not isinstance(payload, dict):
+                raise TypeError("sideband event payload must be an object")
+
+    async def send_sideband_event(
+        self,
+        local_session_id: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Send one event through the authoritative sideband for the exact session."""
+
+        async with self._lock:
+            self._require_active_session(local_session_id)
+            sideband = self._sideband_clients.get(local_session_id)
+            if sideband is None:
+                raise RuntimeError("sideband is not connected")
+
+        await sideband.send_json(payload)
+
+    async def _handle_sideband_failure(self, local_session_id: str, _error: Exception) -> None:
+        await self._detach_sideband(local_session_id)
+
+        active = self._active_session
+        if active is None or active.session_id != local_session_id:
+            return
+
+        await self.close_active_session(
+            outcome=SessionOutcome.FAILED,
+            error="sideband connection failed",
+        )
+
+    async def _detach_sideband(self, local_session_id: str) -> None:
+        sideband = self._sideband_clients.pop(local_session_id, None)
+        if sideband is None:
+            return
+        await sideband.close()
+
     async def interruption_traces(self, session_id: str) -> tuple[InterruptionTrace, ...]:
         """Return an isolated snapshot for the active or most recently closed session."""
 
@@ -333,7 +429,7 @@ class VoiceSessionController:
             if isinstance(message, TeardownCompleteMessage):
                 if active.state.phase != SessionPhase.STOPPING:
                     _transition(active, SessionPhase.STOPPING)
-                return self._close_active_session_locked(
+                return await self._close_active_session_locked(
                     active,
                 )
 
@@ -347,10 +443,12 @@ class VoiceSessionController:
     ) -> None:
         """Stop and mark the current active session during service shutdown."""
 
+        sideband: RealtimeSidebandClient | None = None
         async with self._lock:
             active = self._active_session
             if active is None:
                 return
+            sideband = self._sideband_clients.pop(active.session_id, None)
             self._last_closed_interruption_traces = copy.deepcopy(
                 active.interruptions.traces
             )
@@ -370,7 +468,14 @@ class VoiceSessionController:
             # Keep terminal outcome accessible after cleanup for shutdown completion.
             self._terminal_results[active.session_id] = resolved
 
-    def _close_active_session_locked(self, session: _WakeSession) -> SessionClosedMessage:
+        if sideband is not None:
+            await sideband.close()
+
+    async def _close_active_session_locked(
+        self,
+        session: _WakeSession,
+    ) -> SessionClosedMessage:
+        sideband = self._sideband_clients.pop(session.session_id, None)
         _transition(session, SessionPhase.CLOSED)
         outcome = self._resolve_session_outcome(session)
         resolved = self._resolve_terminal_result(
@@ -388,6 +493,8 @@ class VoiceSessionController:
         if session.browser_handle is not None:
             with contextlib.suppress(Exception):
                 session.browser_handle.close()
+        if sideband is not None:
+            await sideband.close()
 
         return SessionClosedMessage(
             type="session_closed",
