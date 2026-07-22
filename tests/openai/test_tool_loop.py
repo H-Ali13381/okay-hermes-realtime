@@ -195,3 +195,45 @@ async def test_voice_end_session_sends_output_without_response_continuation() ->
     assert provider_events[0]["type"] == "conversation.item.create"
     assert result.close_after_farewell is True
     assert action_states[-1].state == "closing"
+
+
+@pytest.mark.asyncio
+async def test_replay_resumes_partial_delivery_without_reexecution() -> None:
+    broker = RecordingBroker([])
+    provider_events: list[dict[str, Any]] = []
+    action_states: list[ActionStateMessage] = []
+    fail_continuation_once = True
+
+    async def send_provider(event: dict[str, Any]) -> None:
+        nonlocal fail_continuation_once
+        if event == {"type": "response.create"} and fail_continuation_once:
+            fail_continuation_once = False
+            raise ConnectionError("sideband send failed")
+        provider_events.append(event)
+
+    async def publish_action(message: ActionStateMessage) -> None:
+        action_states.append(message)
+
+    loop = TrustedToolLoop(
+        local_session_id="local-actions-01",
+        broker=broker,
+        send_provider_event=send_provider,
+        publish_action_state=publish_action,
+    )
+    call = ToolCall(
+        call_id="call_resume_01",
+        name="assistant_get_current_time",
+        arguments='{"timezone":"UTC"}',
+    )
+
+    with pytest.raises(ConnectionError, match="sideband send failed"):
+        await loop.handle(call)
+    result = await loop.handle(call)
+
+    assert result.output["ok"] is True
+    assert len(broker.calls) == 1
+    assert [event["type"] for event in provider_events] == [
+        "conversation.item.create",
+        "response.create",
+    ]
+    assert [message.state for message in action_states] == ["running", "completed"]
