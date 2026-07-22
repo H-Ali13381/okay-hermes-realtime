@@ -636,6 +636,7 @@ class VoiceSessionController:
             active.teardown_marked = True
         if active.teardown is None:  # pragma: no cover - construction invariant
             raise RuntimeError("teardown coordinator is not configured")
+        active.teardown.start(request)
         return active.teardown
 
     async def request_teardown(
@@ -717,10 +718,7 @@ class VoiceSessionController:
                 outcome = self._outcome_for_stop_reason(message.reason)
                 request = TeardownRequest(outcome=outcome, reason=message.reason)
                 coordinator = self._begin_teardown_locked(active, request)
-                self._teardown_tasks[session_id] = asyncio.create_task(
-                    coordinator.run(request),
-                    name=f"voice-teardown-{session_id}",
-                )
+                self._teardown_tasks[session_id] = coordinator.start(request)
                 return None
 
             if isinstance(message, TeardownCompleteMessage):

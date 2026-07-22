@@ -58,7 +58,6 @@ class TeardownCoordinator:
         self._acknowledgement_timeout = acknowledgement_timeout
         self._step_timeout = step_timeout
         self._browser_acknowledged = asyncio.Event()
-        self._start_lock = asyncio.Lock()
         self._task: asyncio.Task[TeardownReport] | None = None
 
     @staticmethod
@@ -71,12 +70,15 @@ class TeardownCoordinator:
     def acknowledge_browser_teardown(self) -> None:
         self._browser_acknowledged.set()
 
+    def start(self, request: TeardownRequest) -> asyncio.Task[TeardownReport]:
+        """Start synchronously so the first event-loop caller owns the outcome."""
+
+        if self._task is None:
+            self._task = asyncio.create_task(self._run(request))
+        return self._task
+
     async def run(self, request: TeardownRequest) -> TeardownReport:
-        async with self._start_lock:
-            if self._task is None:
-                self._task = asyncio.create_task(self._run(request))
-            task = self._task
-        return await asyncio.shield(task)
+        return await asyncio.shield(self.start(request))
 
     async def _run(self, request: TeardownRequest) -> TeardownReport:
         failures: list[TeardownStepFailure] = []
