@@ -46,7 +46,7 @@ class Settings(BaseModel):
     brave_bin: str = "/opt/brave.com/brave-origin-nightly/brave"
     voice_browser_profile: str = "~/.local/share/okay-hermes-realtime/brave-profile"
     voice_page_url: str = "http://127.0.0.1:8765/voice"
-    voice_browser_start_timeout_seconds: float = 10.0
+    voice_browser_start_timeout_seconds: float = 20.0
 
     @staticmethod
     def default_activation_socket_path(xdg_runtime_dir: str | None = None) -> str:
@@ -116,7 +116,7 @@ class Settings(BaseModel):
                     "http://127.0.0.1:8765/voice",
                 ),
                 "voice_browser_start_timeout_seconds": os.getenv(
-                    "VOICE_BROWSER_START_TIMEOUT_SECONDS", "10.0"
+                    "VOICE_BROWSER_START_TIMEOUT_SECONDS", "20.0"
                 ),
             }
         )

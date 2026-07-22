@@ -109,7 +109,7 @@ class VoiceSessionController:
         token_store: LaunchTokenStore | None = None,
         lock: asyncio.Lock | None = None,
         capability_broker: CapabilityBroker | None = None,
-        browser_start_timeout_seconds: float = 10.0,
+        browser_start_timeout_seconds: float = 20.0,
         browser_ack_timeout_seconds: float = 1.0,
         teardown_step_timeout_seconds: float = 2.0,
         farewell_timeout_seconds: float = 1.5,

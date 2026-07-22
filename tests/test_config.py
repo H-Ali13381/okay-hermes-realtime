@@ -17,7 +17,7 @@ def test_settings_defaults_for_browser_automation(monkeypatch: pytest.MonkeyPatc
     assert settings.brave_bin == "/opt/brave.com/brave-origin-nightly/brave"
     assert settings.voice_browser_profile == "~/.local/share/okay-hermes-realtime/brave-profile"
     assert settings.voice_page_url == "http://127.0.0.1:8765/voice"
-    assert settings.voice_browser_start_timeout_seconds == 10.0
+    assert settings.voice_browser_start_timeout_seconds == 20.0
     assert settings.resolved_activation_socket_path.startswith("/run/user/")
     assert settings.resolved_activation_socket_path.endswith(
         "/okay-hermes-realtime/activation.sock"
