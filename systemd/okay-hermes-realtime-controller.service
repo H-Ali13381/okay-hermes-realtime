@@ -1,0 +1,22 @@
+[Unit]
+Description=Okay Hermes Realtime Controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/okay-hermes-realtime
+EnvironmentFile=%h/.config/okay-hermes-realtime/config.env
+Environment=ACTIVATION_SOCKET_PATH=%t/okay-hermes-realtime/activation.sock
+ExecStart=%h/.local/share/okay-hermes-realtime/venv/bin/okay-hermes-realtime-controller
+KillMode=mixed
+TimeoutStopSec=10s
+Restart=on-failure
+RestartSec=2s
+RuntimeDirectory=okay-hermes-realtime
+RuntimeDirectoryMode=0700
+StateDirectory=okay-hermes-realtime
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=default.target

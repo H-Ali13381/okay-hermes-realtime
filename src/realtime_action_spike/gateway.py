@@ -1,38 +1,69 @@
-"""Loopback FastAPI gateway for OpenAI Realtime SDP and local action execution."""
+"""Loopback FastAPI gateway for OpenAI Realtime SDP and voice-session control."""
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import json
+import re
+import secrets
+from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi import FastAPI, HTTPException, Request, WebSocket
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from starlette.websockets import WebSocketDisconnect
 
 from .capabilities import (
     CAPABILITIES,
     CapabilityBroker,
-    ExecutionContractError,
-    UnknownCapabilityError,
 )
 from .config import Settings, build_realtime_session
+from .openai.calls import (
+    RealtimeCallHandle,
+    RealtimeCallHandleParseError,
+    parse_realtime_call_handle,
+)
+from .runtime.browser import NoopBrowserHandle
+from .runtime.controller import StaleControlMessage, VoiceSessionController
+from .runtime.protocol import SessionOutcome, StopMessage, StopReason
+from .runtime.tokens import LaunchTokenStore
 
 OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
+OPENAI_REALTIME_SESSION_HEADER = "X-OpenAI-Realtime-Session-ID"
+LOCAL_CONTROLLER_SESSION_HEADER = "X-Okay-Hermes-Session-ID"
+_LOCAL_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,128}$")
 
 
 class AsyncPostClient(Protocol):
     async def post(self, url: str, **kwargs: Any) -> httpx.Response: ...
 
 
-class ExecutionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class RealtimeCallHandleRegistry(Protocol):
+    def get(self, local_session_id: str) -> RealtimeCallHandle | None:
+        ...
 
-    call_id: str = Field(min_length=1, max_length=200)
-    name: str = Field(min_length=1, max_length=128)
-    arguments: str | dict[str, Any]
+    def set(self, local_session_id: str, handle: RealtimeCallHandle) -> None:
+        ...
+
+    def clear(self) -> None:
+        ...
+
+
+class _InMemoryRealtimeCallHandleRegistry:
+    def __init__(self) -> None:
+        self._handles: dict[str, RealtimeCallHandle] = {}
+
+    def get(self, local_session_id: str) -> RealtimeCallHandle | None:
+        return self._handles.get(local_session_id)
+
+    def set(self, local_session_id: str, handle: RealtimeCallHandle) -> None:
+        self._handles = {local_session_id: handle}
+
+    def clear(self) -> None:
+        self._handles.clear()
 
 
 def _safety_identifier() -> str:
@@ -71,27 +102,173 @@ async def _post_to_openai(
         return await client.post(OPENAI_REALTIME_CALLS_URL, **request_kwargs)
 
 
+async def _relay_control_websocket(
+    websocket: WebSocket,
+    controller: VoiceSessionController,
+    session_id: str,
+) -> None:
+    receive_task = asyncio.create_task(websocket.receive_text())
+    outbound_task = asyncio.create_task(controller.wait_for_outbound_message(session_id))
+    server_stop_sent = False
+    try:
+        while True:
+            done, _pending = await asyncio.wait(
+                {receive_task, outbound_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if receive_task in done:
+                try:
+                    raw_message = receive_task.result()
+                except WebSocketDisconnect:
+                    with contextlib.suppress(StaleControlMessage):
+                        await controller.request_teardown(
+                            session_id,
+                            outcome=SessionOutcome.FAILED,
+                            reason=StopReason.TRANSPORT_FAILURE,
+                            error="control websocket disconnected",
+                        )
+                    return
+
+                try:
+                    closed = await controller.process_control_message(session_id, raw_message)
+                except (StaleControlMessage, ValueError):
+                    await websocket.close(code=4403)
+                    return
+
+                if closed is not None:
+                    deadline = asyncio.get_running_loop().time() + 0.1
+                    while not server_stop_sent:
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            break
+                        try:
+                            outbound = await asyncio.wait_for(
+                                asyncio.shield(outbound_task),
+                                timeout=remaining,
+                            )
+                        except (TimeoutError, StaleControlMessage):
+                            break
+                        await websocket.send_text(outbound.model_dump_json())
+                        server_stop_sent = isinstance(outbound, StopMessage)
+                        if not server_stop_sent:
+                            outbound_task = asyncio.create_task(
+                                controller.wait_for_outbound_message(session_id)
+                            )
+                    await websocket.send_text(closed.model_dump_json())
+                    await websocket.close()
+                    return
+                receive_task = asyncio.create_task(websocket.receive_text())
+
+            if outbound_task in done:
+                try:
+                    outbound = outbound_task.result()
+                except StaleControlMessage:
+                    return
+                await websocket.send_text(outbound.model_dump_json())
+                server_stop_sent = server_stop_sent or isinstance(outbound, StopMessage)
+                outbound_task = asyncio.create_task(
+                    controller.wait_for_outbound_message(session_id)
+                )
+    finally:
+        receive_task.cancel()
+        outbound_task.cancel()
+        await asyncio.gather(receive_task, outbound_task, return_exceptions=True)
+
+
 def create_app(
     settings: Settings | None = None,
     *,
     upstream_client: AsyncPostClient | None = None,
     broker: CapabilityBroker | None = None,
+    controller: VoiceSessionController | None = None,
+    call_handle_registry: RealtimeCallHandleRegistry | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     broker = broker or CapabilityBroker()
+    web_root = Path(__file__).resolve().parent / "web"
+    index_html = web_root / "index.html"
+    voice_css = web_root / "voice.css"
+    voice_js = web_root / "voice.js"
+    call_handle_registry = call_handle_registry or _InMemoryRealtimeCallHandleRegistry()
+    interruption_js = web_root / "interruption_state.mjs"
+
+    class _DiagnosticLauncher:
+        def launch(self, loopback_url: str) -> NoopBrowserHandle:
+            return NoopBrowserHandle()
+
+    _controller = (
+        controller
+        if controller is not None
+        else VoiceSessionController(
+            launcher=_DiagnosticLauncher(),
+            token_store=LaunchTokenStore(),
+            capability_broker=broker,
+        )
+    )
+
+    active_session_id: str | None = None
+    latest_session_attempt = 0
+
+    def _is_loopback_client(request: Request) -> bool:
+        if request.client is None:
+            return False
+        return request.client.host in {"127.0.0.1", "::1", "localhost", "testclient"}
+
+    def _render_voice_page(session_id: str | None = None) -> HTMLResponse:
+        if session_id is None:
+            return HTMLResponse(content=index_html.read_text(encoding="utf-8"))
+
+        html = index_html.read_text(encoding="utf-8")
+        marker = f"<script>window.__LOCAL_SESSION_ID__ = {json.dumps(session_id)};</script>\n"
+        return HTMLResponse(content=html.replace("</head>", marker + "</head>", 1))
 
     app = FastAPI(title="OpenAI Realtime Action Spike Gateway", version="0.1.0")
-    allowed_origins = [
-        f"http://127.0.0.1:{settings.streamlit_port}",
-        f"http://localhost:{settings.streamlit_port}",
-    ]
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=allowed_origins,
-        allow_credentials=False,
-        allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Content-Type"],
-    )
+    app.state.get_realtime_call_handle = call_handle_registry.get
+
+    @app.get("/voice", include_in_schema=False)
+    async def voice_page(activation: str | None = None) -> HTMLResponse:
+        if activation is None:
+            return _render_voice_page()
+
+        session_id = _controller.validate_activation_token(activation)
+        if session_id is None:
+            raise HTTPException(status_code=403, detail="Invalid or expired activation token")
+
+        return _render_voice_page(session_id=session_id)
+
+    @app.get("/assets/{asset_name}", include_in_schema=False)
+    async def voice_asset(asset_name: str) -> Response:
+        if asset_name == "voice.css":
+            return FileResponse(voice_css, media_type="text/css")
+        if asset_name == "voice.js":
+            return FileResponse(voice_js, media_type="text/javascript")
+        if asset_name == "interruption_state.mjs":
+            return FileResponse(interruption_js, media_type="text/javascript")
+        return Response(status_code=404)
+
+    @app.post("/internal/open")
+    async def open_internal(request: Request) -> dict[str, str]:
+        if not _is_loopback_client(request):
+            raise HTTPException(status_code=403, detail="Only local clients can open voice pages")
+
+        result = await _controller.activate(str(request.url_for("voice_page")))
+        return {"status": result.status}
+
+    @app.websocket("/control")
+    async def control(websocket: WebSocket, activation: str | None = None) -> None:
+        await websocket.accept()
+
+        if activation is None:
+            await websocket.close(code=4403)
+            return
+
+        session_id = await _controller.consume_activation_token(activation)
+        if session_id is None:
+            await websocket.close(code=4403)
+            return
+
+        await _relay_control_websocket(websocket, _controller, session_id)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -100,10 +277,12 @@ def create_app(
             "api_key_configured": settings.api_key_value() is not None,
             "model": settings.realtime_model,
             "capabilities": [capability.name for capability in CAPABILITIES],
+            "controller_status": _controller.status,
         }
 
     @app.post("/session")
     async def create_realtime_session(request: Request) -> Response:
+        nonlocal active_session_id, latest_session_attempt
         if settings.api_key_value() is None:
             raise HTTPException(
                 status_code=503,
@@ -114,6 +293,13 @@ def create_app(
         if media_type != "application/sdp":
             raise HTTPException(status_code=415, detail="Content-Type must be application/sdp")
 
+        local_session_id = request.headers.get(LOCAL_CONTROLLER_SESSION_HEADER)
+        if (
+            local_session_id is not None
+            and _LOCAL_SESSION_ID_RE.fullmatch(local_session_id) is None
+        ):
+            raise HTTPException(status_code=400, detail="Invalid local session binding")
+
         try:
             sdp = (await request.body()).decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -121,6 +307,8 @@ def create_app(
         if not sdp.strip():
             raise HTTPException(status_code=400, detail="SDP offer is empty")
 
+        latest_session_attempt += 1
+        session_attempt = latest_session_attempt
         try:
             upstream = await _post_to_openai(
                 settings=settings,
@@ -137,48 +325,64 @@ def create_app(
                 },
             )
 
-        request_id = upstream.headers.get("x-request-id")
+        if session_attempt != latest_session_attempt:
+            return JSONResponse(
+                status_code=409,
+                content={"detail": "OpenAI Realtime session attempt was superseded"},
+            )
+
         if not upstream.is_success:
             return JSONResponse(
                 status_code=502,
                 content={
                     "detail": "OpenAI Realtime session creation failed",
                     "upstream_status": upstream.status_code,
-                    "request_id": request_id,
                 },
             )
 
-        headers = {"X-OpenAI-Request-ID": request_id} if request_id else None
-        return Response(
-            content=upstream.text,
-            media_type="application/sdp",
-            headers=headers,
-        )
-
-    @app.post("/execute")
-    async def execute_capability(execution_request: ExecutionRequest) -> Response:
         try:
-            result = broker.execute(execution_request.name, execution_request.arguments)
-        except UnknownCapabilityError as exc:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "ok": False,
-                    "call_id": execution_request.call_id,
-                    "error": {"type": "unknown_capability", "message": str(exc)},
-                },
+            handle = parse_realtime_call_handle(
+                location=upstream.headers.get("Location"),
+                headers=upstream.headers,
+                sdp_answer=upstream.text,
             )
-        except ExecutionContractError as exc:
+        except RealtimeCallHandleParseError:
             return JSONResponse(
-                status_code=400,
+                status_code=502,
                 content={
-                    "ok": False,
-                    "call_id": execution_request.call_id,
-                    "error": {"type": "invalid_arguments", "message": str(exc)},
+                    "detail": "OpenAI Realtime session creation failed",
                 },
             )
 
-        return JSONResponse(content={"call_id": execution_request.call_id, **result})
+        if local_session_id is not None:
+            api_key = settings.api_key_value()
+            assert api_key is not None
+            try:
+                await _controller.start_realtime_sideband(
+                    local_session_id=local_session_id,
+                    call_id=handle.call_id,
+                    api_key=api_key,
+                )
+            except StaleControlMessage:
+                return JSONResponse(
+                    status_code=409,
+                    content={"detail": "Local voice session is no longer active"},
+                )
+            except Exception:
+                return JSONResponse(
+                    status_code=502,
+                    content={"detail": "OpenAI Realtime sideband connection failed"},
+                )
+
+        active_session_id = local_session_id or secrets.token_urlsafe(24)
+        call_handle_registry.clear()
+        call_handle_registry.set(active_session_id, handle)
+
+        return Response(
+            content=handle.sdp_answer,
+            media_type="application/sdp",
+            headers={OPENAI_REALTIME_SESSION_HEADER: active_session_id},
+        )
 
     return app
 

@@ -1,7 +1,11 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
 [project]
 name = "openai-realtime-action-spike"
 version = "0.1.0"
-description = "Streamlit feasibility spike for OpenAI Realtime voice function calling"
+description = "FastAPI-based OpenAI Realtime voice function-calling action spike"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -9,9 +13,13 @@ dependencies = [
   "httpx>=0.28,<1",
   "pydantic>=2.11,<3",
   "python-dotenv>=1.1,<2",
-  "streamlit>=1.46,<2",
   "uvicorn>=0.35,<1",
+  "websockets>=15,<16",
 ]
+
+[project.scripts]
+okay-hermes-realtime-controller = "realtime_action_spike.service:main"
+okay-hermes-realtime-activation = "realtime_action_spike.activation_handler:main"
 
 [dependency-groups]
 dev = [
@@ -21,7 +29,14 @@ dev = [
 ]
 
 [tool.uv]
-package = false
+package = true
+
+[tool.hatch.build]
+exclude = ["/artifacts"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/realtime_action_spike"]
+include = ["src/realtime_action_spike/web/**"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

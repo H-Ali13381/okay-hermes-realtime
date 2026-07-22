@@ -1,13 +1,35 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from realtime_action_spike.config import Settings, build_realtime_session
-from realtime_action_spike.gateway import OPENAI_REALTIME_CALLS_URL, create_app
+from realtime_action_spike.gateway import (
+    OPENAI_REALTIME_CALLS_URL,
+    _relay_control_websocket,
+    create_app,
+)
+from realtime_action_spike.openai.calls import RealtimeCallHandle
+from realtime_action_spike.runtime.browser import NoopBrowserHandle
+from realtime_action_spike.runtime.controller import VoiceSessionController
+from realtime_action_spike.runtime.protocol import (
+    ActionStateMessage,
+    LoopbackMessage,
+    PageReadyMessage,
+    PageStartedMessage,
+    SessionOutcome,
+    StopMessage,
+    StopReason,
+    TeardownCompleteMessage,
+    encode_loopback_message,
+)
+from realtime_action_spike.runtime.tokens import LaunchTokenStore
 
 
 class StubUpstreamClient:
@@ -20,8 +42,137 @@ class StubUpstreamClient:
         return self.response
 
 
+class OutOfOrderUpstreamClient:
+    def __init__(self) -> None:
+        self.first_started = asyncio.Event()
+        self.release_first = asyncio.Event()
+        self.call_count = 0
+
+    async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+        del url, kwargs
+        self.call_count += 1
+        call_number = self.call_count
+        if call_number == 1:
+            self.first_started.set()
+            await self.release_first.wait()
+        return httpx.Response(
+            201,
+            text=f"v=0\r\nanswer-{call_number}",
+            headers={"Location": f"/v1/realtime/calls/call-{call_number}"},
+        )
+
+
+class CapturingLauncher:
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+        self.handles: list[NoopBrowserHandle] = []
+
+    def launch(self, loopback_url: str) -> NoopBrowserHandle:
+        self.urls.append(loopback_url)
+        handle = NoopBrowserHandle()
+        self.handles.append(handle)
+        return handle
+
+
+class CallHandleRegistry:
+    def __init__(self) -> None:
+        self.calls: dict[str, RealtimeCallHandle] = {}
+
+    def get(self, local_session_id: str) -> RealtimeCallHandle | None:
+        return self.calls.get(local_session_id)
+
+    def set(self, local_session_id: str, handle: RealtimeCallHandle) -> None:
+        self.calls = {local_session_id: handle}
+
+    def clear(self) -> None:
+        self.calls.clear()
+
+
+class SidebandStartController:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, str]] = []
+
+    async def start_realtime_sideband(
+        self,
+        *,
+        local_session_id: str,
+        call_id: str,
+        api_key: str,
+    ) -> None:
+        self.calls.append(
+            {
+                "local_session_id": local_session_id,
+                "call_id": call_id,
+                "api_key": api_key,
+            }
+        )
+
+
+class OutboundController:
+    def __init__(self, message: LoopbackMessage) -> None:
+        self.message = message
+        self.delivered = False
+
+    async def wait_for_outbound_message(self, _session_id: str) -> LoopbackMessage:
+        if not self.delivered:
+            self.delivered = True
+            return self.message
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def process_control_message(self, _session_id: str, _raw: str) -> None:
+        return None
+
+
+class BlockingControlWebSocket:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self.message_sent = asyncio.Event()
+
+    async def receive_text(self) -> str:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def send_text(self, payload: str) -> None:
+        self.sent.append(payload)
+        self.message_sent.set()
+
+
+class DisconnectingControlWebSocket:
+    async def receive_text(self) -> str:
+        raise WebSocketDisconnect()
+
+    async def send_text(self, _payload: str) -> None:
+        raise AssertionError("disconnect path must not send")
+
+
+class DisconnectController:
+    def __init__(self) -> None:
+        self.teardown_calls: list[dict[str, object]] = []
+        self._never = asyncio.Event()
+
+    async def wait_for_outbound_message(self, _session_id: str) -> LoopbackMessage:
+        await self._never.wait()
+        raise AssertionError("unreachable")
+
+    async def request_teardown(self, session_id: str, **kwargs: object) -> None:
+        self.teardown_calls.append({"session_id": session_id, **kwargs})
+
+
 def settings(api_key: str | None = "test-secret-key") -> Settings:
     return Settings(openai_api_key=api_key)
+
+
+def start_openai_realtime_session(client: TestClient, offer: str = "mock-offer") -> str:
+    response = client.post(
+        "/session",
+        content=f"v=0\r\n{offer}",
+        headers={"Content-Type": "application/sdp"},
+    )
+    assert response.status_code == 200
+    session_id = response.headers.get("x-openai-realtime-session-id")
+    assert session_id
+    return session_id
 
 
 def test_session_configuration_uses_fast_natural_voice_defaults() -> None:
@@ -38,8 +189,9 @@ def test_session_configuration_uses_fast_natural_voice_defaults() -> None:
         "create_response": True,
         "interrupt_response": True,
     }
+    assert session["audio"]["input"]["transcription"] == {"model": "gpt-4o-mini-transcribe"}
     assert session["tool_choice"] == "auto"
-    assert len(session["tools"]) == 6
+    assert len(session["tools"]) == 2
     assert "Do not claim an action succeeded before its tool result" in session["instructions"]
 
 
@@ -55,12 +207,9 @@ def test_health_reports_model_and_missing_key_without_secret_material() -> None:
         "model": "gpt-realtime-2.1-mini",
         "capabilities": [
             "assistant_get_current_time",
-            "assistant_start_timer",
-            "media_play",
-            "media_control",
             "voice_end_session",
-            "agent_delegate_task",
         ],
+        "controller_status": "idle",
     }
 
 
@@ -90,22 +239,38 @@ def test_session_endpoint_relays_sdp_and_server_owned_configuration() -> None:
         httpx.Response(
             201,
             text="v=0\r\nmock-answer",
-            headers={"x-request-id": "req_realtime_test"},
+            headers={
+                "Location": "/v1/realtime/calls/call_endpoint",
+                "x-request-id": "req_realtime_test",
+            },
         )
     )
-    client = TestClient(create_app(settings(), upstream_client=upstream))
+    registry = CallHandleRegistry()
+    client = TestClient(
+        create_app(settings(), upstream_client=upstream, call_handle_registry=registry)
+    )
 
     response = client.post(
         "/session",
         content="v=0\r\nmock-offer",
-        headers={"Content-Type": "application/sdp"},
+        headers={
+            "Content-Type": "application/sdp",
+        },
     )
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/sdp")
-    assert response.headers["x-openai-request-id"] == "req_realtime_test"
+    assert response.headers["x-openai-realtime-session-id"]
+    assert "x-openai-request-id" not in response.headers
     assert response.text == "v=0\r\nmock-answer"
     assert len(upstream.calls) == 1
+
+    session_id = response.headers["x-openai-realtime-session-id"]
+    handle = registry.get(session_id)
+    assert handle is not None
+    assert handle.call_id == "call_endpoint"
+    assert handle.request_id == "req_realtime_test"
+    assert handle.sdp_answer == "v=0\r\nmock-answer"
 
     call = upstream.calls[0]
     assert call["url"] == OPENAI_REALTIME_CALLS_URL
@@ -114,6 +279,87 @@ def test_session_endpoint_relays_sdp_and_server_owned_configuration() -> None:
     assert call["files"]["sdp"] == (None, "v=0\r\nmock-offer", "application/sdp")
     session_json = call["files"]["session"][1]
     assert json.loads(session_json)["model"] == "gpt-realtime-2.1-mini"
+
+
+def test_session_endpoint_starts_sideband_for_exact_controller_session() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_sideband"},
+        )
+    )
+    registry = CallHandleRegistry()
+    controller = SidebandStartController()
+    client = TestClient(
+        create_app(
+            settings(),
+            upstream_client=upstream,
+            call_handle_registry=registry,
+            controller=controller,  # type: ignore[arg-type]
+        )
+    )
+
+    response = client.post(
+        "/session",
+        content="v=0\r\nmock-offer",
+        headers={
+            "Content-Type": "application/sdp",
+            "X-Okay-Hermes-Session-ID": "local-session-1234",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-openai-realtime-session-id"] == "local-session-1234"
+    assert controller.calls == [
+        {
+            "local_session_id": "local-session-1234",
+            "call_id": "call_sideband",
+            "api_key": "test-secret-key",
+        }
+    ]
+    handle = registry.get("local-session-1234")
+    assert handle is not None
+    assert handle.call_id == "call_sideband"
+    assert "test-secret-key" not in response.text
+    assert "call_sideband" not in response.text
+
+
+def test_session_binding_rejects_malformed_location_without_clearing_existing_binding() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_current"},
+        )
+    )
+    registry = CallHandleRegistry()
+    client = TestClient(
+        create_app(settings(), upstream_client=upstream, call_handle_registry=registry)
+    )
+    session_id = start_openai_realtime_session(client, "first-offer")
+    bound_before = registry.get(session_id)
+    assert bound_before is not None
+    assert bound_before.call_id == "call_current"
+
+    upstream.response = httpx.Response(
+        201,
+        text="v=0\r\nmalformed-answer",
+        headers={},
+    )
+    second = client.post(
+        "/session",
+        content="v=0\r\nbad-offer",
+        headers={"Content-Type": "application/sdp"},
+    )
+    after_failure = registry.get(session_id)
+
+    assert second.status_code == 502
+    assert after_failure is not None
+    assert after_failure.call_id == "call_current"
+    assert second.json()["detail"] == "OpenAI Realtime session creation failed"
+    assert "call_current" not in second.text
+    assert "Location" not in second.text
 
 
 def test_upstream_failure_is_sanitized_and_preserves_request_id() -> None:
@@ -136,61 +382,67 @@ def test_upstream_failure_is_sanitized_and_preserves_request_id() -> None:
     assert response.json() == {
         "detail": "OpenAI Realtime session creation failed",
         "upstream_status": 401,
-        "request_id": "req_failed_test",
     }
     assert "test-secret-key" not in response.text
+    assert "req_failed_test" not in response.text
 
 
-def test_execute_endpoint_returns_allowlisted_result_with_call_id() -> None:
+def test_older_session_completion_cannot_replace_newer_openai_scope() -> None:
+    async def run_scenario() -> None:
+        upstream = OutOfOrderUpstreamClient()
+        app = create_app(settings(), upstream_client=upstream)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            first_task = asyncio.create_task(
+                client.post(
+                    "/session",
+                    content="v=0\r\nfirst-offer",
+                    headers={"Content-Type": "application/sdp"},
+                )
+            )
+            await upstream.first_started.wait()
+            second = await client.post(
+                "/session",
+                content="v=0\r\nsecond-offer",
+                headers={"Content-Type": "application/sdp"},
+            )
+            upstream.release_first.set()
+            first = await first_task
+
+        assert second.status_code == 200
+        assert first.status_code == 409
+        assert first.json()["detail"] == "OpenAI Realtime session attempt was superseded"
+
+    asyncio.run(run_scenario())
+
+
+def test_execute_endpoint_is_not_exposed() -> None:
     client = TestClient(create_app(settings()))
 
     response = client.post(
         "/execute",
         json={
-            "call_id": "call_123",
-            "name": "media_play",
-            "arguments": {"query": "Daft Punk"},
+            "session_id": "retired-browser-authority",
+            "call_id": "call_retired",
+            "name": "assistant_get_current_time",
+            "arguments": {},
         },
     )
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["call_id"] == "call_123"
-    assert body["ok"] is True
-    assert body["capability"] == "media_play"
-    assert body["result"]["action"] == "media.play"
+    assert response.status_code == 404
 
 
-def test_execute_endpoint_rejects_unknown_capability_as_structured_error() -> None:
+def test_same_origin_requests_require_no_cross_origin_cors_headers() -> None:
     client = TestClient(create_app(settings()))
 
-    response = client.post(
-        "/execute",
-        json={"call_id": "call_bad", "name": "run_shell", "arguments": {}},
-    )
-
-    assert response.status_code == 400
-    assert response.json() == {
-        "ok": False,
-        "call_id": "call_bad",
-        "error": {
-            "type": "unknown_capability",
-            "message": "unknown capability: run_shell",
-        },
-    }
-
-
-def test_cors_allows_only_loopback_streamlit_origin() -> None:
-    client = TestClient(create_app(settings()))
-
-    allowed = client.options(
-        "/execute",
+    same_origin = client.options(
+        "/session",
         headers={
-            "Origin": "http://127.0.0.1:8501",
+            "Origin": "http://127.0.0.1:8765",
             "Access-Control-Request-Method": "POST",
         },
     )
-    blocked = client.options(
+    cross_origin = client.options(
         "/execute",
         headers={
             "Origin": "https://evil.example",
@@ -198,5 +450,173 @@ def test_cors_allows_only_loopback_streamlit_origin() -> None:
         },
     )
 
-    assert allowed.headers["access-control-allow-origin"] == "http://127.0.0.1:8501"
-    assert "access-control-allow-origin" not in blocked.headers
+    assert "access-control-allow-origin" not in same_origin.headers
+    assert "access-control-allow-origin" not in cross_origin.headers
+
+
+def _activated_controller() -> tuple[VoiceSessionController, str, str]:
+    launcher = CapturingLauncher()
+    controller = VoiceSessionController(
+        launcher,
+        token_store=LaunchTokenStore(token_factory=iter(["launch-token-01"]).__next__),
+        session_id_factory=iter(["local-session-01"]).__next__,
+    )
+    result = asyncio.run(controller.activate("http://127.0.0.1:8765/voice"))
+    assert result.session_id == "local-session-01"
+    assert result.token == "launch-token-01"
+    return controller, result.session_id, result.token
+
+
+def test_voice_activation_token_is_validated_without_consuming() -> None:
+    controller, session_id, token = _activated_controller()
+    client = TestClient(create_app(settings(), controller=controller))
+
+    manual = client.get("/voice")
+    valid = client.get("/voice", params={"activation": token})
+    invalid = client.get("/voice", params={"activation": "wrong-token"})
+
+    assert manual.status_code == 200
+    assert "__LOCAL_SESSION_ID__" not in manual.text
+    assert valid.status_code == 200
+    assert f'window.__LOCAL_SESSION_ID__ = "{session_id}"' in valid.text
+    assert invalid.status_code == 403
+    assert controller.validate_activation_token(token) == session_id
+
+
+def test_control_websocket_consumes_token_and_closes_session() -> None:
+    controller, session_id, token = _activated_controller()
+    client = TestClient(create_app(settings(), controller=controller))
+
+    with client.websocket_connect(f"/control?activation={token}") as websocket:
+        websocket.send_text(
+            encode_loopback_message(PageReadyMessage(type="page_ready", session_id=session_id))
+        )
+        websocket.send_text(
+            encode_loopback_message(PageStartedMessage(type="page_started", session_id=session_id))
+        )
+        websocket.send_text(
+            encode_loopback_message(
+                StopMessage(type="stop", session_id=session_id, reason=StopReason.BUTTON)
+            )
+        )
+        websocket.send_text(
+            encode_loopback_message(
+                TeardownCompleteMessage(type="teardown_complete", session_id=session_id)
+            )
+        )
+        server_stop = websocket.receive_json()
+        closed = websocket.receive_json()
+
+    assert server_stop == {
+        "type": "stop",
+        "session_id": session_id,
+        "reason": "button",
+    }
+    assert closed == {
+        "type": "session_closed",
+        "session_id": session_id,
+        "outcome": "completed",
+    }
+    assert controller.status == "idle"
+
+    with (
+        client.websocket_connect(f"/control?activation={token}") as replay,
+        pytest.raises(WebSocketDisconnect) as raised,
+    ):
+        replay.receive_text()
+    assert raised.value.code == 4403
+
+
+@pytest.mark.asyncio
+async def test_control_relay_delivers_action_state_without_browser_traffic() -> None:
+    action = ActionStateMessage(
+        type="action_state",
+        session_id="local-session-01",
+        capability="assistant_get_current_time",
+        state="completed",
+        message="Current time retrieved",
+    )
+    controller = OutboundController(action)
+    websocket = BlockingControlWebSocket()
+    relay = asyncio.create_task(
+        _relay_control_websocket(
+            websocket,  # type: ignore[arg-type]
+            controller,  # type: ignore[arg-type]
+            "local-session-01",
+        )
+    )
+
+    try:
+        await asyncio.wait_for(websocket.message_sent.wait(), timeout=1.0)
+        assert websocket.sent == [action.model_dump_json()]
+    finally:
+        relay.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await relay
+
+
+@pytest.mark.asyncio
+async def test_control_relay_delivers_server_stop_without_blocking_receive() -> None:
+    stop = StopMessage(
+        type="stop",
+        session_id="local-relay-stop-01",
+        reason=StopReason.NATIVE_CANCEL,
+    )
+    controller = OutboundController(stop)
+    websocket = BlockingControlWebSocket()
+
+    relay = asyncio.create_task(
+        _relay_control_websocket(
+            websocket,  # type: ignore[arg-type]
+            controller,  # type: ignore[arg-type]
+            "local-relay-stop-01",
+        )
+    )
+    try:
+        await asyncio.wait_for(websocket.message_sent.wait(), timeout=1.0)
+        assert websocket.sent == [stop.model_dump_json()]
+        assert not relay.done()
+    finally:
+        relay.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await relay
+
+
+@pytest.mark.asyncio
+async def test_control_disconnect_requests_failed_transport_teardown() -> None:
+    controller = DisconnectController()
+
+    await _relay_control_websocket(
+        DisconnectingControlWebSocket(),  # type: ignore[arg-type]
+        controller,  # type: ignore[arg-type]
+        "local-disconnect-01",
+    )
+
+    assert controller.teardown_calls == [
+        {
+            "session_id": "local-disconnect-01",
+            "outcome": SessionOutcome.FAILED,
+            "reason": StopReason.TRANSPORT_FAILURE,
+            "error": "control websocket disconnected",
+        }
+    ]
+
+
+def test_internal_open_is_loopback_only_and_response_is_sanitized() -> None:
+    launcher = CapturingLauncher()
+    controller = VoiceSessionController(
+        launcher,
+        token_store=LaunchTokenStore(token_factory=iter(["launch-token-private"]).__next__),
+        session_id_factory=iter(["local-session-private"]).__next__,
+    )
+    app = create_app(settings(), controller=controller)
+
+    local = TestClient(app).post("/internal/open")
+    remote = TestClient(app, client=("evil.example", 50000)).post("/internal/open")
+
+    assert local.status_code == 200
+    assert local.json() == {"status": "opened"}
+    assert "token" not in local.text
+    assert "session" not in local.text
+    assert remote.status_code == 403
+    assert launcher.urls and "activation=launch-token-private" in launcher.urls[0]

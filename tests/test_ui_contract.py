@@ -2,81 +2,291 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from fastapi.testclient import TestClient
+from pydantic import SecretStr
+
+from realtime_action_spike.config import Settings
+from realtime_action_spike.gateway import create_app
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-PANEL_PATH = PROJECT_ROOT / "src/realtime_action_spike/web/realtime_panel.html"
-APP_PATH = PROJECT_ROOT / "src/realtime_action_spike/streamlit_app.py"
+INDEX_PATH = PROJECT_ROOT / "src/realtime_action_spike/web/index.html"
+CSS_PATH = PROJECT_ROOT / "src/realtime_action_spike/web/voice.css"
+JS_PATH = PROJECT_ROOT / "src/realtime_action_spike/web/voice.js"
+INTERRUPTION_JS_PATH = PROJECT_ROOT / "src/realtime_action_spike/web/interruption_state.mjs"
 
 
-def read_panel() -> str:
-    return PANEL_PATH.read_text(encoding="utf-8")
+def _read(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
 
 
-def test_panel_has_persistent_conversation_controls_and_inspectors() -> None:
-    panel = read_panel()
-
-    assert 'id="start-button"' in panel
-    assert "Start conversation" in panel
-    assert 'id="stop-button"' in panel
-    assert 'id="connection-status"' in panel
-    assert 'id="execution-list"' in panel
-    assert 'id="event-list"' in panel
+def _extract_block(source: str, start: str, end: str | None = None) -> str:
+    start_index = source.index(start)
+    if end is None:
+        return source[start_index:]
+    end_index = source.index(end, start_index + len(start))
+    return source[start_index:end_index]
 
 
-def test_panel_uses_browser_webrtc_and_server_sdp_relay() -> None:
-    panel = read_panel()
-
-    assert "new RTCPeerConnection()" in panel
-    assert "navigator.mediaDevices.getUserMedia" in panel
-    assert 'pc.createDataChannel("oai-events")' in panel
-    assert "pc.addTrack" in panel
-    assert "pc.createOffer()" in panel
-    assert "pc.setLocalDescription" in panel
-    assert "`${GATEWAY_ORIGIN}/session`" in panel
-    assert '"Content-Type": "application/sdp"' in panel
-    assert "pc.setRemoteDescription" in panel
-    assert "remoteAudio.srcObject" in panel
+def _assert_order(body: str, snippets: list[str]) -> None:
+    positions = [body.index(snippet) for snippet in snippets]
+    assert positions == sorted(positions)
 
 
-def test_panel_executes_and_returns_realtime_function_calls() -> None:
-    panel = read_panel()
-
-    assert 'event.type === "response.function_call_arguments.done"' in panel
-    assert 'event.type === "response.done"' in panel
-    assert 'item.type === "function_call"' in panel
-    assert "handledCallIds" in panel
-    assert "`${GATEWAY_ORIGIN}/execute`" in panel
-    assert 'type: "conversation.item.create"' in panel
-    assert 'type: "function_call_output"' in panel
-    assert 'type: "response.create"' in panel
-    assert "call_id" in panel
-    assert "arguments" in panel
+def _client() -> TestClient:
+    return TestClient(create_app(Settings(openai_api_key=SecretStr("test-secret-key"))))
 
 
-def test_panel_cleans_up_microphone_data_channel_and_peer_connection() -> None:
-    panel = read_panel()
+def test_voice_route_serves_visible_html() -> None:
+    response = _client().get("/voice")
 
-    assert "track.stop()" in panel
-    assert "dataChannel.close()" in panel
-    assert "peerConnection.close()" in panel
-    assert "remoteAudio.srcObject = null" in panel
-    assert "beforeunload" in panel
-
-
-def test_panel_never_embeds_permanent_openai_credentials() -> None:
-    panel = read_panel()
-
-    assert "OPENAI_API_KEY" not in panel
-    assert "api.openai.com" not in panel
-    assert "Bearer " not in panel
+    assert response.status_code == 200
+    assert response.text.startswith("<!doctype html>")
+    assert "Start conversation" in response.text
+    assert "data-testid" not in response.text
 
 
-def test_streamlit_app_embeds_the_panel_with_loopback_gateway_origin() -> None:
-    app = APP_PATH.read_text(encoding="utf-8")
+def test_assets_routes_serve_voice_css_and_js() -> None:
+    client = _client()
 
-    assert "st.set_page_config" in app
-    assert "st.iframe" in app
-    assert "components.html" not in app
-    assert "realtime_panel.html" in app
-    assert "__GATEWAY_ORIGIN__" in app
-    assert "settings.gateway_host" in app
-    assert "settings.gateway_port" in app
+    css = client.get("/assets/voice.css")
+    js = client.get("/assets/voice.js")
+    interruption_js = client.get("/assets/interruption_state.mjs")
+
+    assert css.status_code == 200
+    assert css.text
+    assert css.headers["content-type"].startswith("text/css")
+
+    assert js.status_code == 200
+    assert js.text
+    assert js.headers["content-type"].startswith(("text/javascript", "application/javascript"))
+    assert interruption_js.status_code == 200
+    assert interruption_js.headers["content-type"].startswith(
+        ("text/javascript", "application/javascript")
+    )
+
+
+def test_page_loads_static_assets_via_relative_routes() -> None:
+    response = _client().get("/voice")
+    html = response.text
+
+    assert '<link rel="stylesheet" href="/assets/voice.css"' in html
+    assert '<script type="module" src="/assets/voice.js"></script>' in html
+
+
+def test_page_retains_dom_controls_and_panels() -> None:
+    html = _read(INDEX_PATH)
+
+    assert 'id="connection-status"' in html
+    assert "id=\"transcript-list\"" in html
+    assert 'id="execution-list"' in html
+    assert 'id="execution-count"' in html
+    assert 'id="event-list"' in html
+    assert 'id="remote-audio"' in html
+    assert 'Start conversation' in html
+    assert 'Stop' in html
+    assert 'id="launch-mode"' in html
+
+
+def test_assets_are_split_files() -> None:
+    index_html = _read(INDEX_PATH)
+    script_js = _read(JS_PATH)
+    css = _read(CSS_PATH)
+
+    assert "<style>" not in index_html
+    assert "<script>" not in index_html
+    assert "new RTCPeerConnection()" in script_js
+    assert "oai-events" in script_js
+    assert ".voice-card" in css
+
+
+def test_js_preserves_webrtc_relay_without_browser_execution() -> None:
+    script = _read(JS_PATH)
+
+    assert "navigator.mediaDevices.getUserMedia" in script
+    assert "new RTCPeerConnection()" in script
+    assert 'pc.createDataChannel("oai-events")' in script
+    assert "pc.createOffer()" in script
+    assert "pc.setLocalDescription" in script
+    assert "pc.setRemoteDescription" in script
+    assert 'fetch("/session"' in script
+    assert 'headers: { "Content-Type": "application/sdp" }' in script
+    assert 'type: "response.create"' not in script
+    assert "conversation.item.create" not in script
+    assert "function_call_output" not in script
+    assert "executeFunctionCall" not in script
+    assert "handleActionState" in script
+    assert "sanitizeActionState" in script
+    assert "action_state" in script
+
+
+def test_js_keeps_same_origin_and_session_state_guards() -> None:
+    script = _read(JS_PATH)
+
+    assert "GATEWAY_ORIGIN" not in script
+    assert "__GATEWAY_ORIGIN__" not in script
+    assert "peerConnection !== pc" in script
+    assert "dataChannel !== dc" in script
+    assert "sessionContext.sessionId" in script
+    assert "openAIRealtimeSessionId === sessionContext.sessionId" in script
+    assert "/session" in script
+
+
+def test_js_has_sanitized_timing_markers() -> None:
+    script = _read(JS_PATH)
+
+    assert "function recordTiming" in script
+    assert "performance.now()" in script
+    for marker in [
+        "peer_connection_state",
+        "data_channel_state",
+        "sdp_offer_created",
+        "sdp_answer_applied",
+        "webrtc_transport_failure",
+    ]:
+        assert f'"{marker}"' in script
+
+    assert "event.type === \"timing\"" in script
+    assert "OPENAI_API_KEY" not in script
+    assert "api.openai.com" not in script
+    assert "Authorization" not in script
+    assert "Bearer " not in script
+
+
+def test_ui_contract_keeps_cleanup_guards() -> None:
+    script = _read(JS_PATH)
+
+    assert "track.stop()" in script
+    assert "dataChannel.close()" in script
+    assert "peerConnection.close()" in script
+    assert "remoteAudio.pause()" in script
+    assert "remoteAudio.srcObject = null" in script
+    assert "beforeunload" in script
+    assert "appendEvent({" in script
+
+
+def test_activation_mode_uses_same_origin_control_websocket_and_auto_start() -> None:
+    script = _read(JS_PATH)
+    html = _read(INDEX_PATH)
+
+    assert "new URLSearchParams(window.location.search)" in script
+    assert 'searchParams.get("activation")' in script
+    assert "history.replaceState" in script
+    assert "new WebSocket" in script
+    assert '"/control?activation="' in script
+    assert 'type: "page_ready"' in script
+    assert 'type: "page_started"' in script
+    assert "startConversation()" in script
+    assert 'type: "stop"' in script
+    assert 'type: "teardown_complete"' in script
+    assert 'event.type === "session_closed"' in script
+    assert "Manual diagnostic mode" in html
+
+
+def test_controller_messages_never_include_raw_sdp_or_provider_credentials() -> None:
+    script = _read(JS_PATH)
+
+    assert "controllerSocket.send" in script
+    assert 'name === "webrtc_transport_failure" ? "transport_failure"' in script
+    control_sender = script.split("function sendControlMessage", maxsplit=1)[1].split(
+        "function recordTiming", maxsplit=1
+    )[0]
+    assert "sdp" not in control_sender.lower()
+    assert "api.openai.com" not in script
+    assert "Authorization" not in script
+
+
+def test_interruption_ui_uses_pure_reducer_and_explicit_response_guards() -> None:
+    script = _read(JS_PATH)
+    reducer = _read(INTERRUPTION_JS_PATH)
+    html = _read(INDEX_PATH)
+
+    assert 'from "./interruption_state.mjs"' in script
+    assert "function handleSpeechStarted" in script
+    assert "function suppressInterruptedPlayback" in script
+    assert "function restorePlaybackForResponse" in script
+    assert '"input_audio_buffer.speech_started"' in script
+    assert '"response.output_audio.delta"' in script
+    assert '"response.output_audio.started"' in script
+    assert '"playback_suppressed"' in script
+    assert '"next_response_first_audio"' in script
+    assert '"listening_restored"' in script
+    assert "responseId" in reducer
+    assert "localSessionId" in reducer
+    assert "pendingRestoreResponseId" in reducer
+
+    suppression = script.split("function suppressInterruptedPlayback", maxsplit=1)[1].split(
+        "function restorePlaybackForResponse", maxsplit=1
+    )[0]
+    assert "remoteAudio.pause()" in suppression
+    assert "remoteAudio.muted = true" in suppression
+    assert "track.stop()" not in suppression
+
+    assert 'id="interruption-diagnostics"' in html
+    assert 'id="interruption-state"' in html
+    assert 'id="speech-silence-ms"' in html
+    assert '<details id="interruption-diagnostics"' in html
+
+
+def test_audio_transcript_delta_restores_suppressed_webrtc_playback() -> None:
+    script = _read(JS_PATH)
+    transcript_delta_branch = _extract_block(
+        script,
+        'if (event.type === "response.output_audio_transcript.delta") {',
+        '} else if (event.type === "response.output_audio_transcript.done") {',
+    )
+
+    assert "updateTranscriptTurn" in transcript_delta_branch
+    assert "handleResponseFirstAudio(event, sessionContext)" in transcript_delta_branch
+
+
+def test_js_stop_message_from_controller_invokes_local_teardown_once() -> None:
+    script = _read(JS_PATH)
+
+    assert "if (event.type === \"stop\")" in script
+    assert "sendStopMessage: false" in script
+    assert "stopConversation({" in script
+    assert "sendControlMessage({ type: \"stop\"" in script
+    assert "isStopping || teardownCompleteSent" in script
+
+    stop_event_block = _extract_block(
+        script,
+        "if (event.type === \"stop\") {",
+        "if (event.type === \"session_closed\") {",
+    )
+    assert "sendStopMessage: false" in stop_event_block
+    assert "stopConversation({" in stop_event_block
+    assert 'window.setTimeout(() => window.close(), 500);' in stop_event_block
+    _assert_order(
+        stop_event_block,
+        ["stopConversation({", "window.setTimeout(() => window.close(), 500);"],
+    )
+
+
+def test_js_teardown_order_is_stop_playback_then_channels_then_tracks_then_ack() -> None:
+    script = _read(JS_PATH)
+
+    stop_block = _extract_block(
+        script,
+        "function stopConversation(options = {}) {",
+        "window.addEventListener(\"beforeunload\"",
+    )
+
+    assert "remoteAudio.pause();" in stop_block
+    assert "remoteAudio.muted = true;" in stop_block
+    assert "dataChannel.close();" in stop_block
+    assert "peerConnection.close();" in stop_block
+    assert "for (const track of localStream.getTracks())" in stop_block
+    assert "track.stop();" in stop_block
+    assert 'sendControlMessage({ type: "teardown_complete"' in stop_block
+
+    _assert_order(
+        stop_block,
+        [
+            "remoteAudio.pause();",
+            "remoteAudio.muted = true;",
+            "dataChannel.close();",
+            "peerConnection.close();",
+            "for (const track of localStream.getTracks())",
+            'sendControlMessage({ type: "teardown_complete"',
+        ],
+    )

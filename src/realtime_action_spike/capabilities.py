@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -10,7 +9,7 @@ from datetime import datetime
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 JsonObject = dict[str, Any]
 NowProvider = Callable[[ZoneInfo | None], datetime]
@@ -36,46 +35,8 @@ class CurrentTimeArguments(StrictArguments):
         description="IANA timezone such as UTC or America/Toronto. Use local when unspecified.",
     )
 
-
-class StartTimerArguments(StrictArguments):
-    duration_seconds: int = Field(
-        ge=1,
-        le=86_400,
-        description="Timer duration in whole seconds, from 1 second through 24 hours.",
-    )
-    label: str | None = Field(default=None, max_length=80)
-
-
-class MediaPlayArguments(StrictArguments):
-    query: str = Field(
-        min_length=1,
-        max_length=200,
-        description="Song, artist, album, playlist, or podcast requested by the user.",
-    )
-    media_type: Literal["music", "podcast", "any"] = "music"
-    device: str | None = Field(default=None, max_length=80)
-
-
-class MediaControlArguments(StrictArguments):
-    action: Literal["play", "pause", "resume", "next", "previous", "stop", "set_volume"]
-    volume_percent: int | None = Field(default=None, ge=0, le=100)
-
-    @model_validator(mode="after")
-    def validate_volume_contract(self) -> MediaControlArguments:
-        if self.action == "set_volume" and self.volume_percent is None:
-            raise ValueError("volume_percent is required when action is set_volume")
-        if self.action != "set_volume" and self.volume_percent is not None:
-            raise ValueError("volume_percent is only valid when action is set_volume")
-        return self
-
-
 class EndSessionArguments(StrictArguments):
     reason: str | None = Field(default=None, max_length=120)
-
-
-class DelegateTaskArguments(StrictArguments):
-    task: str = Field(min_length=1, max_length=1_000)
-    priority: Literal["normal", "high"] = "normal"
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,56 +74,13 @@ def _get_current_time(arguments: StrictArguments, now_provider: NowProvider) -> 
     }
 
 
-def _start_timer(arguments: StrictArguments, _now_provider: NowProvider) -> JsonObject:
-    assert isinstance(arguments, StartTimerArguments)
-    return {
-        "action": "timer.start",
-        "duration_seconds": arguments.duration_seconds,
-        "label": arguments.label,
-        "status": "accepted_for_simulation",
-    }
-
-
-def _media_play(arguments: StrictArguments, _now_provider: NowProvider) -> JsonObject:
-    assert isinstance(arguments, MediaPlayArguments)
-    return {
-        "action": "media.play",
-        "query": arguments.query,
-        "media_type": arguments.media_type,
-        "device": arguments.device,
-        "status": "accepted_for_simulation",
-    }
-
-
-def _media_control(arguments: StrictArguments, _now_provider: NowProvider) -> JsonObject:
-    assert isinstance(arguments, MediaControlArguments)
-    return {
-        "action": f"media.{arguments.action}",
-        "volume_percent": arguments.volume_percent,
-        "status": "accepted_for_simulation",
-    }
-
-
 def _end_session(arguments: StrictArguments, _now_provider: NowProvider) -> JsonObject:
     assert isinstance(arguments, EndSessionArguments)
     return {
         "action": "voice.end_session",
         "end_session": True,
         "reason": arguments.reason,
-        "status": "accepted_for_simulation",
-    }
-
-
-def _delegate_task(arguments: StrictArguments, _now_provider: NowProvider) -> JsonObject:
-    assert isinstance(arguments, DelegateTaskArguments)
-    stable_input = f"{arguments.priority}\0{arguments.task}".encode()
-    task_id = f"spike-{hashlib.sha256(stable_input).hexdigest()[:12]}"
-    return {
-        "action": "agent.delegate_task",
-        "task": arguments.task,
-        "priority": arguments.priority,
-        "task_id": task_id,
-        "status": "accepted_for_simulation",
+        "status": "accepted_locally",
     }
 
 
@@ -178,54 +96,14 @@ CAPABILITIES: tuple[CapabilityDefinition, ...] = (
         handler=_get_current_time,
     ),
     CapabilityDefinition(
-        name="assistant_start_timer",
-        description=(
-            "Start a timer after the user clearly asks for one and provides a duration. "
-            "This spike simulates the timer instead of changing the operating system."
-        ),
-        arguments_model=StartTimerArguments,
-        execution="simulated",
-        handler=_start_timer,
-    ),
-    CapabilityDefinition(
-        name="media_play",
-        description=(
-            "Play requested music or a podcast. Call only for an explicit playback request, "
-            "not when merely discussing an artist or song. This spike simulates playback."
-        ),
-        arguments_model=MediaPlayArguments,
-        execution="simulated",
-        handler=_media_play,
-    ),
-    CapabilityDefinition(
-        name="media_control",
-        description=(
-            "Control current media playback: play, pause, resume, next, previous, stop, or set "
-            "volume. This spike simulates the control action."
-        ),
-        arguments_model=MediaControlArguments,
-        execution="simulated",
-        handler=_media_control,
-    ),
-    CapabilityDefinition(
         name="voice_end_session",
         description=(
             "End this voice session when the user explicitly asks to stop, disconnect, or end "
             "the conversation."
         ),
         arguments_model=EndSessionArguments,
-        execution="simulated",
+        execution="local",
         handler=_end_session,
-    ),
-    CapabilityDefinition(
-        name="agent_delegate_task",
-        description=(
-            "Hand off a clearly requested multi-step research, coding, file, or automation task "
-            "to the deeper assistant. This spike records a simulated handoff only."
-        ),
-        arguments_model=DelegateTaskArguments,
-        execution="simulated",
-        handler=_delegate_task,
     ),
 )
 

@@ -1,93 +1,137 @@
-# OpenAI Realtime Action Spike
+# Okay Hermes Realtime — Stage 1 replacement candidate
 
-A local feasibility test for one concrete question: can OpenAI Realtime hold a natural full-duplex voice conversation while reliably emitting typed execution requests that a local assistant controls?
+An OpenAI-specific, independently installable replacement candidate for Okay Hermes Voice (OHV). A native wake listener and tray launch a dedicated Brave app window; microphone and model audio stay on OpenAI Realtime WebRTC while the local controller owns session scope, sideband events, tool authorization, interruption timing, and teardown.
 
-This is a private spike, not an OHV production integration. Tool side effects are simulated except for reading the current time.
+This branch does not modify or reuse the OHV runtime. It has separate units, binaries, config, state, browser profile, and installer paths.
 
-## What it contains
+## Runtime topology
 
-- Streamlit page with one-tap persistent voice conversation
-- browser WebRTC microphone and model audio
-- server-side OpenAI Realtime session creation
-- six typed assistant capabilities
-- local allowlisted execution broker
-- live execution-request and Realtime-event inspector
-- clean Stop behavior for microphone, data channel, and peer connection
-
-The default model is `gpt-realtime-2.1-mini` with minimal reasoning, `marin`, audio output, semantic VAD with high eagerness, automatic responses, and interruption enabled.
-
-## Setup
-
-```bash
-cd /home/user/Documents/SideProjects/Private/openai-realtime-action-spike
-cp .env.example .env
-# Add a standard OpenAI API key to OPENAI_API_KEY in .env.
-uv sync --all-groups
-uv run python scripts/run.py
+```text
+native wake listener ──activation socket──> local controller
+       ▲                                      │
+       │ pause/rearm                          ├─ OpenAI Realtime sideband
+       │                                      ├─ allowlisted tool execution
+replacement tray                              └─ dedicated Brave app process
+                                                       │
+                                                WebRTC mic + audio
+                                                       │
+                                              OpenAI Realtime call
 ```
 
-Open `http://127.0.0.1:8501`, press **Start conversation**, allow microphone access once, and speak normally. The session remains active until Stop, a failed connection, or a `voice_end_session` action completes.
+The controller launches the real Brave binary in a new process group. The page first tears down media and acknowledges Stop; fallback TERM targets only the browser main PID. The systemd controller unit uses `KillMode=mixed`, reserving cgroup-wide KILL for a bounded failure fallback. This avoids Chromium/Crashpad SIGTRAP reports caused by terminating the whole browser tree simultaneously.
 
-A ChatGPT/Codex subscription token is not a standard OpenAI API key. The Realtime API must be enabled for the API project, and usage is billed to that project.
+## Stage 1 scope
 
-## Useful test phrases
+Implemented and exercised:
 
-Conversation without a tool:
+- local ONNX wakeword detection over PipeWire;
+- native Qt tray with Turn ON, Turn OFF, Open Voice Page, status, and diagnostics;
+- dedicated Brave app profile and real microphone capture;
+- OpenAI `gpt-realtime-2.1-mini` WebRTC conversation;
+- server-side OpenAI sideband connection and provider call-handle binding;
+- controller-owned `assistant_get_current_time` and `voice_end_session` execution;
+- interruption playback suppression and timing traces;
+- bounded, idempotent teardown and wake rearm;
+- deterministic lifecycle, race, replay, failure, and installer tests.
 
-- “Why do CRT televisions need a flyback transformer?”
-- Interrupt the answer with: “Actually, explain only the high-voltage path.”
+This remains an OpenAI-only prototype. It is not a generic realtime-provider layer.
 
-Typed local or simulated actions:
+## Quick install
 
-- “What time is it in Tokyo?”
-- “Set a five-minute timer called tea.”
-- “Play Daft Punk.”
-- “Pause the music.”
-- “Set the volume to thirty percent.”
-- “Research powered HDMI to composite converters for me.”
-- “End this conversation.”
+Prerequisites: Linux user systemd, PipeWire/WirePlumber, Brave Origin Nightly, Qt 6 development packages, CMake/Ninja, a wakeword ONNX model, ONNX Runtime, `uv`, and an OpenAI API project with Realtime access.
 
-The right-hand inspector shows the model's function name and arguments before displaying the local broker result. Simulated actions are deliberately reported as simulated.
+```bash
+MODEL=/absolute/path/to/okay-hermes.onnx
+ORT=/absolute/path/to/onnxruntime
 
-## Capability contract
+bash scripts/install_user_services.sh \
+  --model "$MODEL" \
+  --onnxruntime-root "$ORT"
 
-| Function | Execution in this spike |
+bash scripts/install_realtime_tray.sh
+
+# Add OPENAI_API_KEY to the newly installed mode-0600 config:
+$EDITOR ~/.config/okay-hermes-realtime/config.env
+
+systemctl --user enable --now \
+  okay-hermes-realtime-controller.service \
+  okay-hermes-realtime-wakeword.service
+```
+
+Do not run the old OHV and replacement wake listeners together. Record the old unit state before switching. The complete procedure is in [docs/runbooks/stage-1-install-and-smoke.md](docs/runbooks/stage-1-install-and-smoke.md).
+
+## First microphone permission
+
+The replacement uses an isolated profile at:
+
+```text
+~/.local/share/okay-hermes-realtime/brave-profile
+```
+
+The launcher auto-accepts the microphone request for its loopback-only app page. If Brave still presents a permission prompt, allow it once in that dedicated profile. Do not reuse a personal browser profile.
+
+## Operation
+
+```bash
+# Start
+systemctl --user start \
+  okay-hermes-realtime-controller.service \
+  okay-hermes-realtime-wakeword.service
+
+# Health
+curl http://127.0.0.1:8765/health
+cat ~/.local/state/okay-hermes-realtime/controller-health
+cat ~/.local/state/okay-hermes-realtime/capture-health
+
+# Stop
+systemctl --user stop \
+  okay-hermes-realtime-wakeword.service \
+  okay-hermes-realtime-controller.service
+```
+
+The tray performs the same ordered start/stop operations. During a session, Stop, tray Turn OFF, transport failure, and tool-requested close all use the same controller teardown path.
+
+## Replacement-owned paths
+
+| Purpose | Path |
 |---|---|
-| `assistant_get_current_time` | Real local clock read |
-| `assistant_start_timer` | Simulated |
-| `media_play` | Simulated |
-| `media_control` | Simulated |
-| `voice_end_session` | Simulated result; browser then disconnects |
-| `agent_delegate_task` | Simulated durable-task acceptance |
+| Runtime config | `~/.config/okay-hermes-realtime/config.env` |
+| User units | `~/.config/systemd/user/okay-hermes-realtime-*.service` |
+| Python venv/package | `~/.local/share/okay-hermes-realtime/venv` |
+| Wakeword model | `~/.local/share/okay-hermes-realtime/models/okay-hermes-realtime-wakeword.onnx` |
+| Brave profile | `~/.local/share/okay-hermes-realtime/brave-profile` |
+| Listener, ONNX libraries, tray | `~/.local/lib/okay-hermes-realtime/` |
+| Tray autostart | `~/.config/autostart/okay-hermes-realtime-tray.desktop` |
+| Health markers and traces | `~/.local/state/okay-hermes-realtime/` |
+| Activation socket | `$XDG_RUNTIME_DIR/okay-hermes-realtime/activation.sock` |
 
-The initial list comes from the existing OHV destination-router and capability-catalog work: time/timers, session control, media control, and deeper-agent handoff.
+The installer refuses collisions unless `--force` is explicit and records replacement-owned installation state for rollback/uninstall.
 
 ## Security boundary
 
-The browser sends its SDP offer only to the loopback FastAPI gateway. The gateway combines that offer with the server-owned model, prompt, reasoning, VAD, voice, and tool configuration before calling OpenAI's unified Realtime endpoint.
+- `OPENAI_API_KEY` remains in the mode-0600 server config and never enters browser JavaScript.
+- The page receives an opaque one-use local activation scope, not the provider call ID.
+- The controller validates session IDs, sideband events, function names, and bounded JSON arguments.
+- Tool execution is allowlisted; model-generated shell/code is never evaluated.
+- Late/stale events and changed-payload call-ID reuse are rejected.
+- The gateway binds to loopback only.
 
-The permanent API key:
+## Interruption diagnostics
 
-- is read from `.env` or the gateway environment;
-- never appears in the Streamlit HTML or browser JavaScript;
-- never appears in tool schemas or execution results;
-- is redacted from upstream error responses.
+Per-response traces can include:
 
-The execution broker rejects unknown capabilities, malformed JSON, extra fields, invalid enums, and bounded-value violations. It never evaluates model-generated code or shell commands.
+- `response_id`;
+- `user_speech_onset_ms`;
+- `speech_started_received_ns`;
+- `provider_audio_start_ms`;
+- `playback_suppressed_ns`;
+- `response_cancelled_ns`;
+- `truncation_observed_ns`;
+- `listening_restored_ns`;
+- `next_response_first_audio_ns`;
+- derived `speech_start_to_audible_silence_ms` when both endpoints exist.
 
-## Architecture
-
-```text
-Browser / Streamlit iframe
-  ├─ microphone + speaker over WebRTC
-  ├─ Realtime data-channel events
-  └─ execution inspector
-          │
-          ├─ SDP → loopback FastAPI → OpenAI Realtime
-          └─ function call → allowlisted broker
-                                ├─ local clock
-                                └─ simulated side effects
-```
+Missing observations remain missing; the runtime does not substitute plausible zeroes.
 
 ## Verification
 
@@ -95,28 +139,48 @@ Browser / Streamlit iframe
 uv run pytest -q
 uv run ruff check .
 uv run python -m compileall -q src scripts
+node --test tests/web/interruption_state.test.mjs
+uv build
+cmake -S native/realtime-tray -B /tmp/okay-hermes-realtime-tray-final -G Ninja
+cmake --build /tmp/okay-hermes-realtime-tray-final
+ORT=/absolute/path/to/onnxruntime
+native/build_wake_listener.sh \
+  --output /tmp/okay-hermes-realtime-wake-listener-final \
+  --onnxruntime-root "$ORT"
+systemd-analyze --user verify \
+  systemd/okay-hermes-realtime-controller.service \
+  systemd/okay-hermes-realtime-wakeword.service
+git diff --check
 ```
 
-Health endpoints while running:
+## Verified smoke snapshot
 
-```text
-http://127.0.0.1:8765/health
-http://127.0.0.1:8501/_stcore/health
-```
+On 2026-07-22, the replacement was exercised through the actual tray: Turn ON → Open Voice Page → OpenAI WebRTC `live` → Turn OFF. Both units stopped with `Result=success`; the dedicated Brave tree reached zero processes; no new Brave core dump was created.
 
-## Known limitations
+One one-second live-session sample on the test machine reported:
 
-- OpenAI performs intent recognition and chooses the tool in this Realtime mode.
-- Tool selection is probabilistic; the inspector is intended to make failures visible.
-- Side effects are mocks, so this does not yet prove Spotify, timers, or Hermes integration.
-- The Streamlit UI is local HTTP. Remote microphone use requires trusted HTTPS termination.
-- Browser iframe microphone policy still needs live verification in the target browser.
-- This is a single-user loopback spike with no authentication or multi-session task registry.
+| Component | PSS KiB | RSS KiB | CPU % |
+|---|---:|---:|---:|
+| Controller | 43,692 | 57,780 | 0.000 |
+| Wake listener | 25,274 | 31,652 | 5.000 |
+| Tray | 19,438 | 74,164 | 0.000 |
+| Brave tree | 455,365 | 1,531,392 | 18.999 |
+| Combined | 543,769 | 1,694,988 | 23.999 |
 
-## Source material
+This is a single short sample, not a benchmark. Brave dominates residency, and CPU varies with connection/audio activity.
 
-- OpenAI Realtime WebRTC: https://developers.openai.com/api/docs/guides/realtime-webrtc
-- Realtime conversation and function calling: https://developers.openai.com/api/docs/guides/realtime-conversations
-- Realtime VAD: https://developers.openai.com/api/docs/guides/realtime-vad
-- Realtime model prompting: https://developers.openai.com/api/docs/guides/realtime-models-prompting
-- Local OHV contract: `/home/user/wiki/artifacts/html-docs/drafts/2026-06-14-ohv-router-label-contract.md`
+## Known limitations / Stage 2 deferrals
+
+- Only OpenAI Realtime is supported; no provider abstraction or fallback is planned here.
+- Real side effects beyond the local clock and session close remain deferred.
+- Durable Hermes foreground/background task IDs, cancellation/status UI, pending-result reinjection, and long-term session archives are Stage 2 work.
+- Real media service integration (Spotify/volume), timers, and richer local actions are Stage 2 work.
+- A persistent hidden WebRTC worker is only a future measurement candidate; Stage 1 opens a visible app window per activation.
+- The runtime is single-user and loopback-only.
+- The resource figures above are machine/session-specific.
+
+## Design and operations
+
+- [Accepted Stage 1 design](docs/design/2026-07-21-webrtc-wakeword-replacement.md)
+- [Implementation plan](docs/plans/2026-07-21-webrtc-wakeword-replacement-stage-1.md)
+- [Install, smoke, recovery, and rollback runbook](docs/runbooks/stage-1-install-and-smoke.md)

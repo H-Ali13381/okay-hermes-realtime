@@ -1,12 +1,12 @@
-"""Environment and provider session configuration."""
-
 from __future__ import annotations
 
 import os
-from typing import Any, Literal
+from pathlib import Path
+from typing import Literal
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from .capabilities import build_openai_tools
 
@@ -37,30 +37,87 @@ class Settings(BaseModel):
     openai_api_key: SecretStr | None = None
     realtime_model: str = "gpt-realtime-2.1-mini"
     realtime_voice: str = "marin"
-    realtime_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] = (
-        "minimal"
-    )
+    realtime_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] = "minimal"
     gateway_host: str = "127.0.0.1"
     gateway_port: int = Field(default=8765, ge=1, le=65_535)
-    streamlit_host: str = "127.0.0.1"
-    streamlit_port: int = Field(default=8501, ge=1, le=65_535)
+
+    activation_socket_path: str = ""
+
+    brave_bin: str = "/opt/brave.com/brave-origin-nightly/brave"
+    voice_browser_profile: str = "~/.local/share/okay-hermes-realtime/brave-profile"
+    voice_page_url: str = "http://127.0.0.1:8765/voice"
+    voice_browser_start_timeout_seconds: float = 10.0
+
+    @staticmethod
+    def default_activation_socket_path(xdg_runtime_dir: str | None = None) -> str:
+        runtime_dir = xdg_runtime_dir or os.getenv("XDG_RUNTIME_DIR")
+        if not runtime_dir:
+            runtime_dir = f"/run/user/{os.getuid()}"
+        return str(Path(runtime_dir) / "okay-hermes-realtime" / "activation.sock")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_activation_path(cls, data: object) -> object:
+        if isinstance(data, dict):
+            value = data.get("activation_socket_path")
+            if isinstance(value, str) and value:
+                resolved = Path(value)
+                if not resolved.is_absolute():
+                    raise ValueError("ACTIVATION_SOCKET_PATH must be absolute")
+                return data
+        return data
+
+    @property
+    def resolved_activation_socket_path(self) -> str:
+        if self.activation_socket_path:
+            return str(Path(self.activation_socket_path).expanduser())
+        return self.default_activation_socket_path()
+
+    @field_validator("voice_page_url")
+    @classmethod
+    def _validate_voice_page_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"}:
+            raise ValueError("VOICE_PAGE_URL must use http or https")
+        if parsed.username or parsed.password:
+            raise ValueError("VOICE_PAGE_URL must not include credentials")
+        if parsed.fragment:
+            raise ValueError("VOICE_PAGE_URL must not include a fragment")
+        if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("VOICE_PAGE_URL must be loopback")
+        return value
 
     @classmethod
     def from_env(cls) -> Settings:
         load_dotenv()
         key = os.getenv("OPENAI_API_KEY") or None
+        activation_socket_path = os.getenv(
+            "ACTIVATION_SOCKET_PATH",
+            cls.default_activation_socket_path(),
+        )
         return cls.model_validate(
             {
                 "openai_api_key": key,
                 "realtime_model": os.getenv("REALTIME_MODEL", "gpt-realtime-2.1-mini"),
                 "realtime_voice": os.getenv("REALTIME_VOICE", "marin"),
-                "realtime_reasoning_effort": os.getenv(
-                    "REALTIME_REASONING_EFFORT", "minimal"
-                ),
+                "realtime_reasoning_effort": os.getenv("REALTIME_REASONING_EFFORT", "minimal"),
                 "gateway_host": os.getenv("GATEWAY_HOST", "127.0.0.1"),
                 "gateway_port": os.getenv("GATEWAY_PORT", "8765"),
-                "streamlit_host": os.getenv("STREAMLIT_HOST", "127.0.0.1"),
-                "streamlit_port": os.getenv("STREAMLIT_PORT", "8501"),
+                "activation_socket_path": activation_socket_path,
+                "brave_bin": os.getenv(
+                    "BRAVE_BIN", "/opt/brave.com/brave-origin-nightly/brave"
+                ),
+                "voice_browser_profile": os.getenv(
+                    "VOICE_BROWSER_PROFILE",
+                    "~/.local/share/okay-hermes-realtime/brave-profile",
+                ),
+                "voice_page_url": os.getenv(
+                    "VOICE_PAGE_URL",
+                    "http://127.0.0.1:8765/voice",
+                ),
+                "voice_browser_start_timeout_seconds": os.getenv(
+                    "VOICE_BROWSER_START_TIMEOUT_SECONDS", "10.0"
+                ),
             }
         )
 
@@ -70,7 +127,7 @@ class Settings(BaseModel):
         return self.openai_api_key.get_secret_value()
 
 
-def build_realtime_session(settings: Settings) -> dict[str, Any]:
+def build_realtime_session(settings: Settings) -> dict[str, object]:
     """Build the server-owned OpenAI Realtime session contract."""
     return {
         "type": "realtime",
@@ -80,12 +137,13 @@ def build_realtime_session(settings: Settings) -> dict[str, Any]:
         "reasoning": {"effort": settings.realtime_reasoning_effort},
         "audio": {
             "input": {
+                "transcription": {"model": "gpt-4o-mini-transcribe"},
                 "turn_detection": {
                     "type": "semantic_vad",
                     "eagerness": "high",
                     "create_response": True,
                     "interrupt_response": True,
-                }
+                },
             },
             "output": {"voice": settings.realtime_voice},
         },
