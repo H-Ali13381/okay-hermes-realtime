@@ -41,7 +41,8 @@ let transportFailureTimer = null;
 let isStopping = false;
 let controllerSocket = null;
 let controllerSessionClosed = false;
-let teardownSent = false;
+let stopMessageSent = false;
+let teardownCompleteSent = false;
 let interruptionState = null;
 const transcriptTurns = new Map();
 const responseIdByItemId = new Map();
@@ -117,9 +118,19 @@ function openControllerSocket() {
     if (controllerSocket !== socket) return;
     try {
       const event = JSON.parse(message.data);
+      if (event.type === "stop") {
+        stopConversation({
+          reason: typeof event.reason === "string" ? event.reason : "native_cancel",
+          preserveError: true,
+          sendStopMessage: false,
+        });
+        return;
+      }
       if (event.type === "session_closed") {
         controllerSessionClosed = true;
+        stopConversation({ preserveError: true, reason: "native_cancel", sendStopMessage: false });
         socket.close();
+        return;
       }
       if (event.type === "action_state") {
         handleActionState(event);
@@ -134,7 +145,10 @@ function openControllerSocket() {
     }
   });
   socket.addEventListener("close", () => {
-    if (controllerSocket === socket) controllerSocket = null;
+    if (controllerSocket === socket) {
+      controllerSocket = null;
+      stopConversation({ preserveError: true, reason: "transport_failure", sendStopMessage: false });
+    }
   });
 }
 
@@ -584,6 +598,11 @@ async function handleRealtimeEvent(event, sessionContext) {
 async function startConversation() {
   clearError();
   resetTranscript();
+  stopMessageSent = false;
+  teardownCompleteSent = false;
+  remoteAudio.muted = false;
+  remoteAudio.pause();
+  remoteAudio.srcObject = null;
   openAIRealtimeSessionId = null;
   interruptionState = null;
   renderInterruptionDiagnostics();
@@ -708,42 +727,61 @@ async function startConversation() {
 }
 
 function stopConversation(options = {}) {
-  if (isStopping) return;
+  if (isStopping || teardownCompleteSent) return;
   isStopping = true;
-  if (!teardownSent) {
-    sendControlMessage({ type: "stop", reason: options.reason || "button" });
+  const shouldSendStopMessage = options.sendStopMessage !== false;
+
+  try {
+    if (!stopMessageSent) {
+      if (shouldSendStopMessage) {
+        sendControlMessage({ type: "stop", reason: options.reason || "button" });
+      }
+      stopMessageSent = true;
+    }
+
+    clearTransportFailureTimer();
+
+    remoteAudio.pause();
+    remoteAudio.muted = true;
+
+    if (dataChannel) {
+      if (dataChannel.readyState !== "closed") dataChannel.close();
+      dataChannel = null;
+    }
+    if (peerConnection) {
+      if (peerConnection.connectionState !== "closed") peerConnection.close();
+      peerConnection = null;
+    }
+
+    if (localStream) {
+      for (const track of localStream.getTracks()) {
+        track.stop();
+      }
+      localStream = null;
+    }
+
+    remoteAudio.srcObject = null;
+    remoteAudio.muted = false;
+    openAIRealtimeSessionId = null;
+    interruptionState = null;
+    renderInterruptionDiagnostics();
+    responseIdByItemId.clear();
+    startButton.disabled = false;
+    stopButton.disabled = true;
+    voiceCard.dataset.active = "false";
+
+    if (!options.preserveError) {
+      clearError();
+      setStatus("idle", "Not connected");
+    }
+
+    if (!teardownCompleteSent) {
+      teardownCompleteSent = true;
+      sendControlMessage({ type: "teardown_complete" });
+    }
+  } finally {
+    isStopping = false;
   }
-  clearTransportFailureTimer();
-  if (localStream) {
-    for (const track of localStream.getTracks()) track.stop();
-    localStream = null;
-  }
-  if (dataChannel) {
-    if (dataChannel.readyState !== "closed") dataChannel.close();
-    dataChannel = null;
-  }
-  if (peerConnection) {
-    if (peerConnection.connectionState !== "closed") peerConnection.close();
-    peerConnection = null;
-  }
-  remoteAudio.pause();
-  remoteAudio.muted = false;
-  remoteAudio.srcObject = null;
-  openAIRealtimeSessionId = null;
-  interruptionState = null;
-  renderInterruptionDiagnostics();
-  responseIdByItemId.clear();
-  startButton.disabled = false;
-  stopButton.disabled = true;
-  voiceCard.dataset.active = "false";
-  if (!options.preserveError) {
-    clearError();
-    setStatus("idle", "Not connected");
-  }
-  if (!teardownSent) {
-    teardownSent = sendControlMessage({ type: "teardown_complete" });
-  }
-  isStopping = false;
 }
 
 startButton.addEventListener("click", startConversation);

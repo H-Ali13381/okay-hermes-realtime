@@ -19,6 +19,19 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _extract_block(source: str, start: str, end: str | None = None) -> str:
+    start_index = source.index(start)
+    if end is None:
+        return source[start_index:]
+    end_index = source.index(end, start_index + len(start))
+    return source[start_index:end_index]
+
+
+def _assert_order(body: str, snippets: list[str]) -> None:
+    positions = [body.index(snippet) for snippet in snippets]
+    assert positions == sorted(positions)
+
+
 def _client() -> TestClient:
     return TestClient(create_app(Settings(openai_api_key=SecretStr("test-secret-key"))))
 
@@ -212,3 +225,51 @@ def test_interruption_ui_uses_pure_reducer_and_explicit_response_guards() -> Non
     assert 'id="interruption-state"' in html
     assert 'id="speech-silence-ms"' in html
     assert '<details id="interruption-diagnostics"' in html
+
+
+def test_js_stop_message_from_controller_invokes_local_teardown_once() -> None:
+    script = _read(JS_PATH)
+
+    assert "if (event.type === \"stop\")" in script
+    assert "sendStopMessage: false" in script
+    assert "stopConversation({" in script
+    assert "sendControlMessage({ type: \"stop\"" in script
+    assert "isStopping || teardownCompleteSent" in script
+
+    stop_event_block = _extract_block(
+        script,
+        "if (event.type === \"stop\") {",
+        "if (event.type === \"session_closed\") {",
+    )
+    assert "sendStopMessage: false" in stop_event_block
+    assert "stopConversation({" in stop_event_block
+
+
+def test_js_teardown_order_is_stop_playback_then_channels_then_tracks_then_ack() -> None:
+    script = _read(JS_PATH)
+
+    stop_block = _extract_block(
+        script,
+        "function stopConversation(options = {}) {",
+        "window.addEventListener(\"beforeunload\"",
+    )
+
+    assert "remoteAudio.pause();" in stop_block
+    assert "remoteAudio.muted = true;" in stop_block
+    assert "dataChannel.close();" in stop_block
+    assert "peerConnection.close();" in stop_block
+    assert "for (const track of localStream.getTracks())" in stop_block
+    assert "track.stop();" in stop_block
+    assert 'sendControlMessage({ type: "teardown_complete"' in stop_block
+
+    _assert_order(
+        stop_block,
+        [
+            "remoteAudio.pause();",
+            "remoteAudio.muted = true;",
+            "dataChannel.close();",
+            "peerConnection.close();",
+            "for (const track of localStream.getTracks())",
+            'sendControlMessage({ type: "teardown_complete"',
+        ],
+    )
