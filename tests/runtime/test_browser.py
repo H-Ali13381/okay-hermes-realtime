@@ -145,6 +145,30 @@ def test_launch_builds_expected_command_and_process_options(
     assert process.kwargs["start_new_session"] is True
 
 
+def test_launch_restores_vendor_wrapper_environment_for_direct_brave_binary(
+    tmp_path: Path,
+) -> None:
+    binary = make_executable(tmp_path / "brave")
+    wrapper = make_executable(tmp_path / "brave-origin")
+    process = FakeProcess(pid=123)
+    factory = ProcessFactory(process=process)
+    launcher = DedicatedBraveLauncher(
+        brave_binary=str(binary),
+        brave_profile=str(tmp_path / "profile"),
+        loopback_base_url="http://127.0.0.1:8765/voice",
+        start_timeout_seconds=10.0,
+        process_factory=factory,
+    )
+
+    launcher.launch(launcher._build_loopback_url("secret-token"))
+
+    environment = factory.calls[0][1]["env"]
+    assert isinstance(environment, dict)
+    assert environment["CHROME_WRAPPER"] == str(wrapper.resolve())
+    assert environment["CHROME_VERSION_EXTRA"] == "nightly"
+    assert environment["GNOME_DISABLE_CRASH_DIALOG"] == "SET_BY_GOOGLE_CHROME"
+
+
 def test_launch_rejects_non_loopback_voice_url_and_sanitizes_token_in_error(
     tmp_path: Path,
 ) -> None:
