@@ -97,6 +97,17 @@ The first slice may leave the native PipeWire capture stream open while inferenc
 11. The controller closes only the dedicated Brave app process/window.
 12. The activation handler returns and wakeword inference rearms.
 
+## Verified Stage 1 implementation deltas
+
+The 2026-07-22 machine smoke verified these concrete deltas from the original design:
+
+- The Stage 1 browser launcher targets the actual Brave Origin Nightly binary at `/opt/brave.com/brave-origin-nightly/brave`, not its retained shell wrapper. The launched PID is therefore the browser main process and process-group leader.
+- Browser teardown is application cleanup, bounded main-PID TERM, then owned-group KILL only if stuck. The controller unit uses `KillMode=mixed` and `TimeoutStopSec=10s` so systemd does not TERM every Chromium child before coordinated cleanup.
+- Embedded Uvicorn does not capture process signals; the runtime service owns SIGTERM ordering and keeps the control WebSocket alive through active-session close.
+- The installed controller, listener, tray, config, state, model, browser profile, and user-unit names are all replacement-specific under `okay-hermes-realtime` paths.
+- The Stage 1 executable tool catalog is deliberately bounded to `assistant_get_current_time` and `voice_end_session`. Rich media, timers, and durable Hermes tasks remain Stage 2 work even where the design describes their eventual ownership boundary.
+- The actual tray path reached OpenAI WebRTC `live`, then Turn OFF produced successful unit results, no remaining dedicated Brave process, and no new Brave core dump.
+
 ## Visible webpage
 
 The webpage replaces both Streamlit and OHV’s terminal popup as the primary session surface.
