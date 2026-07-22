@@ -468,7 +468,28 @@ def create_app(
         if media_type != "application/sdp":
             raise HTTPException(status_code=415, detail="Content-Type must be application/sdp")
 
-        local_session_id = request.headers.get(LOCAL_CONTROLLER_SESSION_HEADER)
+        header_session_id = request.headers.get(LOCAL_CONTROLLER_SESSION_HEADER)
+        query_session_id = request.query_params.get("local_session_id")
+        if (
+            header_session_id is not None
+            and query_session_id is not None
+            and header_session_id != query_session_id
+        ):
+            raise HTTPException(status_code=400, detail="Conflicting local session bindings")
+
+        if query_session_id is not None:
+            authorization = request.headers.get("authorization", "")
+            if not authorization.startswith("Bearer ek_"):
+                raise HTTPException(status_code=403, detail="Invalid Realtime client credential")
+            if _LOCAL_SESSION_ID_RE.fullmatch(query_session_id) is None:
+                raise HTTPException(status_code=400, detail="Invalid local session binding")
+            if _controller.active_session_id != query_session_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Local voice session is no longer active",
+                )
+
+        local_session_id = query_session_id or header_session_id
         if (
             local_session_id is not None
             and _LOCAL_SESSION_ID_RE.fullmatch(local_session_id) is None

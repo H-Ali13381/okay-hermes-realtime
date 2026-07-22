@@ -22596,25 +22596,6 @@ async function fetchClientSecret() {
   }
   return payload;
 }
-async function waitForProviderCallId(transport, connectPromise) {
-  const deadline = performance.now() + 1e4;
-  while (realtimeTransport === transport) {
-    if (typeof transport.callId === "string" && transport.callId) {
-      return transport.callId;
-    }
-    if (performance.now() >= deadline) {
-      throw new Error("Realtime transport did not expose a call ID");
-    }
-    const outcome = await Promise.race([
-      connectPromise.then(() => "connected"),
-      new Promise((resolve) => setTimeout(() => resolve("poll"), 20))
-    ]);
-    if (outcome === "connected") {
-      throw new Error("Realtime transport connected without a call ID");
-    }
-  }
-  throw new Error("Realtime transport was replaced during connection");
-}
 async function startConversation() {
   clearError();
   resetTranscript();
@@ -22669,19 +22650,11 @@ async function startConversation() {
     const connectPromise = transport.connect({
       apiKey: clientSecret.value,
       model: clientSecret.session.model,
+      url: localSessionId ? `/session?local_session_id=${encodeURIComponent(localSessionId)}` : void 0,
       initialSessionConfig: {
         providerData: clientSecret.session
       }
     });
-    if (localSessionId) {
-      const providerCallId = await waitForProviderCallId(transport, connectPromise);
-      if (!sendControlMessage({
-        type: "realtime_connected",
-        provider_call_id: providerCallId
-      })) {
-        throw new Error("Could not bind the Realtime call to the local controller");
-      }
-    }
     await connectPromise;
     if (realtimeTransport !== transport) return;
     if (localSessionId) {

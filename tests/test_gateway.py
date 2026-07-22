@@ -94,8 +94,9 @@ class CallHandleRegistry:
 
 
 class SidebandStartController:
-    def __init__(self) -> None:
+    def __init__(self, active_session_id: str | None = None) -> None:
         self.calls: list[dict[str, str]] = []
+        self.active_session_id = active_session_id
 
     async def start_realtime_sideband(
         self,
@@ -460,7 +461,7 @@ def test_session_endpoint_starts_sideband_for_exact_controller_session() -> None
         )
     )
     registry = CallHandleRegistry()
-    controller = SidebandStartController()
+    controller = SidebandStartController(active_session_id="local-session-1234")
     client = TestClient(
         create_app(
             settings(),
@@ -471,16 +472,17 @@ def test_session_endpoint_starts_sideband_for_exact_controller_session() -> None
     )
 
     response = client.post(
-        "/session",
+        "/session?local_session_id=local-session-1234",
         content="v=0\r\nmock-offer",
         headers={
+            "Authorization": "Bearer ek_test_ephemeral",
             "Content-Type": "application/sdp",
-            "X-Okay-Hermes-Session-ID": "local-session-1234",
         },
     )
 
     assert response.status_code == 200
     assert response.headers["x-openai-realtime-session-id"] == "local-session-1234"
+    assert "location" not in response.headers
     assert controller.calls == [
         {
             "local_session_id": "local-session-1234",
@@ -493,6 +495,36 @@ def test_session_endpoint_starts_sideband_for_exact_controller_session() -> None
     assert handle.call_id == "call_sideband"
     assert "test-secret-key" not in response.text
     assert "call_sideband" not in response.text
+
+
+def test_session_endpoint_rejects_stale_query_binding_before_upstream() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_unused"},
+        )
+    )
+    controller = SidebandStartController(active_session_id="active-session-5678")
+    client = TestClient(
+        create_app(
+            settings(),
+            upstream_client=upstream,
+            controller=controller,  # type: ignore[arg-type]
+        )
+    )
+
+    response = client.post(
+        "/session?local_session_id=stale-session-1234",
+        content="v=0\r\nmock-offer",
+        headers={
+            "Authorization": "Bearer ek_test_ephemeral",
+            "Content-Type": "application/sdp",
+        },
+    )
+
+    assert response.status_code == 409
+    assert upstream.calls == []
 
 
 def test_session_binding_rejects_malformed_location_without_clearing_existing_binding() -> None:

@@ -113,6 +113,10 @@ def test_js_uses_openai_realtime_webrtc_transport() -> None:
     assert 'if (cause?.type === "error") return' in start_block
     assert "const connectPromise = transport.connect" in start_block
     assert "await connectPromise" in start_block
+    assert (
+        'url: localSessionId ? `/session?local_session_id=${encodeURIComponent(localSessionId)}`'
+        in start_block
+    )
     assert "new RTCPeerConnection" not in start_block
     assert "createDataChannel" not in start_block
     assert 'fetch("/session"' not in script
@@ -184,12 +188,12 @@ def test_activation_mode_uses_same_origin_control_websocket_and_auto_start() -> 
     assert "new WebSocket" in script
     assert "/control?activation=" in script
     assert 'type: "page_ready"' in script
-    assert 'type: "realtime_connected"' in script
-    assert "provider_call_id: providerCallId" in script
+    assert 'type: "realtime_connected"' not in script
+    assert "provider_call_id: providerCallId" not in script
     assert 'type: "page_started"' in script
     assert start_block.index("const connectPromise = transport.connect") < start_block.index(
-        'type: "realtime_connected"'
-    ) < start_block.index("await connectPromise")
+        "await connectPromise"
+    ) < start_block.index('sendControlMessage({ type: "page_started" })')
     assert "startConversation()" in script
     assert 'type: "stop"' in script
     assert 'type: "teardown_complete"' in script
