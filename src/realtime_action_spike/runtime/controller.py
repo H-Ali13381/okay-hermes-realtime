@@ -29,6 +29,7 @@ from .protocol import (
     TimingMessage,
     parse_loopback_message,
 )
+from .session_startup import BrowserStartupDeadline
 from .session_state import SessionPhase, SessionState, SessionTransitionError
 from .teardown import (
     TeardownCoordinator,
@@ -89,6 +90,7 @@ class _WakeSession:
     teardown_marked: bool = False
     stop_reason: StopReason | None = None
     resolved_result: TerminalSessionResult | None = None
+    startup_deadline: BrowserStartupDeadline | None = None
 
 
 class VoiceSessionController:
@@ -102,6 +104,7 @@ class VoiceSessionController:
         token_store: LaunchTokenStore | None = None,
         lock: asyncio.Lock | None = None,
         capability_broker: CapabilityBroker | None = None,
+        browser_start_timeout_seconds: float = 10.0,
         browser_ack_timeout_seconds: float = 1.0,
         teardown_step_timeout_seconds: float = 2.0,
         farewell_timeout_seconds: float = 1.5,
@@ -113,6 +116,7 @@ class VoiceSessionController:
         self._token_store = token_store or LaunchTokenStore()
         self._lock = lock or asyncio.Lock()
         self._capability_broker = capability_broker or CapabilityBroker()
+        self._browser_start_timeout_seconds = browser_start_timeout_seconds
         self._browser_ack_timeout_seconds = browser_ack_timeout_seconds
         self._teardown_step_timeout_seconds = teardown_step_timeout_seconds
         self._farewell_timeout_seconds = farewell_timeout_seconds
@@ -227,7 +231,28 @@ class VoiceSessionController:
                 )
 
             session.browser_handle = browser_handle
+            session.startup_deadline = BrowserStartupDeadline(
+                self._browser_start_timeout_seconds,
+                lambda: self._expire_browser_startup(session),
+            )
+            session.startup_deadline.start()
             return ActivationResult(status="opened", session_id=session_id, token=token)
+
+    async def _expire_browser_startup(self, session: _WakeSession) -> None:
+        request = TeardownRequest(
+            outcome=SessionOutcome.TIMED_OUT,
+            reason=StopReason.TIMEOUT,
+            error="browser startup timed out",
+        )
+        async with self._lock:
+            if self._active_session is not session or session.state.phase not in {
+                SessionPhase.LAUNCHING,
+                SessionPhase.CONNECTING,
+            }:
+                return
+            coordinator = self._begin_teardown_locked(session, request)
+
+        await coordinator.run(request)
 
     async def publish_action_state(self, message: ActionStateMessage) -> None:
         """Queue a sanitized action-state message for the exact active page."""
@@ -597,6 +622,9 @@ class VoiceSessionController:
                 self._close_after_response.discard(session.session_id)
                 self._farewell_events.pop(session.session_id, None)
                 farewell_task = self._farewell_tasks.pop(session.session_id, None)
+                if session.startup_deadline is not None:
+                    session.startup_deadline.cancel()
+                    session.startup_deadline = None
                 self._teardown_tasks.pop(session.session_id, None)
                 self._resolve_terminal_result(
                     session,
@@ -713,6 +741,9 @@ class VoiceSessionController:
 
             if isinstance(message, PageStartedMessage):
                 _transition(active, SessionPhase.LIVE)
+                if active.startup_deadline is not None:
+                    active.startup_deadline.cancel()
+                    active.startup_deadline = None
                 self._notify_status()
                 return None
 

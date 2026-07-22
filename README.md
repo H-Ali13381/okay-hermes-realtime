@@ -18,7 +18,7 @@ replacement tray                              └─ dedicated Brave app process
                                               OpenAI Realtime call
 ```
 
-The controller launches the real Brave binary in a new process group. The page first tears down media and acknowledges Stop; fallback TERM targets only the browser main PID. The systemd controller unit uses `KillMode=mixed`, reserving cgroup-wide KILL for a bounded failure fallback. This avoids Chromium/Crashpad SIGTRAP reports caused by terminating the whole browser tree simultaneously.
+The controller launches the real Brave binary in a new process group and enforces a bounded deadline for the page to reach `page_started`. The page first tears down media and acknowledges Stop; fallback TERM targets only the browser main PID. The systemd controller unit uses `KillMode=mixed`, reserving cgroup-wide KILL for a bounded failure fallback. This avoids Chromium/Crashpad SIGTRAP reports caused by terminating the whole browser tree simultaneously.
 
 ## Stage 1 scope
 
@@ -139,7 +139,7 @@ Missing observations remain missing; the runtime does not substitute plausible z
 uv run pytest -q
 uv run ruff check .
 uv run python -m compileall -q src scripts
-node --test tests/web/interruption_state.test.mjs
+node --test tests/web/*.test.mjs
 uv build
 cmake -S native/realtime-tray -B /tmp/okay-hermes-realtime-tray-final -G Ninja
 cmake --build /tmp/okay-hermes-realtime-tray-final

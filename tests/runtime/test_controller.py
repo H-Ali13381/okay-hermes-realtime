@@ -361,6 +361,74 @@ async def test_waiter_cancellation_does_not_cancel_shared_terminal_future() -> N
 
 
 @pytest.mark.asyncio
+async def test_browser_startup_timeout_closes_browser_and_releases_slot() -> None:
+    launcher = DeterministicLauncher()
+    controller = VoiceSessionController(
+        launcher,
+        token_store=LaunchTokenStore(
+            token_factory=SequenceFactory(["token-startup-timeout"]),
+        ),
+        session_id_factory=SequenceFactory(["session-startup-timeout"]),
+        browser_start_timeout_seconds=0.01,
+        browser_ack_timeout_seconds=0.01,
+        teardown_step_timeout_seconds=0.05,
+    )
+
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    assert activation.session_id is not None
+
+    result = await asyncio.wait_for(
+        controller.wait_for_terminal_result(activation.session_id),
+        timeout=0.5,
+    )
+
+    assert result == TerminalSessionResult(
+        session_id="session-startup-timeout",
+        outcome=SessionOutcome.TIMED_OUT,
+        error="browser startup timed out",
+    )
+    assert launcher.handles[0].closed_calls == 1
+    assert controller.status == "idle"
+
+
+@pytest.mark.asyncio
+async def test_page_started_cancels_browser_startup_timeout() -> None:
+    launcher = DeterministicLauncher()
+    controller = VoiceSessionController(
+        launcher,
+        token_store=LaunchTokenStore(
+            token_factory=SequenceFactory(["token-startup-live"]),
+        ),
+        session_id_factory=SequenceFactory(["session-startup-live"]),
+        browser_start_timeout_seconds=0.01,
+        browser_ack_timeout_seconds=0.01,
+        teardown_step_timeout_seconds=0.05,
+    )
+
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    assert activation.session_id is not None
+    await controller.process_control_message(
+        activation.session_id,
+        encode_loopback_message(
+            PageReadyMessage(type="page_ready", session_id=activation.session_id)
+        ),
+    )
+    await controller.process_control_message(
+        activation.session_id,
+        encode_loopback_message(
+            PageStartedMessage(type="page_started", session_id=activation.session_id)
+        ),
+    )
+
+    await asyncio.sleep(0.03)
+
+    assert controller.status == "live"
+    assert launcher.handles[0].closed_calls == 0
+    await controller.close_active_session()
+    assert controller.status == "idle"
+
+
+@pytest.mark.asyncio
 async def test_launch_failure_resolves_terminal_result_and_releases_slot() -> None:
     launcher = FailingLauncher(RuntimeError("launch failed"))
     controller = VoiceSessionController(
