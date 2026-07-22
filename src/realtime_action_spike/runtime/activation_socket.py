@@ -111,6 +111,16 @@ class ActivationSocket:
                 )
                 return
 
+            if terminal_result.outcome == SessionOutcome.CANCELLED:
+                await _write_response(
+                    {
+                        "outcome": "cancelled",
+                        "session_id": terminal_result.session_id,
+                    },
+                    writer,
+                )
+                return
+
             await _write_response(
                 {
                     "outcome": "failed",

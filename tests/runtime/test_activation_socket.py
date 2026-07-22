@@ -95,6 +95,35 @@ async def test_valid_handoff_blocks_until_exact_session_closes(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_cancelled_terminal_result_is_reported_distinctly(tmp_path: Path) -> None:
+    path = tmp_path / "runtime" / "activation.sock"
+    controller = FakeController(
+        ActivationResult(status="opened", session_id="local-session-03", token="launch-token")
+    )
+    server = ActivationSocket(controller, "http://127.0.0.1:8765/voice", str(path))  # type: ignore[arg-type]
+    await server.start()
+
+    reader, writer = await _open_request(path, json.dumps(ACTIVATION).encode() + b"\n")
+    await asyncio.wait_for(controller.wait_started.wait(), timeout=1.0)
+
+    assert controller.terminal_future is not None
+    controller.terminal_future.set_result(
+        TerminalSessionResult(
+            session_id="local-session-03",
+            outcome=SessionOutcome.CANCELLED,
+        )
+    )
+    assert await _read_json_line(reader) == {
+        "outcome": "cancelled",
+        "session_id": "local-session-03",
+    }
+
+    writer.close()
+    await writer.wait_closed()
+    await server.stop()
+
+
+@pytest.mark.asyncio
 async def test_busy_and_malformed_requests_return_bounded_responses(tmp_path: Path) -> None:
     path = tmp_path / "runtime" / "activation.sock"
     controller = FakeController(ActivationResult(status="busy"))

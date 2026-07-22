@@ -109,6 +109,26 @@ async def test_busy_response_uses_distinct_exit_code(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancelled_response_uses_distinct_exit_code(tmp_path: Path) -> None:
+    path = tmp_path / "activation.sock"
+    server = await _serve_once(
+        path,
+        {"outcome": "cancelled", "session_id": "local-session-03"},
+    )
+
+    code, stdout, stderr = await _run_handler(json.dumps(ACTIVATION).encode(), path)
+    assert code == 3
+    assert json.loads(stdout) == {
+        "outcome": "cancelled",
+        "session_id": "local-session-03",
+    }
+    assert stderr == ""
+
+    server.close()
+    await server.wait_closed()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("payload", [b"", b"not-json", b"{}", b"{} {}"])
 async def test_malformed_stdin_is_sanitized(payload: bytes, tmp_path: Path) -> None:
     code, stdout, stderr = await _run_handler(payload, tmp_path / "missing.sock")

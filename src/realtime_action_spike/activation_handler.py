@@ -44,6 +44,8 @@ def main() -> int:
         return 0
     if outcome == "busy":
         return 2
+    if outcome == "cancelled":
+        return 3
     return 1
 
 
@@ -120,6 +122,8 @@ def _decode_response(raw: str) -> dict[str, object]:
         return {"outcome": "completed", "session_id": str(response.get("session_id", ""))}
     if response["outcome"] == "busy":
         return {"outcome": "busy"}
+    if response["outcome"] == "cancelled":
+        return {"outcome": "cancelled", "session_id": str(response.get("session_id", ""))}
 
     return {
         "outcome": "failed",
