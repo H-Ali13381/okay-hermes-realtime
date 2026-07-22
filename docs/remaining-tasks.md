@@ -45,7 +45,7 @@ Status is synchronized to `feature/webrtc-wakeword-replacement` on 2026-07-22. A
 - [x] Verify runtime/install/native paths contain no legacy OHV installed-name collisions.
 - [x] Run Python, Node, lint, compile, wheel/sdist, native tray, native listener, systemd, and diff gates.
 - [x] Complete independent full-diff review and address all blocking findings.
-- [ ] Pass the temporary local-`main` merge verification gate.
+- [x] Pass the temporary local-`main` merge verification gate.
 
 ## Verified Stage 1 snapshot
 
