@@ -23,6 +23,7 @@ class TimingName(StrEnum):
 
 class StopReason(StrEnum):
     BUTTON = "button"
+    MODEL_REQUEST = "model_request"
     TRANSPORT_FAILURE = "transport_failure"
     NATIVE_CANCEL = "native_cancel"
     TIMEOUT = "timeout"

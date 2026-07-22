@@ -418,12 +418,16 @@ class _ToolBroker:
 def _controller(
     *session_ids: str,
     broker: _ToolBroker | None = None,
+    farewell_timeout_seconds: float = 1.5,
+    browser_ack_timeout_seconds: float = 0.25,
 ) -> VoiceSessionController:
     sequence = iter(session_ids)
     return VoiceSessionController(
         _Launcher(),
         session_id_factory=lambda: next(sequence),
         capability_broker=broker,
+        farewell_timeout_seconds=farewell_timeout_seconds,
+        browser_ack_timeout_seconds=browser_ack_timeout_seconds,
     )
 
 
@@ -559,4 +563,41 @@ async def test_voice_end_session_closes_after_current_response_done() -> None:
 
     assert result.outcome is SessionOutcome.COMPLETED
     assert controller.active_session_id is None
+    assert ws.closed
+
+
+async def test_voice_end_session_farewell_timeout_still_tears_down() -> None:
+    broker = _ToolBroker()
+    controller = _controller(
+        "local-end-timeout-01",
+        broker=broker,
+        farewell_timeout_seconds=0.01,
+        browser_ack_timeout_seconds=0.01,
+    )
+    await controller.activate("http://127.0.0.1:8765/voice")
+    ws = _FakeWebSocket(messages=deque())
+    await controller.start_realtime_sideband(
+        local_session_id="local-end-timeout-01",
+        call_id="call_session_timeout",
+        api_key="server-secret",
+        websocket_connect=_Connector(ws),
+    )
+
+    await controller.process_sideband_event(
+        "local-end-timeout-01",
+        {
+            "type": "response.function_call_arguments.done",
+            "call_id": "call_end_timeout",
+            "name": "voice_end_session",
+            "arguments": "{}",
+        },
+    )
+
+    result = await asyncio.wait_for(
+        controller.wait_for_terminal_result("local-end-timeout-01"),
+        timeout=0.2,
+    )
+
+    assert result.outcome is SessionOutcome.COMPLETED
+    assert controller.status == "idle"
     assert ws.closed

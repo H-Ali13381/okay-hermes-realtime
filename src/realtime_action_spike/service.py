@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import signal
 from collections.abc import Callable
+from pathlib import Path
 from typing import Protocol
 
 import uvicorn
@@ -73,9 +75,9 @@ class RuntimeService:
                 start_timeout_seconds=settings.voice_browser_start_timeout_seconds,
             )
         ),
-        controller_factory: Callable[[DedicatedBraveLauncher], VoiceSessionController] = (
-            lambda launcher: VoiceSessionController(launcher=launcher)
-        ),
+        controller_factory: (
+            Callable[[DedicatedBraveLauncher], VoiceSessionController] | None
+        ) = None,
         socket_factory: Callable[[VoiceSessionController, Settings], ActivationSocket] = (
             lambda controller, settings: ActivationSocket(
                 controller=controller,
@@ -109,7 +111,16 @@ class RuntimeService:
         self._signal_handlers_registered = False
 
         self._launcher = launcher_factory(settings)
-        self._controller = controller_factory(self._launcher)
+        if controller_factory is None:
+            state_home = Path(
+                os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
+            )
+            self._controller = VoiceSessionController(
+                launcher=self._launcher,
+                trace_directory=state_home / "okay-hermes-realtime" / "traces",
+            )
+        else:
+            self._controller = controller_factory(self._launcher)
         self._socket = socket_factory(self._controller, settings)
         self._app = app_factory(settings, self._controller)
         self._http_server = http_server_factory(self._app, settings)

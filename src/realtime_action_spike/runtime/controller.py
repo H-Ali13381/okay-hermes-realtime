@@ -6,6 +6,7 @@ import copy
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
@@ -17,6 +18,7 @@ from realtime_action_spike.openai.tool_loop import ToolActionState, ToolCall, Tr
 from .browser import BrowserHandle
 from .protocol import (
     ActionStateMessage,
+    LoopbackMessage,
     PageReadyMessage,
     PageStartedMessage,
     SessionClosedMessage,
@@ -28,6 +30,13 @@ from .protocol import (
     parse_loopback_message,
 )
 from .session_state import SessionPhase, SessionState, SessionTransitionError
+from .teardown import (
+    TeardownCoordinator,
+    TeardownHooks,
+    TeardownReport,
+    TeardownRequest,
+    TeardownStepFailure,
+)
 from .timing import JsonValue, SessionTrace, sanitize_timing_data
 from .tokens import LaunchTokenStore
 
@@ -75,6 +84,8 @@ class _WakeSession:
     trace: SessionTrace
     interruptions: InterruptionTimelineReducer
     browser_handle: BrowserHandle | None
+    teardown: TeardownCoordinator | None = None
+    teardown_marked: bool = False
     stop_reason: StopReason | None = None
     resolved_result: TerminalSessionResult | None = None
 
@@ -90,12 +101,20 @@ class VoiceSessionController:
         token_store: LaunchTokenStore | None = None,
         lock: asyncio.Lock | None = None,
         capability_broker: CapabilityBroker | None = None,
+        browser_ack_timeout_seconds: float = 0.25,
+        teardown_step_timeout_seconds: float = 2.0,
+        farewell_timeout_seconds: float = 1.5,
+        trace_directory: Path | None = None,
     ) -> None:
         self._launcher = launcher
         self._session_id_factory = session_id_factory or (lambda: secrets.token_urlsafe(16))
         self._token_store = token_store or LaunchTokenStore()
         self._lock = lock or asyncio.Lock()
         self._capability_broker = capability_broker or CapabilityBroker()
+        self._browser_ack_timeout_seconds = browser_ack_timeout_seconds
+        self._teardown_step_timeout_seconds = teardown_step_timeout_seconds
+        self._farewell_timeout_seconds = farewell_timeout_seconds
+        self._trace_directory = trace_directory
 
         self._active_session: _WakeSession | None = None
         self._last_closed_session_id: str | None = None
@@ -106,7 +125,10 @@ class VoiceSessionController:
         self._function_call_parsers: dict[str, FunctionCallEventParser] = {}
         self._tool_loops: dict[str, TrustedToolLoop] = {}
         self._close_after_response: set[str] = set()
-        self._outbound_messages: dict[str, asyncio.Queue[ActionStateMessage]] = {}
+        self._outbound_messages: dict[str, asyncio.Queue[LoopbackMessage]] = {}
+        self._farewell_events: dict[str, asyncio.Event] = {}
+        self._farewell_tasks: dict[str, asyncio.Task[None]] = {}
+        self._teardown_tasks: dict[str, asyncio.Task[TeardownReport]] = {}
 
     @property
     def token_store(self) -> LaunchTokenStore:
@@ -161,10 +183,12 @@ class VoiceSessionController:
                 interruptions=interruptions,
                 browser_handle=None,
             )
+            session.teardown = self._build_teardown_coordinator(session)
 
             self._active_session = session
             self._terminal_futures[session_id] = terminal_future
             self._outbound_messages[session_id] = asyncio.Queue(maxsize=64)
+            self._farewell_events[session_id] = asyncio.Event()
             self._last_closed_session_id = None
             self._last_closed_interruption_traces = ()
             try:
@@ -180,6 +204,7 @@ class VoiceSessionController:
                 )
                 self._active_session = None
                 self._outbound_messages.pop(session_id, None)
+                self._farewell_events.pop(session_id, None)
                 _transition(session, SessionPhase.FAILED)
                 self._terminal_futures.pop(session_id, None)
                 self._terminal_results[session_id] = session.resolved_result
@@ -202,13 +227,15 @@ class VoiceSessionController:
         """Queue a sanitized action-state message for the exact active page."""
 
         async with self._lock:
-            self._require_active_session(message.session_id)
+            active = self._require_active_session(message.session_id)
+            if active.state.phase is SessionPhase.STOPPING:
+                raise StaleControlMessage("session is stopping")
             queue = self._outbound_messages[message.session_id]
             if queue.full():
                 queue.get_nowait()
             queue.put_nowait(message)
 
-    async def wait_for_outbound_message(self, session_id: str) -> ActionStateMessage:
+    async def wait_for_outbound_message(self, session_id: str) -> LoopbackMessage:
         """Wait for the next sanitized controller-to-page message."""
 
         async with self._lock:
@@ -383,7 +410,9 @@ class VoiceSessionController:
         """Apply one sideband event for an exact local session."""
 
         async with self._lock:
-            self._require_active_session(local_session_id)
+            active = self._require_active_session(local_session_id)
+            if active.state.phase is SessionPhase.STOPPING:
+                raise StaleControlMessage("session is stopping")
             if not isinstance(payload, dict):
                 raise TypeError("sideband event payload must be an object")
             parser = self._function_call_parsers.get(local_session_id)
@@ -404,12 +433,41 @@ class VoiceSessionController:
                 async with self._lock:
                     self._require_active_session(local_session_id)
                     self._close_after_response.add(local_session_id)
+                    if local_session_id not in self._farewell_tasks:
+                        task = asyncio.create_task(
+                            self._wait_for_farewell(local_session_id),
+                            name=f"voice-farewell-{local_session_id}",
+                        )
+                        self._farewell_tasks[local_session_id] = task
 
         if payload.get("type") == "response.done":
             async with self._lock:
-                should_close = local_session_id in self._close_after_response
-            if should_close:
-                await self.close_active_session(outcome=SessionOutcome.COMPLETED)
+                farewell_event = self._farewell_events.get(local_session_id)
+                if local_session_id not in self._close_after_response:
+                    farewell_event = None
+                if farewell_event is not None:
+                    farewell_event.set()
+
+    async def _wait_for_farewell(self, local_session_id: str) -> None:
+        async with self._lock:
+            farewell_event = self._farewell_events.get(local_session_id)
+        if farewell_event is None:
+            return
+
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(
+                farewell_event.wait(),
+                timeout=self._farewell_timeout_seconds,
+            )
+
+        try:
+            await self.request_teardown(
+                local_session_id,
+                outcome=SessionOutcome.COMPLETED,
+                reason=StopReason.MODEL_REQUEST,
+            )
+        except StaleControlMessage:
+            return
 
     async def send_sideband_event(
         self,
@@ -447,6 +505,155 @@ class VoiceSessionController:
             return
         await sideband.close()
 
+    def _build_teardown_coordinator(self, session: _WakeSession) -> TeardownCoordinator:
+        async def mark_stopping(request: TeardownRequest) -> None:
+            async with self._lock:
+                self._begin_teardown_locked(session, request)
+
+        async def request_browser_stop(request: TeardownRequest) -> None:
+            async with self._lock:
+                active = self._require_active_session(session.session_id)
+                queue = self._outbound_messages[session.session_id]
+                message = StopMessage(
+                    type="stop",
+                    session_id=session.session_id,
+                    reason=request.reason,
+                )
+                if queue.full():
+                    queue.get_nowait()
+                queue.put_nowait(message)
+                active.trace.record(
+                    "browser_stop_requested",
+                    source="controller",
+                    data={"reason": message.reason.value},
+                )
+
+        async def close_sideband() -> None:
+            async with self._lock:
+                sideband = self._sideband_clients.pop(session.session_id, None)
+                self._function_call_parsers.pop(session.session_id, None)
+                self._tool_loops.pop(session.session_id, None)
+                self._close_after_response.discard(session.session_id)
+            if sideband is not None:
+                await sideband.close()
+
+        async def close_browser() -> None:
+            async with self._lock:
+                browser_handle = session.browser_handle
+                session.browser_handle = None
+            if browser_handle is not None:
+                await asyncio.to_thread(browser_handle.close)
+
+        async def persist_trace(failures: tuple[TeardownStepFailure, ...]) -> None:
+            for failure in failures:
+                session.trace.record(
+                    "teardown_step_failed",
+                    source="controller",
+                    data={"step": failure.step, "kind": failure.kind},
+                )
+            session.trace.record("teardown_complete", source="controller")
+            if self._trace_directory is None:
+                return
+
+            trace_path = self._trace_directory / f"{session.session_id}.jsonl"
+
+            def write_trace() -> None:
+                trace_path.parent.mkdir(parents=True, exist_ok=True)
+                session.trace.write_jsonl(trace_path)
+
+            await asyncio.to_thread(write_trace)
+
+        async def finalize(
+            request: TeardownRequest,
+            _failures: tuple[TeardownStepFailure, ...],
+        ) -> None:
+            farewell_task: asyncio.Task[None] | None = None
+            async with self._lock:
+                active = self._active_session
+                if active is not session:
+                    return
+
+                terminal_phase = (
+                    SessionPhase.FAILED
+                    if request.outcome is SessionOutcome.FAILED
+                    else SessionPhase.CLOSED
+                )
+                _transition(session, terminal_phase)
+                self._last_closed_interruption_traces = copy.deepcopy(
+                    session.interruptions.traces
+                )
+                self._active_session = None
+                self._last_closed_session_id = session.session_id
+                self._outbound_messages.pop(session.session_id, None)
+                self._function_call_parsers.pop(session.session_id, None)
+                self._tool_loops.pop(session.session_id, None)
+                self._close_after_response.discard(session.session_id)
+                self._farewell_events.pop(session.session_id, None)
+                farewell_task = self._farewell_tasks.pop(session.session_id, None)
+                self._teardown_tasks.pop(session.session_id, None)
+                self._resolve_terminal_result(
+                    session,
+                    outcome=request.outcome,
+                    error=request.error,
+                )
+
+            current_task = asyncio.current_task()
+            if farewell_task is not None and farewell_task is not current_task:
+                farewell_task.cancel()
+
+        return TeardownCoordinator(
+            TeardownHooks(
+                mark_stopping=mark_stopping,
+                request_browser_stop=request_browser_stop,
+                close_sideband=close_sideband,
+                close_browser=close_browser,
+                persist_trace=persist_trace,
+                finalize=finalize,
+            ),
+            acknowledgement_timeout=self._browser_ack_timeout_seconds,
+            step_timeout=self._teardown_step_timeout_seconds,
+        )
+
+    def _begin_teardown_locked(
+        self,
+        session: _WakeSession,
+        request: TeardownRequest,
+    ) -> TeardownCoordinator:
+        active = self._require_active_session(session.session_id)
+        if active.state.phase is not SessionPhase.STOPPING:
+            _transition(active, SessionPhase.STOPPING)
+        if active.stop_reason is None:
+            active.stop_reason = request.reason
+        if not active.teardown_marked:
+            active.trace.record(
+                "teardown_requested",
+                source="controller",
+                data={
+                    "outcome": request.outcome.value,
+                    "reason": request.reason.value,
+                },
+            )
+            active.teardown_marked = True
+        if active.teardown is None:  # pragma: no cover - construction invariant
+            raise RuntimeError("teardown coordinator is not configured")
+        return active.teardown
+
+    async def request_teardown(
+        self,
+        session_id: str,
+        *,
+        outcome: SessionOutcome,
+        reason: StopReason,
+        error: str | None = None,
+    ) -> TeardownReport:
+        """Run the exact-session teardown once; the first terminal request wins."""
+
+        request = TeardownRequest(outcome=outcome, error=error, reason=reason)
+        async with self._lock:
+            session = self._require_active_session(session_id)
+            coordinator = self._begin_teardown_locked(session, request)
+        return await coordinator.run(request)
+
     async def interruption_traces(self, session_id: str) -> tuple[InterruptionTrace, ...]:
         """Return an isolated snapshot for the active or most recently closed session."""
 
@@ -464,6 +671,8 @@ class VoiceSessionController:
         raw_message: str,
     ) -> SessionClosedMessage | None:
         message = parse_loopback_message(raw_message, expected_session_id=session_id)
+        coordinator: TeardownCoordinator | None = None
+        request: TeardownRequest | None = None
 
         async with self._lock:
             active = self._active_session
@@ -505,18 +714,33 @@ class VoiceSessionController:
                 return None
 
             if isinstance(message, StopMessage):
-                active.stop_reason = message.reason
-                _transition(active, SessionPhase.STOPPING)
+                outcome = self._outcome_for_stop_reason(message.reason)
+                request = TeardownRequest(outcome=outcome, reason=message.reason)
+                coordinator = self._begin_teardown_locked(active, request)
+                self._teardown_tasks[session_id] = asyncio.create_task(
+                    coordinator.run(request),
+                    name=f"voice-teardown-{session_id}",
+                )
                 return None
 
             if isinstance(message, TeardownCompleteMessage):
-                if active.state.phase != SessionPhase.STOPPING:
-                    _transition(active, SessionPhase.STOPPING)
-                return await self._close_active_session_locked(
-                    active,
+                reason = active.stop_reason or StopReason.BUTTON
+                request = TeardownRequest(
+                    outcome=self._outcome_for_stop_reason(reason),
+                    reason=reason,
                 )
+                coordinator = self._begin_teardown_locked(active, request)
+                coordinator.acknowledge_browser_teardown()
 
-        raise RuntimeError("unreachable")
+        if coordinator is None or request is None:  # pragma: no cover - protocol exhaustiveness
+            raise RuntimeError("unreachable")
+
+        report = await coordinator.run(request)
+        return SessionClosedMessage(
+            type="session_closed",
+            session_id=session_id,
+            outcome=report.request.outcome,
+        )
 
     async def close_active_session(
         self,
@@ -524,81 +748,33 @@ class VoiceSessionController:
         outcome: SessionOutcome = SessionOutcome.CANCELLED,
         error: str | None = None,
     ) -> None:
-        """Stop and mark the current active session during service shutdown."""
+        """Converge service or tray shutdown on the shared teardown path."""
 
-        sideband: RealtimeSidebandClient | None = None
         async with self._lock:
             active = self._active_session
             if active is None:
                 return
-            sideband = self._sideband_clients.pop(active.session_id, None)
-            self._function_call_parsers.pop(active.session_id, None)
-            self._tool_loops.pop(active.session_id, None)
-            self._close_after_response.discard(active.session_id)
-            self._last_closed_interruption_traces = copy.deepcopy(
-                active.interruptions.traces
-            )
-            self._active_session = None
-            self._last_closed_session_id = active.session_id
-            self._outbound_messages.pop(active.session_id, None)
+            session_id = active.session_id
 
-            browser_handle = active.browser_handle
-            if browser_handle is not None:
-                with contextlib.suppress(Exception):
-                    browser_handle.close()
-
-            resolved = self._resolve_terminal_result(
-                active,
-                outcome=outcome,
-                error=error,
-            )
-            # Keep terminal outcome accessible after cleanup for shutdown completion.
-            self._terminal_results[active.session_id] = resolved
-
-        if sideband is not None:
-            await sideband.close()
-
-    async def _close_active_session_locked(
-        self,
-        session: _WakeSession,
-    ) -> SessionClosedMessage:
-        sideband = self._sideband_clients.pop(session.session_id, None)
-        _transition(session, SessionPhase.CLOSED)
-        outcome = self._resolve_session_outcome(session)
-        resolved = self._resolve_terminal_result(
-            session,
+        reason = (
+            StopReason.TRANSPORT_FAILURE
+            if outcome is SessionOutcome.FAILED
+            else StopReason.NATIVE_CANCEL
+        )
+        await self.request_teardown(
+            session_id,
             outcome=outcome,
-            error=None,
+            reason=reason,
+            error=error,
         )
 
-        self._last_closed_interruption_traces = copy.deepcopy(
-            session.interruptions.traces
-        )
-        self._active_session = None
-        self._last_closed_session_id = session.session_id
-        self._function_call_parsers.pop(session.session_id, None)
-        self._tool_loops.pop(session.session_id, None)
-        self._close_after_response.discard(session.session_id)
-        self._outbound_messages.pop(session.session_id, None)
-
-        if session.browser_handle is not None:
-            with contextlib.suppress(Exception):
-                session.browser_handle.close()
-        if sideband is not None:
-            await sideband.close()
-
-        return SessionClosedMessage(
-            type="session_closed",
-            session_id=session.session_id,
-            outcome=resolved.outcome,
-        )
-
-    def _resolve_session_outcome(self, session: _WakeSession) -> SessionOutcome:
-        if session.stop_reason is StopReason.TRANSPORT_FAILURE:
+    @staticmethod
+    def _outcome_for_stop_reason(reason: StopReason) -> SessionOutcome:
+        if reason is StopReason.TRANSPORT_FAILURE:
             return SessionOutcome.FAILED
-        if session.stop_reason is StopReason.TIMEOUT:
+        if reason is StopReason.TIMEOUT:
             return SessionOutcome.TIMED_OUT
-        if session.stop_reason is StopReason.NATIVE_CANCEL:
+        if reason is StopReason.NATIVE_CANCEL:
             return SessionOutcome.CANCELLED
         return SessionOutcome.COMPLETED
 

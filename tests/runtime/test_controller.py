@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -37,7 +38,7 @@ class FakeBrowserHandle(NoopBrowserHandle):
 class DeterministicLauncher:
     def __init__(self) -> None:
         self.launched_urls: list[str] = []
-        self.handles: list[FakeBrowserHandle] = []
+        self.handles: list[NoopBrowserHandle] = []
 
     def launch(self, loopback_url: str) -> BrowserHandle:
         self.launched_urls.append(loopback_url)
@@ -54,6 +55,22 @@ class FailingLauncher:
     def launch(self, loopback_url: str) -> BrowserHandle:
         self.calls += 1
         raise self.error
+
+
+class FailingCloseHandle(NoopBrowserHandle):
+    def close(self) -> None:
+        self.closed_calls += 1
+        raise RuntimeError("injected browser close failure")
+
+
+class FirstCloseFailsLauncher(DeterministicLauncher):
+    def launch(self, loopback_url: str) -> BrowserHandle:
+        self.launched_urls.append(loopback_url)
+        handle: FakeBrowserHandle | FailingCloseHandle = (
+            FailingCloseHandle() if not self.handles else FakeBrowserHandle()
+        )
+        self.handles.append(handle)
+        return handle
 
 
 class SequenceFactory:
@@ -573,3 +590,215 @@ async def test_action_state_queue_is_fifo_and_exact_session_scoped() -> None:
         await controller.publish_action_state(
             completed.model_copy(update={"session_id": "local-stale-02"})
         )
+
+
+@pytest.mark.asyncio
+async def test_server_teardown_requests_browser_stop_then_waits_for_ack() -> None:
+    launcher = DeterministicLauncher()
+    controller = VoiceSessionController(
+        launcher,
+        token_store=LaunchTokenStore(
+            token_factory=SequenceFactory(["token-server-stop"]),
+        ),
+        session_id_factory=SequenceFactory(["local-server-stop"]),
+        browser_ack_timeout_seconds=0.2,
+        teardown_step_timeout_seconds=0.2,
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id is not None
+
+    teardown_task = asyncio.create_task(
+        controller.request_teardown(
+            session_id,
+            outcome=SessionOutcome.FAILED,
+            reason=StopReason.TRANSPORT_FAILURE,
+            error="sideband connection failed",
+        )
+    )
+    outbound = await asyncio.wait_for(
+        controller.wait_for_outbound_message(session_id),
+        timeout=0.1,
+    )
+
+    assert outbound == StopMessage(
+        type="stop",
+        session_id=session_id,
+        reason=StopReason.TRANSPORT_FAILURE,
+    )
+    assert controller.status == "stopping"
+    assert not teardown_task.done()
+
+    closed = await controller.process_control_message(
+        session_id,
+        encode_loopback_message(
+            TeardownCompleteMessage(type="teardown_complete", session_id=session_id)
+        ),
+    )
+    report = await teardown_task
+    result = await controller.wait_for_terminal_result(session_id)
+
+    assert isinstance(closed, SessionClosedMessage)
+    assert report.request.outcome is SessionOutcome.FAILED
+    assert report.browser_acknowledged is True
+    assert result == TerminalSessionResult(
+        session_id=session_id,
+        outcome=SessionOutcome.FAILED,
+        error="sideband connection failed",
+    )
+    assert launcher.handles[0].closed_calls == 1
+    assert controller.status == "idle"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_teardown_uses_first_terminal_outcome_and_closes_once() -> None:
+    launcher = DeterministicLauncher()
+    controller = VoiceSessionController(
+        launcher,
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-duplicate-stop"])),
+        session_id_factory=SequenceFactory(["local-duplicate-stop"]),
+        browser_ack_timeout_seconds=0.2,
+        teardown_step_timeout_seconds=0.2,
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id is not None
+
+    first = asyncio.create_task(
+        controller.request_teardown(
+            session_id,
+            outcome=SessionOutcome.TIMED_OUT,
+            reason=StopReason.TIMEOUT,
+        )
+    )
+    outbound = await asyncio.wait_for(controller.wait_for_outbound_message(session_id), 0.1)
+    second = asyncio.create_task(
+        controller.request_teardown(
+            session_id,
+            outcome=SessionOutcome.CANCELLED,
+            reason=StopReason.NATIVE_CANCEL,
+        )
+    )
+    await controller.process_control_message(
+        session_id,
+        encode_loopback_message(
+            TeardownCompleteMessage(type="teardown_complete", session_id=session_id)
+        ),
+    )
+
+    first_report, second_report = await asyncio.gather(first, second)
+    result = await controller.wait_for_terminal_result(session_id)
+
+    assert isinstance(outbound, StopMessage)
+    assert first_report is second_report
+    assert first_report.request.outcome is SessionOutcome.TIMED_OUT
+    assert result.outcome is SessionOutcome.TIMED_OUT
+    assert launcher.handles[0].closed_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_missing_browser_ack_is_bounded_and_persists_final_trace_atomically(
+    tmp_path: Path,
+) -> None:
+    launcher = DeterministicLauncher()
+    controller = VoiceSessionController(
+        launcher,
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-no-ack"])),
+        session_id_factory=SequenceFactory(["local-no-browser-ack"]),
+        browser_ack_timeout_seconds=0.01,
+        teardown_step_timeout_seconds=0.2,
+        trace_directory=tmp_path,
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id is not None
+
+    report = await asyncio.wait_for(
+        controller.request_teardown(
+            session_id,
+            outcome=SessionOutcome.CANCELLED,
+            reason=StopReason.NATIVE_CANCEL,
+        ),
+        timeout=0.2,
+    )
+
+    assert [(failure.step, failure.kind) for failure in report.failures] == [
+        ("browser_ack", "timeout")
+    ]
+    assert launcher.handles[0].closed_calls == 1
+    assert controller.status == "idle"
+    trace_path = tmp_path / f"{session_id}.jsonl"
+    assert trace_path.is_file()
+    assert "teardown_requested" in trace_path.read_text(encoding="utf-8")
+    assert not list(tmp_path.glob(f".{trace_path.name}.*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_stopping_session_rejects_new_sideband_tool_work() -> None:
+    controller = VoiceSessionController(
+        DeterministicLauncher(),
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-reject-work"])),
+        session_id_factory=SequenceFactory(["local-reject-work"]),
+        browser_ack_timeout_seconds=0.01,
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id is not None
+
+    teardown = asyncio.create_task(
+        controller.request_teardown(
+            session_id,
+            outcome=SessionOutcome.CANCELLED,
+            reason=StopReason.NATIVE_CANCEL,
+        )
+    )
+    await asyncio.wait_for(controller.wait_for_outbound_message(session_id), 0.1)
+
+    with pytest.raises(StaleControlMessage, match="stopping"):
+        await controller.process_sideband_event(
+            session_id,
+            {"type": "response.function_call_arguments.done"},
+        )
+
+    await teardown
+
+
+@pytest.mark.asyncio
+async def test_browser_close_failure_still_returns_idle_and_rearms() -> None:
+    launcher = FirstCloseFailsLauncher()
+    controller = VoiceSessionController(
+        launcher,
+        token_store=LaunchTokenStore(
+            token_factory=SequenceFactory(["token-close-fails", "token-rearmed"])
+        ),
+        session_id_factory=SequenceFactory(["local-close-fails", "local-rearmed-02"]),
+        browser_ack_timeout_seconds=0.2,
+    )
+    first = await controller.activate("http://127.0.0.1:8765/voice")
+    assert first.session_id is not None
+
+    teardown = asyncio.create_task(
+        controller.request_teardown(
+            first.session_id,
+            outcome=SessionOutcome.CANCELLED,
+            reason=StopReason.NATIVE_CANCEL,
+        )
+    )
+    await controller.wait_for_outbound_message(first.session_id)
+    await controller.process_control_message(
+        first.session_id,
+        encode_loopback_message(
+            TeardownCompleteMessage(type="teardown_complete", session_id=first.session_id)
+        ),
+    )
+    report = await teardown
+
+    assert [(failure.step, failure.kind) for failure in report.failures] == [
+        ("close_browser", "error")
+    ]
+    assert controller.status == "idle"
+    second = await controller.activate("http://127.0.0.1:8765/voice")
+    assert second.status == "opened"
+    assert second.session_id == "local-rearmed-02"
+
+    await controller.close_active_session()
