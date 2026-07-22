@@ -319,6 +319,45 @@ async def test_cancelled_connect_does_not_report_terminal_failure() -> None:
     await client.close()
 
 
+async def test_close_during_connect_closes_late_socket_without_terminal_failure() -> None:
+    connect_started = asyncio.Event()
+    release_connect = asyncio.Event()
+    websocket = _FakeWebSocket(messages=deque())
+    failures: list[tuple[str, Exception]] = []
+
+    async def delayed_connector(_url: str, _headers: dict[str, str]) -> _FakeWebSocket:
+        connect_started.set()
+        await release_connect.wait()
+        return websocket
+
+    async def on_event(_event: SidebandEvent) -> None:
+        return None
+
+    async def on_failure(session_id: str, error: Exception) -> None:
+        failures.append((session_id, error))
+
+    client = RealtimeSidebandClient(
+        local_session_id="session-connect-close",
+        call_id="call_connect_close",
+        api_key="test-api-key",
+        on_event=on_event,
+        on_terminal_failure=on_failure,
+        websocket_connect=delayed_connector,
+    )
+    connect_task = asyncio.create_task(client.connect())
+    await connect_started.wait()
+    await client.close()
+    release_connect.set()
+
+    try:
+        with pytest.raises(RuntimeError, match="closed during connect"):
+            await connect_task
+        assert websocket.closed
+        assert not failures
+    finally:
+        await client.close()
+
+
 async def test_connect_failure_notifies_terminal_failure_once() -> None:
     failures: list[tuple[str, Exception]] = []
 

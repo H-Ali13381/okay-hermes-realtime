@@ -78,7 +78,7 @@ class RealtimeSidebandClient:
 
             headers = {"Authorization": f"Bearer {self._api_key}"}
             try:
-                self._websocket = await self._connect(
+                websocket = await self._connect(
                     build_sideband_url(self.call_id),
                     headers,
                 )
@@ -87,6 +87,13 @@ class RealtimeSidebandClient:
             except Exception as error:
                 await self._fail(error)
                 raise
+
+            if self._closed:
+                with contextlib.suppress(Exception):
+                    await websocket.close()
+                raise RuntimeError("sideband client closed during connect")
+
+            self._websocket = websocket
             self._reader_task = asyncio.create_task(self._run_reader())
 
     async def send_json(self, payload: JsonObject) -> None:
