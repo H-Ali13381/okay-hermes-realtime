@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
 [project]
 name = "openai-realtime-action-spike"
 version = "0.1.0"
@@ -13,6 +17,10 @@ dependencies = [
   "websockets>=15,<16",
 ]
 
+[project.scripts]
+okay-hermes-realtime-controller = "realtime_action_spike.service:main"
+okay-hermes-realtime-activation = "realtime_action_spike.activation_handler:main"
+
 [dependency-groups]
 dev = [
   "pytest>=8.4,<9",
@@ -21,7 +29,11 @@ dev = [
 ]
 
 [tool.uv]
-package = false
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/realtime_action_spike"]
+include = ["src/realtime_action_spike/web/**"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
