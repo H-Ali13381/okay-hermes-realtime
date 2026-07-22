@@ -11,6 +11,16 @@ const executionList = document.getElementById("execution-list");
 const executionCount = document.getElementById("execution-count");
 const eventList = document.getElementById("event-list");
 const remoteAudio = document.getElementById("remote-audio");
+const launchMode = document.getElementById("launch-mode");
+
+const initialUrl = new URL(window.location.href);
+const searchParams = new URLSearchParams(window.location.search);
+let activationToken = searchParams.get("activation");
+const localSessionId = window.__LOCAL_SESSION_ID__ || null;
+if (activationToken) {
+  initialUrl.searchParams.delete("activation");
+  history.replaceState(null, "", `${initialUrl.pathname}${initialUrl.search}${initialUrl.hash}`);
+}
 
 let peerConnection = null;
 let dataChannel = null;
@@ -20,15 +30,89 @@ let receivedExecutionCount = 0;
 let disconnectAfterResponse = false;
 let transportFailureTimer = null;
 let isStopping = false;
+let controllerSocket = null;
+let controllerSessionClosed = false;
+let teardownSent = false;
 const handledCallIds = new Set();
 const transcriptTurns = new Map();
 
+function sendControlMessage(message) {
+  if (
+    !controllerSocket ||
+    controllerSocket.readyState !== WebSocket.OPEN ||
+    !localSessionId ||
+    controllerSessionClosed
+  ) {
+    return false;
+  }
+  controllerSocket.send(JSON.stringify({ ...message, session_id: localSessionId }));
+  return true;
+}
+
+function controlTimingData(name, data) {
+  if (name === "peer_connection_state" || name === "data_channel_state") {
+    return { state: data.state };
+  }
+  if (name === "webrtc_transport_failure") {
+    return { state: data.state };
+  }
+  return {};
+}
+
 function recordTiming(name, data = {}) {
+  const atMs = Number(performance.now().toFixed(2));
   appendEvent({
     type: "timing",
     name,
-    at_ms: Number(performance.now().toFixed(2)),
+    at_ms: atMs,
     detail: data,
+  });
+  const protocolName = name === "webrtc_transport_failure" ? "transport_failure" : name;
+  sendControlMessage({
+    type: "timing",
+    name: protocolName,
+    monotonic_ms: atMs,
+    data: controlTimingData(name, data),
+  });
+}
+
+function openControllerSocket() {
+  if (!activationToken || !localSessionId) return;
+
+  launchMode.textContent = "Wake activation mode · connecting controller";
+  startButton.disabled = true;
+  const websocketScheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const controllerUrl = `${websocketScheme}//${window.location.host}` +
+    "/control?activation=" + encodeURIComponent(activationToken);
+  const socket = new WebSocket(controllerUrl);
+  controllerSocket = socket;
+
+  socket.addEventListener("open", () => {
+    if (controllerSocket !== socket) return;
+    activationToken = null;
+    launchMode.textContent = "Wake activation mode · controller connected";
+    sendControlMessage({ type: "page_ready" });
+    void startConversation();
+  });
+  socket.addEventListener("message", (message) => {
+    if (controllerSocket !== socket) return;
+    try {
+      const event = JSON.parse(message.data);
+      if (event.type === "session_closed") {
+        controllerSessionClosed = true;
+        socket.close();
+      }
+    } catch (_error) {
+      failConversation("Controller returned an invalid message");
+    }
+  });
+  socket.addEventListener("error", () => {
+    if (controllerSocket === socket && !controllerSessionClosed) {
+      failConversation("Could not connect to the local voice controller");
+    }
+  });
+  socket.addEventListener("close", () => {
+    if (controllerSocket === socket) controllerSocket = null;
   });
 }
 
@@ -61,7 +145,7 @@ function clearTransportFailureTimer() {
 function failConversation(message) {
   if (isStopping) return;
   showError(message);
-  stopConversation({ preserveError: true });
+  stopConversation({ preserveError: true, reason: "transport_failure" });
 }
 
 function scheduleTransportFailure(pc) {
@@ -493,16 +577,20 @@ async function startConversation() {
     recordTiming("sdp_answer_applied", {
       type: "answer",
     });
+    sendControlMessage({ type: "page_started" });
     stopButton.disabled = false;
   } catch (error) {
     showError(error.message || String(error));
-    stopConversation({ preserveError: true });
+    stopConversation({ preserveError: true, reason: "transport_failure" });
   }
 }
 
 function stopConversation(options = {}) {
   if (isStopping) return;
   isStopping = true;
+  if (!teardownSent) {
+    sendControlMessage({ type: "stop", reason: options.reason || "button" });
+  }
   clearTransportFailureTimer();
   if (localStream) {
     for (const track of localStream.getTracks()) track.stop();
@@ -528,9 +616,13 @@ function stopConversation(options = {}) {
     clearError();
     setStatus("idle", "Not connected");
   }
+  if (!teardownSent) {
+    teardownSent = sendControlMessage({ type: "teardown_complete" });
+  }
   isStopping = false;
 }
 
 startButton.addEventListener("click", startConversation);
-stopButton.addEventListener("click", () => stopConversation());
-window.addEventListener("beforeunload", () => stopConversation());
+stopButton.addEventListener("click", () => stopConversation({ reason: "button" }));
+window.addEventListener("beforeunload", () => stopConversation({ reason: "native_cancel" }));
+openControllerSocket();

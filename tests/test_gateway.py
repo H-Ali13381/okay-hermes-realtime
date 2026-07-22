@@ -6,12 +6,24 @@ from collections.abc import Mapping
 from typing import Any
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 import realtime_action_spike.gateway as gateway_module
 from realtime_action_spike.capabilities import CapabilityBroker
 from realtime_action_spike.config import Settings, build_realtime_session
 from realtime_action_spike.gateway import OPENAI_REALTIME_CALLS_URL, create_app
+from realtime_action_spike.runtime.controller import VoiceSessionController
+from realtime_action_spike.runtime.protocol import (
+    PageReadyMessage,
+    PageStartedMessage,
+    StopMessage,
+    StopReason,
+    TeardownCompleteMessage,
+    encode_loopback_message,
+)
+from realtime_action_spike.runtime.tokens import LaunchTokenStore
 
 
 class StubUpstreamClient:
@@ -38,6 +50,14 @@ class OutOfOrderUpstreamClient:
             self.first_started.set()
             await self.release_first.wait()
         return httpx.Response(201, text=f"v=0\r\nanswer-{call_number}")
+
+
+class CapturingLauncher:
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    def launch(self, loopback_url: str) -> None:
+        self.urls.append(loopback_url)
 
 
 class CountingBroker(CapabilityBroker):
@@ -134,6 +154,7 @@ def test_health_reports_model_and_missing_key_without_secret_material() -> None:
             "voice_end_session",
             "agent_delegate_task",
         ],
+        "controller_status": "idle",
     }
 
 
@@ -529,3 +550,90 @@ def test_same_origin_requests_require_no_cross_origin_cors_headers() -> None:
 
     assert "access-control-allow-origin" not in same_origin.headers
     assert "access-control-allow-origin" not in cross_origin.headers
+
+
+def _activated_controller() -> tuple[VoiceSessionController, str, str]:
+    launcher = CapturingLauncher()
+    controller = VoiceSessionController(
+        launcher,
+        token_store=LaunchTokenStore(token_factory=iter(["launch-token-01"]).__next__),
+        session_id_factory=iter(["local-session-01"]).__next__,
+    )
+    result = asyncio.run(controller.activate("http://127.0.0.1:8765/voice"))
+    assert result.session_id == "local-session-01"
+    assert result.token == "launch-token-01"
+    return controller, result.session_id, result.token
+
+
+def test_voice_activation_token_is_validated_without_consuming() -> None:
+    controller, session_id, token = _activated_controller()
+    client = TestClient(create_app(settings(), controller=controller))
+
+    manual = client.get("/voice")
+    valid = client.get("/voice", params={"activation": token})
+    invalid = client.get("/voice", params={"activation": "wrong-token"})
+
+    assert manual.status_code == 200
+    assert "__LOCAL_SESSION_ID__" not in manual.text
+    assert valid.status_code == 200
+    assert f'window.__LOCAL_SESSION_ID__ = "{session_id}"' in valid.text
+    assert invalid.status_code == 403
+    assert controller.validate_activation_token(token) == session_id
+
+
+def test_control_websocket_consumes_token_and_closes_session() -> None:
+    controller, session_id, token = _activated_controller()
+    client = TestClient(create_app(settings(), controller=controller))
+
+    with client.websocket_connect(f"/control?activation={token}") as websocket:
+        websocket.send_text(
+            encode_loopback_message(PageReadyMessage(type="page_ready", session_id=session_id))
+        )
+        websocket.send_text(
+            encode_loopback_message(PageStartedMessage(type="page_started", session_id=session_id))
+        )
+        websocket.send_text(
+            encode_loopback_message(
+                StopMessage(type="stop", session_id=session_id, reason=StopReason.BUTTON)
+            )
+        )
+        websocket.send_text(
+            encode_loopback_message(
+                TeardownCompleteMessage(type="teardown_complete", session_id=session_id)
+            )
+        )
+        closed = websocket.receive_json()
+
+    assert closed == {
+        "type": "session_closed",
+        "session_id": session_id,
+        "outcome": "completed",
+    }
+    assert controller.status == "idle"
+
+    with (
+        client.websocket_connect(f"/control?activation={token}") as replay,
+        pytest.raises(WebSocketDisconnect) as raised,
+    ):
+        replay.receive_text()
+    assert raised.value.code == 4403
+
+
+def test_internal_open_is_loopback_only_and_response_is_sanitized() -> None:
+    launcher = CapturingLauncher()
+    controller = VoiceSessionController(
+        launcher,
+        token_store=LaunchTokenStore(token_factory=iter(["launch-token-private"]).__next__),
+        session_id_factory=iter(["local-session-private"]).__next__,
+    )
+    app = create_app(settings(), controller=controller)
+
+    local = TestClient(app).post("/internal/open")
+    remote = TestClient(app, client=("evil.example", 50000)).post("/internal/open")
+
+    assert local.status_code == 200
+    assert local.json() == {"status": "opened"}
+    assert "token" not in local.text
+    assert "session" not in local.text
+    assert remote.status_code == 403
+    assert launcher.urls and "activation=launch-token-private" in launcher.urls[0]

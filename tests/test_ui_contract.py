@@ -65,6 +65,7 @@ def test_page_retains_dom_controls_and_panels() -> None:
     assert 'id="remote-audio"' in html
     assert 'Start conversation' in html
     assert 'Stop' in html
+    assert 'id="launch-mode"' in html
 
 
 def test_assets_are_split_files() -> None:
@@ -138,3 +139,34 @@ def test_ui_contract_keeps_cleanup_guards() -> None:
     assert "remoteAudio.srcObject = null" in script
     assert "beforeunload" in script
     assert "appendEvent({" in script
+
+
+def test_activation_mode_uses_same_origin_control_websocket_and_auto_start() -> None:
+    script = _read(JS_PATH)
+    html = _read(INDEX_PATH)
+
+    assert "new URLSearchParams(window.location.search)" in script
+    assert 'searchParams.get("activation")' in script
+    assert "history.replaceState" in script
+    assert "new WebSocket" in script
+    assert '"/control?activation="' in script
+    assert 'type: "page_ready"' in script
+    assert 'type: "page_started"' in script
+    assert "startConversation()" in script
+    assert 'type: "stop"' in script
+    assert 'type: "teardown_complete"' in script
+    assert 'event.type === "session_closed"' in script
+    assert "Manual diagnostic mode" in html
+
+
+def test_controller_messages_never_include_raw_sdp_or_provider_credentials() -> None:
+    script = _read(JS_PATH)
+
+    assert "controllerSocket.send" in script
+    assert 'name === "webrtc_transport_failure" ? "transport_failure"' in script
+    control_sender = script.split("function sendControlMessage", maxsplit=1)[1].split(
+        "function recordTiming", maxsplit=1
+    )[0]
+    assert "sdp" not in control_sender.lower()
+    assert "api.openai.com" not in script
+    assert "Authorization" not in script

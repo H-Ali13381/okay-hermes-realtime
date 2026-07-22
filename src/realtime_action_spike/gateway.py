@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi import FastAPI, HTTPException, Request, WebSocket
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.websockets import WebSocketDisconnect
 
 from .capabilities import (
     CAPABILITIES,
@@ -21,6 +22,8 @@ from .capabilities import (
     UnknownCapabilityError,
 )
 from .config import Settings, build_realtime_session
+from .runtime.controller import StaleControlMessage, VoiceSessionController
+from .runtime.tokens import LaunchTokenStore
 
 OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
 OPENAI_REALTIME_SESSION_HEADER = "X-OpenAI-Realtime-Session-ID"
@@ -94,22 +97,57 @@ def create_app(
     *,
     upstream_client: AsyncPostClient | None = None,
     broker: CapabilityBroker | None = None,
+    controller: VoiceSessionController | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     broker = broker or CapabilityBroker()
-    active_session_id: str | None = None
-    latest_session_attempt = 0
-    execution_results_by_call_id: dict[str, tuple[str, int, str]] = {}
     web_root = Path(__file__).resolve().parent / "web"
     index_html = web_root / "index.html"
     voice_css = web_root / "voice.css"
     voice_js = web_root / "voice.js"
 
+    class _DiagnosticLauncher:
+        def launch(self, loopback_url: str) -> None:
+            return None
+
+    _controller = (
+        controller
+        if controller is not None
+        else VoiceSessionController(
+            launcher=_DiagnosticLauncher(),
+            token_store=LaunchTokenStore(),
+        )
+    )
+
+    active_session_id: str | None = None
+    latest_session_attempt = 0
+    execution_results_by_call_id: dict[str, tuple[str, int, str]] = {}
+
+    def _is_loopback_client(request: Request) -> bool:
+        if request.client is None:
+            return False
+        return request.client.host in {"127.0.0.1", "::1", "localhost", "testclient"}
+
+    def _render_voice_page(session_id: str | None = None) -> HTMLResponse:
+        if session_id is None:
+            return HTMLResponse(content=index_html.read_text(encoding="utf-8"))
+
+        html = index_html.read_text(encoding="utf-8")
+        marker = f"<script>window.__LOCAL_SESSION_ID__ = {json.dumps(session_id)};</script>\n"
+        return HTMLResponse(content=html.replace("</head>", marker + "</head>", 1))
+
     app = FastAPI(title="OpenAI Realtime Action Spike Gateway", version="0.1.0")
 
     @app.get("/voice", include_in_schema=False)
-    async def voice_page() -> FileResponse:
-        return FileResponse(index_html)
+    async def voice_page(activation: str | None = None) -> HTMLResponse:
+        if activation is None:
+            return _render_voice_page()
+
+        session_id = _controller.validate_activation_token(activation)
+        if session_id is None:
+            raise HTTPException(status_code=403, detail="Invalid or expired activation token")
+
+        return _render_voice_page(session_id=session_id)
 
     @app.get("/assets/{asset_name}", include_in_schema=False)
     async def voice_asset(asset_name: str) -> Response:
@@ -119,6 +157,44 @@ def create_app(
             return FileResponse(voice_js, media_type="text/javascript")
         return Response(status_code=404)
 
+    @app.post("/internal/open")
+    async def open_internal(request: Request) -> dict[str, str]:
+        if not _is_loopback_client(request):
+            raise HTTPException(status_code=403, detail="Only local clients can open voice pages")
+
+        result = await _controller.activate(str(request.url_for("voice_page")))
+        return {"status": result.status}
+
+    @app.websocket("/control")
+    async def control(websocket: WebSocket, activation: str | None = None) -> None:
+        await websocket.accept()
+
+        if activation is None:
+            await websocket.close(code=4403)
+            return
+
+        session_id = await _controller.consume_activation_token(activation)
+        if session_id is None:
+            await websocket.close(code=4403)
+            return
+
+        while True:
+            try:
+                raw_message = await websocket.receive_text()
+            except WebSocketDisconnect:
+                return
+
+            try:
+                closed = await _controller.process_control_message(session_id, raw_message)
+            except (StaleControlMessage, ValueError):
+                await websocket.close(code=4403)
+                return
+
+            if closed is not None:
+                await websocket.send_text(closed.model_dump_json())
+                await websocket.close()
+                return
+
     @app.get("/health")
     async def health() -> dict[str, Any]:
         return {
@@ -126,6 +202,7 @@ def create_app(
             "api_key_configured": settings.api_key_value() is not None,
             "model": settings.realtime_model,
             "capabilities": [capability.name for capability in CAPABILITIES],
+            "controller_status": _controller.status,
         }
 
     @app.post("/session")

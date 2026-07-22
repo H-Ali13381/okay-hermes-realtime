@@ -65,6 +65,19 @@ def test_closed_and_failed_states_cannot_resurrect() -> None:
             failed_state.transition_to(next_phase)
 
 
+@pytest.mark.parametrize("phase", [SessionPhase.LAUNCHING, SessionPhase.CONNECTING])
+def test_stop_is_legal_before_session_reaches_live(phase: SessionPhase) -> None:
+    state = SessionState(session_id="session-early-stop")
+    state.transition_to(SessionPhase.LAUNCHING)
+    if phase is SessionPhase.CONNECTING:
+        state.transition_to(SessionPhase.CONNECTING)
+
+    state.transition_to(SessionPhase.STOPPING)
+    state.transition_to(SessionPhase.CLOSED)
+
+    assert state.phase is SessionPhase.CLOSED
+
+
 def test_repeated_stop_is_idempotent() -> None:
     state = SessionState(session_id="session-stop")
     state.transition_to(SessionPhase.LAUNCHING)

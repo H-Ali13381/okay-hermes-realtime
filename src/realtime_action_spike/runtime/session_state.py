@@ -35,8 +35,16 @@ class SessionState:
 
     _TRANSITIONS: ClassVar[dict[SessionPhase, set[SessionPhase]]] = {
         SessionPhase.IDLE: {SessionPhase.LAUNCHING},
-        SessionPhase.LAUNCHING: {SessionPhase.CONNECTING, SessionPhase.FAILED},
-        SessionPhase.CONNECTING: {SessionPhase.LIVE, SessionPhase.FAILED},
+        SessionPhase.LAUNCHING: {
+            SessionPhase.CONNECTING,
+            SessionPhase.STOPPING,
+            SessionPhase.FAILED,
+        },
+        SessionPhase.CONNECTING: {
+            SessionPhase.LIVE,
+            SessionPhase.STOPPING,
+            SessionPhase.FAILED,
+        },
         SessionPhase.LIVE: {SessionPhase.STOPPING, SessionPhase.FAILED},
         SessionPhase.STOPPING: {SessionPhase.STOPPING, SessionPhase.CLOSED, SessionPhase.FAILED},
         SessionPhase.CLOSED: set(),
