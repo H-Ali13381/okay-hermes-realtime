@@ -28,7 +28,7 @@ from .openai.calls import (
 )
 from .runtime.browser import NoopBrowserHandle
 from .runtime.controller import StaleControlMessage, VoiceSessionController
-from .runtime.protocol import SessionOutcome, StopReason
+from .runtime.protocol import SessionOutcome, StopMessage, StopReason
 from .runtime.tokens import LaunchTokenStore
 
 OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
@@ -109,6 +109,7 @@ async def _relay_control_websocket(
 ) -> None:
     receive_task = asyncio.create_task(websocket.receive_text())
     outbound_task = asyncio.create_task(controller.wait_for_outbound_message(session_id))
+    server_stop_sent = False
     try:
         while True:
             done, _pending = await asyncio.wait(
@@ -136,6 +137,24 @@ async def _relay_control_websocket(
                     return
 
                 if closed is not None:
+                    deadline = asyncio.get_running_loop().time() + 0.1
+                    while not server_stop_sent:
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            break
+                        try:
+                            outbound = await asyncio.wait_for(
+                                asyncio.shield(outbound_task),
+                                timeout=remaining,
+                            )
+                        except (TimeoutError, StaleControlMessage):
+                            break
+                        await websocket.send_text(outbound.model_dump_json())
+                        server_stop_sent = isinstance(outbound, StopMessage)
+                        if not server_stop_sent:
+                            outbound_task = asyncio.create_task(
+                                controller.wait_for_outbound_message(session_id)
+                            )
                     await websocket.send_text(closed.model_dump_json())
                     await websocket.close()
                     return
@@ -147,6 +166,7 @@ async def _relay_control_websocket(
                 except StaleControlMessage:
                     return
                 await websocket.send_text(outbound.model_dump_json())
+                server_stop_sent = server_stop_sent or isinstance(outbound, StopMessage)
                 outbound_task = asyncio.create_task(
                     controller.wait_for_outbound_message(session_id)
                 )
