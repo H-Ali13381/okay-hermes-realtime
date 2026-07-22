@@ -162,4 +162,3 @@ def test_parse_realtime_call_handle_rejects_malformed_call_id() -> None:
 
     assert "call#id" not in str(exc_info.value)
     assert "SECRET-API-KEY" not in str(exc_info.value)
-

@@ -74,4 +74,3 @@ def test_session_and_token_are_distinct_and_reproducible() -> None:
     token = store.issue("local-session-xyz")
 
     assert token != "local-session-xyz"
-
