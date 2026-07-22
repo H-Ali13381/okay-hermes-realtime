@@ -20,6 +20,7 @@ from realtime_action_spike.runtime.browser import NoopBrowserHandle
 from realtime_action_spike.runtime.controller import VoiceSessionController
 from realtime_action_spike.runtime.protocol import (
     ActionStateMessage,
+    LoopbackMessage,
     PageReadyMessage,
     PageStartedMessage,
     StopMessage,
@@ -107,11 +108,11 @@ class SidebandStartController:
 
 
 class OutboundController:
-    def __init__(self, message: ActionStateMessage) -> None:
+    def __init__(self, message: LoopbackMessage) -> None:
         self.message = message
         self.delivered = False
 
-    async def wait_for_outbound_message(self, _session_id: str) -> ActionStateMessage:
+    async def wait_for_outbound_message(self, _session_id: str) -> LoopbackMessage:
         if not self.delivered:
             self.delivered = True
             return self.message
@@ -481,8 +482,14 @@ def test_control_websocket_consumes_token_and_closes_session() -> None:
                 TeardownCompleteMessage(type="teardown_complete", session_id=session_id)
             )
         )
+        server_stop = websocket.receive_json()
         closed = websocket.receive_json()
 
+    assert server_stop == {
+        "type": "stop",
+        "session_id": session_id,
+        "reason": "button",
+    }
     assert closed == {
         "type": "session_closed",
         "session_id": session_id,
@@ -520,6 +527,33 @@ async def test_control_relay_delivers_action_state_without_browser_traffic() -> 
     try:
         await asyncio.wait_for(websocket.message_sent.wait(), timeout=1.0)
         assert websocket.sent == [action.model_dump_json()]
+    finally:
+        relay.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await relay
+
+
+@pytest.mark.asyncio
+async def test_control_relay_delivers_server_stop_without_blocking_receive() -> None:
+    stop = StopMessage(
+        type="stop",
+        session_id="local-relay-stop-01",
+        reason=StopReason.NATIVE_CANCEL,
+    )
+    controller = OutboundController(stop)
+    websocket = BlockingControlWebSocket()
+
+    relay = asyncio.create_task(
+        _relay_control_websocket(
+            websocket,  # type: ignore[arg-type]
+            controller,  # type: ignore[arg-type]
+            "local-relay-stop-01",
+        )
+    )
+    try:
+        await asyncio.wait_for(websocket.message_sent.wait(), timeout=1.0)
+        assert websocket.sent == [stop.model_dump_json()]
+        assert not relay.done()
     finally:
         relay.cancel()
         with pytest.raises(asyncio.CancelledError):
