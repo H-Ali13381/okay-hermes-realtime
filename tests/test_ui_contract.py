@@ -51,7 +51,7 @@ def test_assets_routes_serve_voice_css_and_js() -> None:
     css = client.get("/assets/voice.css")
     js = client.get("/assets/voice.js")
     interruption_js = client.get("/assets/interruption_state.mjs")
-    startup_guard_js = client.get("/assets/startup_guard.mjs")
+    connection_lifecycle_js = client.get("/assets/connection_lifecycle.mjs")
 
     assert css.status_code == 200
     assert css.text
@@ -64,8 +64,8 @@ def test_assets_routes_serve_voice_css_and_js() -> None:
     assert interruption_js.headers["content-type"].startswith(
         ("text/javascript", "application/javascript")
     )
-    assert startup_guard_js.status_code == 200
-    assert startup_guard_js.headers["content-type"].startswith(
+    assert connection_lifecycle_js.status_code == 200
+    assert connection_lifecycle_js.headers["content-type"].startswith(
         ("text/javascript", "application/javascript")
     )
 

@@ -188,11 +188,13 @@ def create_app(
     broker = broker or CapabilityBroker()
     web_root = Path(__file__).resolve().parent / "web"
     index_html = web_root / "index.html"
-    voice_css = web_root / "voice.css"
-    voice_js = web_root / "voice.js"
     call_handle_registry = call_handle_registry or _InMemoryRealtimeCallHandleRegistry()
-    interruption_js = web_root / "interruption_state.mjs"
-    startup_guard_js = web_root / "startup_guard.mjs"
+    web_assets = {
+        "connection_lifecycle.mjs": "text/javascript",
+        "interruption_state.mjs": "text/javascript",
+        "voice.css": "text/css",
+        "voice.js": "text/javascript",
+    }
 
     class _DiagnosticLauncher:
         def launch(self, loopback_url: str) -> NoopBrowserHandle:
@@ -240,15 +242,10 @@ def create_app(
 
     @app.get("/assets/{asset_name}", include_in_schema=False)
     async def voice_asset(asset_name: str) -> Response:
-        if asset_name == "voice.css":
-            return FileResponse(voice_css, media_type="text/css")
-        if asset_name == "voice.js":
-            return FileResponse(voice_js, media_type="text/javascript")
-        if asset_name == "interruption_state.mjs":
-            return FileResponse(interruption_js, media_type="text/javascript")
-        if asset_name == "startup_guard.mjs":
-            return FileResponse(startup_guard_js, media_type="text/javascript")
-        return Response(status_code=404)
+        media_type = web_assets.get(asset_name)
+        if media_type is None:
+            return Response(status_code=404)
+        return FileResponse(web_root / asset_name, media_type=media_type)
 
     @app.post("/internal/open")
     async def open_internal(request: Request) -> dict[str, str]:

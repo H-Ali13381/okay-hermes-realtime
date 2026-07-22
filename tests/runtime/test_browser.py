@@ -108,7 +108,6 @@ def test_launch_builds_expected_command_and_process_options(
         brave_binary=str(binary),
         brave_profile=str(profile),
         loopback_base_url="http://127.0.0.1:8765/voice",
-        start_timeout_seconds=10.0,
         process_factory=factory,
     )
 
@@ -156,7 +155,6 @@ def test_launch_restores_vendor_wrapper_environment_for_direct_brave_binary(
         brave_binary=str(binary),
         brave_profile=str(tmp_path / "profile"),
         loopback_base_url="http://127.0.0.1:8765/voice",
-        start_timeout_seconds=10.0,
         process_factory=factory,
     )
 
@@ -178,7 +176,6 @@ def test_launch_rejects_non_loopback_voice_url_and_sanitizes_token_in_error(
         brave_binary=str(binary),
         brave_profile=str(tmp_path / "profile"),
         loopback_base_url="http://127.0.0.1:8765/voice",
-        start_timeout_seconds=10.0,
         process_factory=ProcessFactory(process=process),
     )
 
@@ -197,7 +194,6 @@ def test_launch_rejects_credentials_fragment_and_unexpected_queries(
         brave_binary=str(binary),
         brave_profile=str(tmp_path / "profile"),
         loopback_base_url="http://127.0.0.1:8765/voice",
-        start_timeout_seconds=10.0,
         process_factory=ProcessFactory(process=process),
     )
 
@@ -225,7 +221,6 @@ def test_launch_supports_absolute_binary_and_resolves_bare_commands(
         brave_binary=str(absolute_binary),
         brave_profile=str(tmp_path / "profile"),
         loopback_base_url="http://127.0.0.1:8765/voice",
-        start_timeout_seconds=10.0,
         process_factory=ProcessFactory(process=FakeProcess(pid=111)),
     )
     assert launcher._resolved_brave_binary == str(absolute_binary.resolve())
@@ -240,7 +235,6 @@ def test_launch_supports_absolute_binary_and_resolves_bare_commands(
         brave_binary="brave-origin-nightly",
         brave_profile=str(tmp_path / "profile2"),
         loopback_base_url="http://127.0.0.1:8765/voice",
-        start_timeout_seconds=10.0,
         process_factory=ProcessFactory(process=FakeProcess(pid=112)),
     )
     assert launcher._resolved_brave_binary == str(which_binary)
@@ -250,7 +244,6 @@ def test_launch_supports_absolute_binary_and_resolves_bare_commands(
             brave_binary="missing-command",
             brave_profile=str(tmp_path / "profile3"),
             loopback_base_url="http://127.0.0.1:8765/voice",
-            start_timeout_seconds=10.0,
             process_factory=ProcessFactory(process=FakeProcess(pid=113)),
         )
 
@@ -266,7 +259,6 @@ def test_launch_creates_dedicated_profile_directory_with_owner_only_permissions(
         brave_binary=str(binary),
         brave_profile=str(profile),
         loopback_base_url="http://127.0.0.1:8765/voice",
-        start_timeout_seconds=10.0,
         process_factory=ProcessFactory(process=process),
     )
     launcher.launch(launcher._build_loopback_url("token-1"))
@@ -284,7 +276,6 @@ def test_launch_raises_if_process_exits_immediately(tmp_path: Path) -> None:
         brave_binary=str(binary),
         brave_profile=str(tmp_path / "profile"),
         loopback_base_url="http://127.0.0.1:8765/voice",
-        start_timeout_seconds=10.0,
         process_factory=ProcessFactory(process=process),
     )
 

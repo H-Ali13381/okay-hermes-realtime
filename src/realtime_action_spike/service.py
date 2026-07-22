@@ -80,7 +80,6 @@ class RuntimeService:
                 brave_binary=settings.brave_bin,
                 brave_profile=settings.voice_browser_profile,
                 loopback_base_url=settings.voice_page_url,
-                start_timeout_seconds=settings.voice_browser_start_timeout_seconds,
             )
         ),
         controller_factory: (
@@ -128,6 +127,9 @@ class RuntimeService:
         if controller_factory is None:
             self._controller = VoiceSessionController(
                 launcher=self._launcher,
+                browser_start_timeout_seconds=(
+                    settings.voice_browser_start_timeout_seconds
+                ),
                 trace_directory=state_home / "okay-hermes-realtime" / "traces",
                 status_observer=self._publish_controller_status,
             )

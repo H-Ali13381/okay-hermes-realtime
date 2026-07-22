@@ -1,4 +1,4 @@
-import { canApplySessionAnswer } from "./startup_guard.mjs";
+import { applySessionAnswer } from "./connection_lifecycle.mjs";
 import {
   createInterruptionState,
   reduceInterruption,
@@ -715,10 +715,12 @@ async function startConversation() {
     openAIRealtimeSessionId = sessionId;
     interruptionState = createInterruptionState(sessionId);
     renderInterruptionDiagnostics();
-    const answerSdp = await sdpResponse.text();
-    if (!canApplySessionAnswer(peerConnection, pc)) return;
-    const answer = { type: "answer", sdp: answerSdp };
-    await pc.setRemoteDescription(answer);
+    const answerApplied = await applySessionAnswer({
+      activePeer: () => peerConnection,
+      expectedPeer: pc,
+      response: sdpResponse,
+    });
+    if (!answerApplied) return;
     recordTiming("sdp_answer_applied", {
       type: "answer",
     });
