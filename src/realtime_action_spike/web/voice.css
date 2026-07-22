@@ -460,6 +460,53 @@ pre {
   display: block;
 }
 
+.interruption-diagnostics {
+  margin: 0 15px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--muted);
+  background: #141619;
+  font-size: 11px;
+}
+
+.interruption-diagnostics summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  cursor: pointer;
+  list-style-position: inside;
+}
+
+.interruption-diagnostics summary span:first-child {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.timing-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  margin: 0;
+  border-top: 1px solid var(--line);
+  background: var(--line);
+}
+
+.timing-grid div {
+  padding: 9px 12px;
+  background: #141619;
+}
+
+.timing-grid dt {
+  color: var(--quiet);
+}
+
+.timing-grid dd {
+  margin: 3px 0 0;
+  color: var(--accent-strong);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
 @media (max-width: 850px) {
   html,
   body {

@@ -458,3 +458,59 @@ def test_expected_session_id_is_ignored_for_activation_messages() -> None:
     assert parsed.probability == activation_message["probability"]
     assert parsed.detected_at == activation_message["detected_at"]
     assert parsed.native_listener == activation_message["native_listener"]
+
+
+@pytest.mark.parametrize(
+    ("name", "data"),
+    [
+        (
+            TimingName.NEXT_RESPONSE_FIRST_AUDIO,
+            {"response_id": "resp-next", "interrupted_response_id": "resp-old"},
+        ),
+        (
+            TimingName.LISTENING_RESTORED,
+            {"response_id": "resp-next", "interrupted_response_id": "resp-old"},
+        ),
+    ],
+)
+def test_interruption_timing_markers_require_explicit_response_ids(
+    name: TimingName,
+    data: dict[str, str],
+) -> None:
+    parsed = parse_loopback_message(
+        {
+            "type": "timing",
+            "session_id": "local-session-01",
+            "name": name.value,
+            "monotonic_ms": 10.0,
+            "data": data,
+        }
+    )
+    assert isinstance(parsed, TimingMessage)
+    assert parsed.data == data
+
+    with pytest.raises(ValueError, match="response_id"):
+        parse_loopback_message(
+            {
+                "type": "timing",
+                "session_id": "local-session-01",
+                "name": name.value,
+                "monotonic_ms": 10.0,
+                "data": {},
+            }
+        )
+
+
+def test_playback_suppressed_accepts_scoped_response_id() -> None:
+    parsed = parse_loopback_message(
+        {
+            "type": "timing",
+            "session_id": "local-session-01",
+            "name": TimingName.PLAYBACK_SUPPRESSED.value,
+            "monotonic_ms": 10.0,
+            "data": {"suppressed": True, "response_id": "resp-current"},
+        }
+    )
+
+    assert isinstance(parsed, TimingMessage)
+    assert parsed.data["response_id"] == "resp-current"

@@ -1,3 +1,8 @@
+import {
+  createInterruptionState,
+  reduceInterruption,
+} from "./interruption_state.mjs";
+
 "use strict";
 
 const startButton = document.getElementById("start-button");
@@ -12,6 +17,11 @@ const executionCount = document.getElementById("execution-count");
 const eventList = document.getElementById("event-list");
 const remoteAudio = document.getElementById("remote-audio");
 const launchMode = document.getElementById("launch-mode");
+const interruptionStateText = document.getElementById("interruption-state");
+const speechSilenceMs = document.getElementById("speech-silence-ms");
+const responseCancelMs = document.getElementById("response-cancel-ms");
+const truncationMs = document.getElementById("truncation-ms");
+const listeningRestoredMs = document.getElementById("listening-restored-ms");
 
 const initialUrl = new URL(window.location.href);
 const searchParams = new URLSearchParams(window.location.search);
@@ -33,8 +43,10 @@ let isStopping = false;
 let controllerSocket = null;
 let controllerSessionClosed = false;
 let teardownSent = false;
+let interruptionState = null;
 const handledCallIds = new Set();
 const transcriptTurns = new Map();
+const responseIdByItemId = new Map();
 
 function sendControlMessage(message) {
   if (
@@ -55,6 +67,15 @@ function controlTimingData(name, data) {
   }
   if (name === "webrtc_transport_failure") {
     return { state: data.state };
+  }
+  if (name === "playback_suppressed") {
+    return { suppressed: true, response_id: data.responseId };
+  }
+  if (name === "next_response_first_audio" || name === "listening_restored") {
+    return {
+      response_id: data.responseId,
+      interrupted_response_id: data.interruptedResponseId,
+    };
   }
   return {};
 }
@@ -337,6 +358,176 @@ function sendRealtimeEvent(event, channel = dataChannel) {
   channel.send(JSON.stringify(event));
 }
 
+function interruptionContextIsCurrent(sessionContext) {
+  return Boolean(
+    interruptionState &&
+    interruptionState.localSessionId === sessionContext.sessionId &&
+    openAIRealtimeSessionId === sessionContext.sessionId &&
+    peerConnection === sessionContext.pc &&
+    dataChannel === sessionContext.dc
+  );
+}
+
+function reduceBrowserInterruption(type, fields, sessionContext) {
+  if (!interruptionContextIsCurrent(sessionContext)) return [];
+  const result = reduceInterruption(interruptionState, {
+    type,
+    localSessionId: sessionContext.sessionId,
+    atMs: Number(performance.now().toFixed(3)),
+    ...fields,
+  });
+  interruptionState = result.state;
+  renderInterruptionDiagnostics();
+  return result.effects;
+}
+
+function renderInterruptionDiagnostics() {
+  const trace = interruptionState?.interruption || null;
+  if (!trace) {
+    interruptionStateText.textContent = "No interruption measured";
+    speechSilenceMs.textContent = "—";
+    responseCancelMs.textContent = "—";
+    truncationMs.textContent = "—";
+    listeningRestoredMs.textContent = "—";
+    return;
+  }
+
+  if (trace.listeningRestoredMs !== null) {
+    interruptionStateText.textContent = "Playback restored";
+  } else if (trace.playbackSuppressedMs !== null) {
+    interruptionStateText.textContent = "Playback suppressed · waiting for next response";
+  } else {
+    interruptionStateText.textContent = "Speech detected · suppressing playback";
+  }
+  speechSilenceMs.textContent = formatTimingDelta(trace.speechToSilenceMs);
+  responseCancelMs.textContent = formatTimingDelta(
+    timingDelta(trace.speechStartedMs, trace.responseCancelledMs),
+  );
+  truncationMs.textContent = formatTimingDelta(
+    timingDelta(trace.speechStartedMs, trace.truncationObservedMs),
+  );
+  listeningRestoredMs.textContent = formatTimingDelta(
+    timingDelta(trace.speechStartedMs, trace.listeningRestoredMs),
+  );
+}
+
+function timingDelta(startMs, endMs) {
+  if (startMs === null || endMs === null || endMs < startMs) return null;
+  return Number((endMs - startMs).toFixed(2));
+}
+
+function formatTimingDelta(value) {
+  return value === null ? "—" : `${value.toFixed(2)} ms`;
+}
+
+function handleSpeechStarted(sessionContext) {
+  const effects = reduceBrowserInterruption("speech_started", {}, sessionContext);
+  for (const effect of effects) {
+    if (effect.type === "suppress_playback") {
+      suppressInterruptedPlayback(effect, sessionContext);
+    }
+  }
+}
+
+function suppressInterruptedPlayback(effect, sessionContext) {
+  if (
+    !interruptionContextIsCurrent(sessionContext) ||
+    interruptionState.suppressedResponseId !== effect.responseId
+  ) {
+    return;
+  }
+  remoteAudio.muted = true;
+  remoteAudio.pause();
+  reduceBrowserInterruption(
+    "playback_suppressed",
+    { responseId: effect.responseId },
+    sessionContext,
+  );
+  recordTiming("playback_suppressed", {
+    suppressed: true,
+    responseId: effect.responseId,
+  });
+}
+
+async function restorePlaybackForResponse(effect, sessionContext) {
+  if (
+    !interruptionContextIsCurrent(sessionContext) ||
+    interruptionState.restoreInFlightResponseId !== effect.responseId
+  ) {
+    return;
+  }
+  recordTiming("next_response_first_audio", {
+    responseId: effect.responseId,
+    interruptedResponseId: effect.interruptedResponseId,
+  });
+  remoteAudio.muted = false;
+  try {
+    await remoteAudio.play();
+  } catch (_error) {
+    remoteAudio.muted = true;
+    showError("Playback could not resume after interruption");
+    return;
+  }
+  if (!interruptionContextIsCurrent(sessionContext)) return;
+  reduceBrowserInterruption(
+    "listening_restored",
+    {
+      responseId: effect.responseId,
+      interruptedResponseId: effect.interruptedResponseId,
+    },
+    sessionContext,
+  );
+  recordTiming("listening_restored", {
+    responseId: effect.responseId,
+    interruptedResponseId: effect.interruptedResponseId,
+  });
+}
+
+function handleResponseCreated(event, sessionContext) {
+  const responseId = event.response?.id;
+  if (!responseId) return;
+  reduceBrowserInterruption(
+    "response_created",
+    { responseId },
+    sessionContext,
+  );
+}
+
+function handleResponseFirstAudio(event, sessionContext) {
+  const responseId = event.response_id;
+  if (!responseId) return;
+  const effects = reduceBrowserInterruption(
+    "response_first_audio",
+    { responseId },
+    sessionContext,
+  );
+  for (const effect of effects) {
+    if (effect.type === "restore_playback") {
+      void restorePlaybackForResponse(effect, sessionContext);
+    }
+  }
+}
+
+function handleResponseCancellation(event, sessionContext) {
+  const responseId = event.response?.id;
+  if (!responseId || event.response?.status !== "cancelled") return;
+  reduceBrowserInterruption(
+    "response_cancelled",
+    { responseId },
+    sessionContext,
+  );
+}
+
+function handleResponseTruncation(event, sessionContext) {
+  const responseId = event.response_id || responseIdByItemId.get(event.item_id);
+  if (!responseId) return;
+  reduceBrowserInterruption(
+    "response_truncated",
+    { responseId },
+    sessionContext,
+  );
+}
+
 async function executeFunctionCall(item, sessionContext) {
   const callId = item.call_id;
   if (!callId || handledCallIds.has(callId)) return;
@@ -426,13 +617,26 @@ async function handleRealtimeEvent(event, sessionContext) {
     updateTranscriptTurn("assistant", event.item_id, event.delta, { append: true });
   } else if (event.type === "response.output_audio_transcript.done") {
     updateTranscriptTurn("assistant", event.item_id, event.transcript);
+  } else if (event.type === "response.output_item.added") {
+    if (event.response_id && event.item?.id) {
+      responseIdByItemId.set(event.item.id, event.response_id);
+    }
   } else if (event.type === "input_audio_buffer.speech_started") {
+    handleSpeechStarted(sessionContext);
     setStatus("listening", "Listening");
   } else if (event.type === "input_audio_buffer.speech_stopped") {
     ensureTranscriptTurn("user", event.item_id);
     setStatus("thinking", "Thinking");
   } else if (event.type === "response.created") {
+    handleResponseCreated(event, sessionContext);
     setStatus("responding", "Responding");
+  } else if (
+    event.type === "response.output_audio.delta" ||
+    event.type === "response.output_audio.started"
+  ) {
+    handleResponseFirstAudio(event, sessionContext);
+  } else if (event.type === "conversation.item.truncated") {
+    handleResponseTruncation(event, sessionContext);
   } else if (event.type === "response.function_call_arguments.done") {
     await executeFunctionCall(
       {
@@ -445,6 +649,7 @@ async function handleRealtimeEvent(event, sessionContext) {
       sessionContext,
     );
   } else if (event.type === "response.done") {
+    handleResponseCancellation(event, sessionContext);
     const functionCalls = (event.response?.output || []).filter(
       (item) => item.type === "function_call"
     );
@@ -467,6 +672,8 @@ async function startConversation() {
   clearError();
   resetTranscript();
   openAIRealtimeSessionId = null;
+  interruptionState = null;
+  renderInterruptionDiagnostics();
   startButton.disabled = true;
   setStatus("connecting", "Requesting microphone");
 
@@ -571,6 +778,8 @@ async function startConversation() {
       throw new Error("Session gateway did not return an OpenAI Realtime session ID");
     }
     openAIRealtimeSessionId = sessionId;
+    interruptionState = createInterruptionState(sessionId);
+    renderInterruptionDiagnostics();
     const answerSdp = await sdpResponse.text();
     const answer = { type: "answer", sdp: answerSdp };
     await pc.setRemoteDescription(answer);
@@ -605,9 +814,13 @@ function stopConversation(options = {}) {
     peerConnection = null;
   }
   remoteAudio.pause();
+  remoteAudio.muted = false;
   remoteAudio.srcObject = null;
   openAIRealtimeSessionId = null;
+  interruptionState = null;
+  renderInterruptionDiagnostics();
   handledCallIds.clear();
+  responseIdByItemId.clear();
   disconnectAfterResponse = false;
   startButton.disabled = false;
   stopButton.disabled = true;

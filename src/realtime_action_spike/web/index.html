@@ -42,6 +42,18 @@
         </div>
         <div>
           <div id="error-banner" class="error-banner" data-visible="false" role="alert"></div>
+          <details id="interruption-diagnostics" class="interruption-diagnostics">
+            <summary>
+              <span>Interruption timing</span>
+              <span id="interruption-state">No interruption measured</span>
+            </summary>
+            <dl class="timing-grid">
+              <div><dt>Speech → silence</dt><dd id="speech-silence-ms">—</dd></div>
+              <div><dt>Cancel observed</dt><dd id="response-cancel-ms">—</dd></div>
+              <div><dt>Truncation</dt><dd id="truncation-ms">—</dd></div>
+              <div><dt>Listening restored</dt><dd id="listening-restored-ms">—</dd></div>
+            </dl>
+          </details>
           <div class="controls">
             <button id="start-button" class="button primary" type="button">Start conversation</button>
             <button id="stop-button" class="button" type="button" disabled>Stop</button>
@@ -85,6 +97,6 @@
 
   <audio id="remote-audio" autoplay playsinline></audio>
 
-  <script src="/assets/voice.js" defer></script>
+  <script type="module" src="/assets/voice.js"></script>
 </body>
 </html>

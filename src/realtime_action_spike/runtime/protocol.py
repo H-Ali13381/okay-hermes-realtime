@@ -12,6 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator,
 
 class TimingName(StrEnum):
     PLAYBACK_SUPPRESSED = "playback_suppressed"
+    NEXT_RESPONSE_FIRST_AUDIO = "next_response_first_audio"
+    LISTENING_RESTORED = "listening_restored"
     PEER_CONNECTION_STATE = "peer_connection_state"
     DATA_CHANNEL_STATE = "data_channel_state"
     SDP_OFFER_CREATED = "sdp_offer_created"
@@ -35,6 +37,7 @@ class SessionOutcome(StrEnum):
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,128}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_PROVIDER_RESPONSE_ID_RE = re.compile(r"^[A-Za-z0-9._~-]{1,256}$")
 _SECRET_KEY_NAMES = {
     "api_key",
     "authorization",
@@ -236,12 +239,31 @@ def _validate_timing_message_data(name: TimingName, data: dict[str, Any]) -> Non
     _scan_no_secrets(data)
 
     if name == TimingName.PLAYBACK_SUPPRESSED:
-        allowed = {"suppressed"}
+        allowed = {"suppressed", "response_id"}
         provided = set(data.keys())
         if unknown := provided - allowed:
             raise ValueError(f"unexpected timing data keys: {sorted(unknown)}")
         if "suppressed" in data and not isinstance(data["suppressed"], bool):
             raise ValueError("suppressed must be a bool")
+        if "response_id" in data:
+            _validate_provider_response_id(data["response_id"], "response_id")
+        return
+
+    if name in {
+        TimingName.NEXT_RESPONSE_FIRST_AUDIO,
+        TimingName.LISTENING_RESTORED,
+    }:
+        required = {"response_id", "interrupted_response_id"}
+        provided = set(data.keys())
+        if unknown := provided - required:
+            raise ValueError(f"unexpected timing data keys: {sorted(unknown)}")
+        if missing := required - provided:
+            raise ValueError(f"response_id fields are required: {sorted(missing)}")
+        _validate_provider_response_id(data["response_id"], "response_id")
+        _validate_provider_response_id(
+            data["interrupted_response_id"],
+            "interrupted_response_id",
+        )
         return
 
     if name == TimingName.PEER_CONNECTION_STATE:
@@ -305,6 +327,11 @@ def _validate_timing_message_data(name: TimingName, data: dict[str, Any]) -> Non
         return
 
     raise ValueError(f"unsupported timing name: {name}")
+
+
+def _validate_provider_response_id(value: Any, field_name: str) -> None:
+    if not isinstance(value, str) or not _PROVIDER_RESPONSE_ID_RE.fullmatch(value):
+        raise ValueError(f"{field_name} must be a bounded provider response identifier")
 
 
 def parse_loopback_message(

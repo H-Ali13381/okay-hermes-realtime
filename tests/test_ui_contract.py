@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INDEX_PATH = PROJECT_ROOT / "src/realtime_action_spike/web/index.html"
 CSS_PATH = PROJECT_ROOT / "src/realtime_action_spike/web/voice.css"
 JS_PATH = PROJECT_ROOT / "src/realtime_action_spike/web/voice.js"
+INTERRUPTION_JS_PATH = PROJECT_ROOT / "src/realtime_action_spike/web/interruption_state.mjs"
 
 
 def _read(path: Path) -> str:
@@ -36,6 +37,7 @@ def test_assets_routes_serve_voice_css_and_js() -> None:
 
     css = client.get("/assets/voice.css")
     js = client.get("/assets/voice.js")
+    interruption_js = client.get("/assets/interruption_state.mjs")
 
     assert css.status_code == 200
     assert css.text
@@ -44,6 +46,10 @@ def test_assets_routes_serve_voice_css_and_js() -> None:
     assert js.status_code == 200
     assert js.text
     assert js.headers["content-type"].startswith(("text/javascript", "application/javascript"))
+    assert interruption_js.status_code == 200
+    assert interruption_js.headers["content-type"].startswith(
+        ("text/javascript", "application/javascript")
+    )
 
 
 def test_page_loads_static_assets_via_relative_routes() -> None:
@@ -51,7 +57,7 @@ def test_page_loads_static_assets_via_relative_routes() -> None:
     html = response.text
 
     assert '<link rel="stylesheet" href="/assets/voice.css"' in html
-    assert '<script src="/assets/voice.js" defer></script>' in html
+    assert '<script type="module" src="/assets/voice.js"></script>' in html
 
 
 def test_page_retains_dom_controls_and_panels() -> None:
@@ -170,3 +176,35 @@ def test_controller_messages_never_include_raw_sdp_or_provider_credentials() -> 
     assert "sdp" not in control_sender.lower()
     assert "api.openai.com" not in script
     assert "Authorization" not in script
+
+
+def test_interruption_ui_uses_pure_reducer_and_explicit_response_guards() -> None:
+    script = _read(JS_PATH)
+    reducer = _read(INTERRUPTION_JS_PATH)
+    html = _read(INDEX_PATH)
+
+    assert 'from "./interruption_state.mjs"' in script
+    assert "function handleSpeechStarted" in script
+    assert "function suppressInterruptedPlayback" in script
+    assert "function restorePlaybackForResponse" in script
+    assert '"input_audio_buffer.speech_started"' in script
+    assert '"response.output_audio.delta"' in script
+    assert '"response.output_audio.started"' in script
+    assert '"playback_suppressed"' in script
+    assert '"next_response_first_audio"' in script
+    assert '"listening_restored"' in script
+    assert "responseId" in reducer
+    assert "localSessionId" in reducer
+    assert "pendingRestoreResponseId" in reducer
+
+    suppression = script.split("function suppressInterruptedPlayback", maxsplit=1)[1].split(
+        "function restorePlaybackForResponse", maxsplit=1
+    )[0]
+    assert "remoteAudio.pause()" in suppression
+    assert "remoteAudio.muted = true" in suppression
+    assert "track.stop()" not in suppression
+
+    assert 'id="interruption-diagnostics"' in html
+    assert 'id="interruption-state"' in html
+    assert 'id="speech-silence-ms"' in html
+    assert '<details id="interruption-diagnostics"' in html

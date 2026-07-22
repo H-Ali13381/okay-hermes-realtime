@@ -138,6 +138,7 @@ def create_app(
     voice_css = web_root / "voice.css"
     voice_js = web_root / "voice.js"
     call_handle_registry = call_handle_registry or _InMemoryRealtimeCallHandleRegistry()
+    interruption_js = web_root / "interruption_state.mjs"
 
     class _DiagnosticLauncher:
         def launch(self, loopback_url: str) -> NoopBrowserHandle:
@@ -189,6 +190,8 @@ def create_app(
             return FileResponse(voice_css, media_type="text/css")
         if asset_name == "voice.js":
             return FileResponse(voice_js, media_type="text/javascript")
+        if asset_name == "interruption_state.mjs":
+            return FileResponse(interruption_js, media_type="text/javascript")
         return Response(status_code=404)
 
     @app.post("/internal/open")
