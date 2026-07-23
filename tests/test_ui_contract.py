@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INDEX_PATH = PROJECT_ROOT / "src/realtime_action_spike/web/index.html"
 CSS_PATH = PROJECT_ROOT / "src/realtime_action_spike/web/voice.css"
 JS_PATH = PROJECT_ROOT / "src/realtime_action_spike/web/voice.js"
+SOURCE_JS_PATH = PROJECT_ROOT / "frontend/voice.js"
 
 
 def _read(path: Path) -> str:
@@ -248,6 +249,25 @@ def test_controller_messages_never_include_raw_sdp_or_provider_credentials() -> 
     assert "sdp" not in control_sender.lower()
     assert "clientSecret" not in control_sender
     assert "activationToken" not in control_sender
+
+
+def test_late_sdp_answer_is_ignored_after_peer_teardown() -> None:
+    script = _read(JS_PATH)
+    source_script = _read(SOURCE_JS_PATH)
+
+    assert 'from "./peer-lifecycle.js"' in source_script
+    answer_block = script.split(
+        'const answer = { type: "answer", sdp: await response.text() };',
+        maxsplit=1,
+    )[1].split('recordTiming("sdp_answer_applied")', maxsplit=1)[0]
+    assert "canApplyRemoteAnswer(peerConnection, pc)" in answer_block
+    assert "webrtc.late_sdp_answer_ignored" in answer_block
+    assert answer_block.index("canApplyRemoteAnswer") < answer_block.index(
+        "pc.setRemoteDescription(answer)"
+    )
+    assert answer_block.index("canApplyRemoteAnswer") < answer_block.index(
+        "executionScope = response.headers.get"
+    )
 
 
 def test_interruption_ui_observes_sdk_events_without_owning_playback() -> None:

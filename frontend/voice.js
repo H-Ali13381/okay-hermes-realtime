@@ -1,5 +1,7 @@
 "use strict";
 
+import { canApplyRemoteAnswer } from "./peer-lifecycle.js";
+
 const startButton = document.getElementById("start-button");
 const stopButton = document.getElementById("stop-button");
 const voiceCard = document.getElementById("voice-card");
@@ -705,11 +707,18 @@ async function startConversation() {
       }
       throw new Error(detail || `Session gateway returned ${response.status}`);
     }
+    const answer = { type: "answer", sdp: await response.text() };
+    if (!canApplyRemoteAnswer(peerConnection, pc)) {
+      appendEvent({
+        type: "webrtc.late_sdp_answer_ignored",
+        signaling_state: pc.signalingState,
+      });
+      return;
+    }
     executionScope = response.headers.get("X-Okay-Hermes-Execution-Scope");
     if (localSessionId && !executionScope) {
       throw new Error("Session gateway did not return a local execution scope");
     }
-    const answer = { type: "answer", sdp: await response.text() };
     await pc.setRemoteDescription(answer);
     recordTiming("sdp_answer_applied");
   } catch (error) {
