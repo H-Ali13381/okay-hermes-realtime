@@ -13,22 +13,16 @@ from realtime_action_spike.config import Settings, build_realtime_session
 from realtime_action_spike.gateway import (
     LOCAL_CLIENT_HEADER,
     LOCAL_CLIENT_HEADER_VALUE,
-    LOCAL_CONTROLLER_SESSION_HEADER,
     OPENAI_REALTIME_CALLS_URL,
-    OPENAI_REALTIME_CLIENT_SECRETS_URL,
     _relay_control_websocket,
     create_app,
 )
-from realtime_action_spike.openai.calls import RealtimeCallHandle
 from realtime_action_spike.runtime.browser import NoopBrowserHandle
 from realtime_action_spike.runtime.controller import VoiceSessionController
 from realtime_action_spike.runtime.protocol import (
-    ActionStateMessage,
     LoopbackMessage,
     PageReadyMessage,
     PageStartedMessage,
-    RealtimeConnectedMessage,
-    SessionOutcome,
     StopMessage,
     StopReason,
     TeardownCompleteMessage,
@@ -79,39 +73,9 @@ class CapturingLauncher:
         return handle
 
 
-class CallHandleRegistry:
-    def __init__(self) -> None:
-        self.calls: dict[str, RealtimeCallHandle] = {}
-
-    def get(self, local_session_id: str) -> RealtimeCallHandle | None:
-        return self.calls.get(local_session_id)
-
-    def set(self, local_session_id: str, handle: RealtimeCallHandle) -> None:
-        self.calls = {local_session_id: handle}
-
-    def clear(self) -> None:
-        self.calls.clear()
-
-
-class SidebandStartController:
+class ActiveSessionController:
     def __init__(self, active_session_id: str | None = None) -> None:
-        self.calls: list[dict[str, str]] = []
         self.active_session_id = active_session_id
-
-    async def start_realtime_sideband(
-        self,
-        *,
-        local_session_id: str,
-        call_id: str,
-        api_key: str,
-    ) -> None:
-        self.calls.append(
-            {
-                "local_session_id": local_session_id,
-                "call_id": call_id,
-                "api_key": api_key,
-            }
-        )
 
 
 class OutboundController:
@@ -299,104 +263,6 @@ def test_session_endpoint_requires_server_side_api_key() -> None:
     assert response.json()["detail"] == "OPENAI_API_KEY is not configured on the gateway"
 
 
-def test_client_secret_endpoint_mints_ephemeral_token_with_server_owned_session() -> None:
-    upstream = StubUpstreamClient(
-        httpx.Response(
-            200,
-            json={
-                "value": "ek_ephemeral_browser_token",
-                "expires_at": 1_796_000_000,
-                "session": {"type": "realtime"},
-            },
-        )
-    )
-    controller, session_id, _token = _activated_controller()
-    client = TestClient(create_app(settings(), upstream_client=upstream, controller=controller))
-
-    response = client.post(
-        "/client-secret",
-        headers={
-            LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE,
-            LOCAL_CONTROLLER_SESSION_HEADER: session_id,
-        },
-    )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload == {
-        "value": "ek_ephemeral_browser_token",
-        "expires_at": 1_796_000_000,
-        "session": build_realtime_session(settings()),
-    }
-    assert "test-secret-key" not in response.text
-    assert upstream.calls == [
-        {
-            "url": OPENAI_REALTIME_CLIENT_SECRETS_URL,
-            "headers": {
-                "Authorization": "Bearer test-secret-key",
-                "OpenAI-Safety-Identifier": upstream.calls[0]["headers"][
-                    "OpenAI-Safety-Identifier"
-                ],
-                "Content-Type": "application/json",
-            },
-            "json": {"session": build_realtime_session(settings())},
-        }
-    ]
-
-
-def test_client_secret_rejects_stale_controller_session() -> None:
-    controller, _session_id, _token = _activated_controller()
-    client = TestClient(create_app(settings(), controller=controller))
-
-    response = client.post(
-        "/client-secret",
-        headers={
-            LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE,
-            LOCAL_CONTROLLER_SESSION_HEADER: "local-session-stale",
-        },
-    )
-
-    assert response.status_code == 409
-    assert response.json() == {"detail": "Local voice session is no longer active"}
-
-
-def test_client_secret_rejects_requests_without_voice_client_header() -> None:
-    upstream = StubUpstreamClient(
-        httpx.Response(
-            200,
-            json={"value": "ek_test_ephemeral", "expires_at": 1_800_000_000},
-        )
-    )
-
-    response = TestClient(create_app(settings(), upstream_client=upstream)).post(
-        "/client-secret"
-    )
-
-    assert response.status_code == 403
-    assert upstream.calls == []
-
-
-def test_manual_client_secret_disables_tools_without_sideband() -> None:
-    upstream = StubUpstreamClient(
-        httpx.Response(
-            200,
-            json={"value": "ek_manual_ephemeral", "expires_at": 1_800_000_000},
-        )
-    )
-
-    response = TestClient(create_app(settings(), upstream_client=upstream)).post(
-        "/client-secret",
-        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
-    )
-
-    assert response.status_code == 200
-    session = response.json()["session"]
-    assert session["tools"] == []
-    assert session["tool_choice"] == "none"
-    assert "Manual diagnostic mode cannot execute tools" in session["instructions"]
-    assert upstream.calls[0]["json"] == {"session": session}
-
-
 def test_session_endpoint_rejects_wrong_media_type() -> None:
     client = TestClient(create_app(settings()))
 
@@ -416,10 +282,7 @@ def test_session_endpoint_relays_sdp_and_server_owned_configuration() -> None:
             },
         )
     )
-    registry = CallHandleRegistry()
-    client = TestClient(
-        create_app(settings(), upstream_client=upstream, call_handle_registry=registry)
-    )
+    client = TestClient(create_app(settings(), upstream_client=upstream))
 
     response = client.post(
         "/session",
@@ -436,12 +299,6 @@ def test_session_endpoint_relays_sdp_and_server_owned_configuration() -> None:
     assert response.text == "v=0\r\nmock-answer"
     assert len(upstream.calls) == 1
 
-    session_id = response.headers["x-openai-realtime-session-id"]
-    handle = registry.get(session_id)
-    assert handle is not None
-    assert handle.call_id == "call_endpoint"
-    assert handle.request_id == "req_realtime_test"
-    assert handle.sdp_answer == "v=0\r\nmock-answer"
 
     call = upstream.calls[0]
     assert call["url"] == OPENAI_REALTIME_CALLS_URL
@@ -452,51 +309,6 @@ def test_session_endpoint_relays_sdp_and_server_owned_configuration() -> None:
     assert json.loads(session_json)["model"] == "gpt-realtime-2.1-mini"
 
 
-def test_session_endpoint_starts_sideband_for_exact_controller_session() -> None:
-    upstream = StubUpstreamClient(
-        httpx.Response(
-            201,
-            text="v=0\r\nmock-answer",
-            headers={"Location": "/v1/realtime/calls/call_sideband"},
-        )
-    )
-    registry = CallHandleRegistry()
-    controller = SidebandStartController(active_session_id="local-session-1234")
-    client = TestClient(
-        create_app(
-            settings(),
-            upstream_client=upstream,
-            call_handle_registry=registry,
-            controller=controller,  # type: ignore[arg-type]
-        )
-    )
-
-    response = client.post(
-        "/session?local_session_id=local-session-1234",
-        content="v=0\r\nmock-offer",
-        headers={
-            LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE,
-            "Content-Type": "application/sdp",
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.headers["x-openai-realtime-session-id"] == "local-session-1234"
-    assert "location" not in response.headers
-    assert controller.calls == [
-        {
-            "local_session_id": "local-session-1234",
-            "call_id": "call_sideband",
-            "api_key": "test-secret-key",
-        }
-    ]
-    handle = registry.get("local-session-1234")
-    assert handle is not None
-    assert handle.call_id == "call_sideband"
-    assert "test-secret-key" not in response.text
-    assert "call_sideband" not in response.text
-
-
 def test_session_endpoint_rejects_stale_query_binding_before_upstream() -> None:
     upstream = StubUpstreamClient(
         httpx.Response(
@@ -505,7 +317,7 @@ def test_session_endpoint_rejects_stale_query_binding_before_upstream() -> None:
             headers={"Location": "/v1/realtime/calls/call_unused"},
         )
     )
-    controller = SidebandStartController(active_session_id="active-session-5678")
+    controller = ActiveSessionController(active_session_id="active-session-5678")
     client = TestClient(
         create_app(
             settings(),
@@ -525,43 +337,6 @@ def test_session_endpoint_rejects_stale_query_binding_before_upstream() -> None:
 
     assert response.status_code == 409
     assert upstream.calls == []
-
-
-def test_session_binding_rejects_malformed_location_without_clearing_existing_binding() -> None:
-    upstream = StubUpstreamClient(
-        httpx.Response(
-            201,
-            text="v=0\r\nmock-answer",
-            headers={"Location": "/v1/realtime/calls/call_current"},
-        )
-    )
-    registry = CallHandleRegistry()
-    client = TestClient(
-        create_app(settings(), upstream_client=upstream, call_handle_registry=registry)
-    )
-    session_id = start_openai_realtime_session(client, "first-offer")
-    bound_before = registry.get(session_id)
-    assert bound_before is not None
-    assert bound_before.call_id == "call_current"
-
-    upstream.response = httpx.Response(
-        201,
-        text="v=0\r\nmalformed-answer",
-        headers={},
-    )
-    second = client.post(
-        "/session",
-        content="v=0\r\nbad-offer",
-        headers={"Content-Type": "application/sdp"},
-    )
-    after_failure = registry.get(session_id)
-
-    assert second.status_code == 502
-    assert after_failure is not None
-    assert after_failure.call_id == "call_current"
-    assert second.json()["detail"] == "OpenAI Realtime session creation failed"
-    assert "call_current" not in second.text
-    assert "Location" not in second.text
 
 
 def test_upstream_failure_is_sanitized_and_preserves_request_id() -> None:
@@ -626,7 +401,7 @@ def test_bound_session_issues_scope_and_execute_replays_identical_call() -> None
             headers={"Location": "/v1/realtime/calls/call_direct_tools"},
         )
     )
-    controller = SidebandStartController(active_session_id="local-session-1234")
+    controller = ActiveSessionController(active_session_id="local-session-1234")
     client = TestClient(
         create_app(
             settings(),
@@ -672,7 +447,7 @@ def test_bound_session_issues_scope_and_execute_replays_identical_call() -> None
 
 
 def test_execute_rejects_missing_or_stale_scope() -> None:
-    controller = SidebandStartController(active_session_id="local-session-1234")
+    controller = ActiveSessionController(active_session_id="local-session-1234")
     client = TestClient(create_app(settings(), controller=controller))  # type: ignore[arg-type]
     request = {
         "scope": "stale-execution-scope",
@@ -789,34 +564,6 @@ def test_control_websocket_consumes_token_and_closes_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_control_relay_delivers_action_state_without_browser_traffic() -> None:
-    action = ActionStateMessage(
-        type="action_state",
-        session_id="local-session-01",
-        capability="assistant_get_current_time",
-        state="completed",
-        message="Current time retrieved",
-    )
-    controller = OutboundController(action)
-    websocket = BlockingControlWebSocket()
-    relay = asyncio.create_task(
-        _relay_control_websocket(
-            websocket,  # type: ignore[arg-type]
-            controller,  # type: ignore[arg-type]
-            "local-session-01",
-        )
-    )
-
-    try:
-        await asyncio.wait_for(websocket.message_sent.wait(), timeout=1.0)
-        assert websocket.sent == [action.model_dump_json()]
-    finally:
-        relay.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await relay
-
-
-@pytest.mark.asyncio
 async def test_control_relay_delivers_server_stop_without_blocking_receive() -> None:
     stop = StopMessage(
         type="stop",
@@ -844,52 +591,17 @@ async def test_control_relay_delivers_server_stop_without_blocking_receive() -> 
 
 
 @pytest.mark.asyncio
-async def test_control_relay_binds_sideband_before_processing_realtime_connected() -> None:
-    events: list[str] = []
-    controller = BindingOrderController(events)
-    message = RealtimeConnectedMessage(
-        type="realtime_connected",
-        session_id="local-binding-01",
-        provider_call_id="call_provider_01",
-    )
-    websocket = RealtimeBindingWebSocket(encode_loopback_message(message))
-
-    async def bind(local_session_id: str, provider_call_id: str) -> None:
-        assert local_session_id == "local-binding-01"
-        assert provider_call_id == "call_provider_01"
-        events.append("bound")
-
-    relay = asyncio.create_task(
-        _relay_control_websocket(
-            websocket,  # type: ignore[arg-type]
-            controller,  # type: ignore[arg-type]
-            "local-binding-01",
-            bind_realtime_call=bind,
-        )
-    )
-    try:
-        await asyncio.wait_for(controller.processed.wait(), timeout=1.0)
-        assert events == ["bound", "processed"]
-    finally:
-        relay.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await relay
-
-
-@pytest.mark.asyncio
 async def test_control_relay_treats_disconnect_during_send_as_terminal() -> None:
-    action = ActionStateMessage(
-        type="action_state",
+    stop = StopMessage(
+        type="stop",
         session_id="local-send-close-01",
-        capability="assistant_get_current_time",
-        state="completed",
-        message="Current time retrieved",
+        reason=StopReason.NATIVE_CANCEL,
     )
 
     await asyncio.wait_for(
         _relay_control_websocket(
             DisconnectingSendWebSocket(),  # type: ignore[arg-type]
-            OutboundController(action),  # type: ignore[arg-type]
+            OutboundController(stop),  # type: ignore[arg-type]
             "local-send-close-01",
         ),
         timeout=1.0,
@@ -897,45 +609,7 @@ async def test_control_relay_treats_disconnect_during_send_as_terminal() -> None
 
 
 @pytest.mark.asyncio
-async def test_control_relay_tears_down_when_sideband_binding_fails(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    controller = BindingFailureController()
-    message = RealtimeConnectedMessage(
-        type="realtime_connected",
-        session_id="local-binding-failure-01",
-        provider_call_id="call_provider_failure_01",
-    )
-    websocket = RealtimeBindingWebSocket(encode_loopback_message(message))
-
-    async def fail_binding(_local_session_id: str, _provider_call_id: str) -> None:
-        raise RejectedSidebandError(403)
-
-    await asyncio.wait_for(
-        _relay_control_websocket(
-            websocket,  # type: ignore[arg-type]
-            controller,  # type: ignore[arg-type]
-            "local-binding-failure-01",
-            bind_realtime_call=fail_binding,
-        ),
-        timeout=1.0,
-    )
-
-    assert websocket.close_codes == [1011]
-    assert controller.teardown_calls == [
-        {
-            "session_id": "local-binding-failure-01",
-            "outcome": SessionOutcome.FAILED,
-            "reason": StopReason.TRANSPORT_FAILURE,
-            "error": "sideband connection failed",
-        }
-    ]
-    assert "error_type=RejectedSidebandError status_code=403" in caplog.text
-    assert "secret-value" not in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_control_disconnect_requests_failed_transport_teardown() -> None:
+async def test_control_disconnect_does_not_tear_down_live_media() -> None:
     controller = DisconnectController()
 
     await _relay_control_websocket(
@@ -944,14 +618,7 @@ async def test_control_disconnect_requests_failed_transport_teardown() -> None:
         "local-disconnect-01",
     )
 
-    assert controller.teardown_calls == [
-        {
-            "session_id": "local-disconnect-01",
-            "outcome": SessionOutcome.FAILED,
-            "reason": StopReason.TRANSPORT_FAILURE,
-            "error": "control websocket disconnected",
-        }
-    ]
+    assert controller.teardown_calls == []
 
 
 def test_internal_open_is_loopback_only_and_response_is_sanitized() -> None:

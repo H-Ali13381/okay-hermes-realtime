@@ -38,7 +38,6 @@ async def _noop_release_profile_lock() -> None:
 class TeardownHooks:
     mark_stopping: Callable[[TeardownRequest], Awaitable[None]]
     request_browser_stop: Callable[[TeardownRequest], Awaitable[None]]
-    close_sideband: Callable[[], Awaitable[None]]
     close_browser: Callable[[], Awaitable[None]]
     persist_trace: Callable[[tuple[TeardownStepFailure, ...]], Awaitable[None]]
     finalize: Callable[
@@ -121,7 +120,6 @@ class TeardownCoordinator:
                 except TimeoutError:
                     failures.append(TeardownStepFailure(step="browser_ack", kind="timeout"))
 
-            await self._run_step("close_sideband", self._hooks.close_sideband, failures)
             await self._run_step("close_browser", self._hooks.close_browser, failures)
             await self._run_step(
                 "release_profile_lock",

@@ -39,7 +39,7 @@ class SessionOutcome(StrEnum):
 
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,128}$")
-_PROVIDER_CALL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
+
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PROVIDER_RESPONSE_ID_RE = re.compile(r"^[A-Za-z0-9._~-]{1,256}$")
 _SECRET_KEY_NAMES = {
@@ -49,7 +49,6 @@ _SECRET_KEY_NAMES = {
     "token",
     "password",
     "secret",
-    "sideband_url",
     "call_id",
 }
 
@@ -112,24 +111,6 @@ class PageStartedMessage(_StrictBaseModel):
     @classmethod
     def _validate_session_id(cls, value: str) -> str:
         return _validate_session_id(value)
-
-
-class RealtimeConnectedMessage(_StrictBaseModel):
-    type: Literal["realtime_connected"] = "realtime_connected"
-    session_id: str
-    provider_call_id: str
-
-    @field_validator("session_id")
-    @classmethod
-    def _validate_session_id(cls, value: str) -> str:
-        return _validate_session_id(value)
-
-    @field_validator("provider_call_id")
-    @classmethod
-    def _validate_provider_call_id(cls, value: str) -> str:
-        if _PROVIDER_CALL_ID_RE.fullmatch(value) is None:
-            raise ValueError("provider_call_id must be a bounded opaque identifier")
-        return value
 
 
 class TimingMessage(_StrictBaseModel):
@@ -198,36 +179,16 @@ class SessionClosedMessage(_StrictBaseModel):
         return _validate_session_id(value)
 
 
-class ActionStateMessage(_StrictBaseModel):
-    type: Literal["action_state"] = "action_state"
-    session_id: str
-    capability: str = Field(pattern=r"^[a-z][a-z0-9_]{0,127}$")
-    state: Literal["running", "completed", "failed", "closing"]
-    message: str | None = Field(default=None, min_length=1, max_length=240)
-
-    @field_validator("session_id")
-    @classmethod
-    def _validate_session_id(cls, value: str) -> str:
-        return _validate_session_id(value)
-
-    @field_validator("message")
-    @classmethod
-    def _validate_message(cls, value: str | None) -> str | None:
-        if value is not None and any(ord(character) < 32 for character in value):
-            raise ValueError("action message must not contain control characters")
-        return value
-
-
 LoopbackMessage = Annotated[
     ActivationMessage
     | PageReadyMessage
     | PageStartedMessage
-    | RealtimeConnectedMessage
+
     | TimingMessage
     | StopMessage
     | TeardownCompleteMessage
     | SessionClosedMessage
-    | ActionStateMessage,
+    ,
     Field(discriminator="type"),
 ]
 

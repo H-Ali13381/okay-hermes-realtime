@@ -17,7 +17,6 @@ from realtime_action_spike.runtime.controller import (
     VoiceSessionController,
 )
 from realtime_action_spike.runtime.protocol import (
-    ActionStateMessage,
     PageReadyMessage,
     PageStartedMessage,
     SessionClosedMessage,
@@ -694,40 +693,6 @@ async def test_controller_retains_completed_session_interruption_traces() -> Non
 
 
 @pytest.mark.asyncio
-async def test_action_state_queue_is_fifo_and_exact_session_scoped() -> None:
-    controller = VoiceSessionController(
-        DeterministicLauncher(),
-        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-actions"])),
-        session_id_factory=SequenceFactory(["local-actions-01"]),
-    )
-    activation = await controller.activate("http://127.0.0.1:8765/voice")
-    assert activation.session_id == "local-actions-01"
-    running = ActionStateMessage(
-        type="action_state",
-        session_id="local-actions-01",
-        capability="assistant_get_current_time",
-        state="running",
-    )
-    completed = ActionStateMessage(
-        type="action_state",
-        session_id="local-actions-01",
-        capability="assistant_get_current_time",
-        state="completed",
-        message="Current time retrieved",
-    )
-
-    await controller.publish_action_state(running)
-    await controller.publish_action_state(completed)
-
-    assert await controller.wait_for_outbound_message("local-actions-01") == running
-    assert await controller.wait_for_outbound_message("local-actions-01") == completed
-    with pytest.raises(StaleControlMessage):
-        await controller.publish_action_state(
-            completed.model_copy(update={"session_id": "local-stale-02"})
-        )
-
-
-@pytest.mark.asyncio
 async def test_server_teardown_requests_browser_stop_then_waits_for_ack() -> None:
     launcher = DeterministicLauncher()
     controller = VoiceSessionController(
@@ -748,7 +713,7 @@ async def test_server_teardown_requests_browser_stop_then_waits_for_ack() -> Non
             session_id,
             outcome=SessionOutcome.FAILED,
             reason=StopReason.TRANSPORT_FAILURE,
-            error="sideband connection failed",
+            error="transport failed",
         )
     )
     outbound = await asyncio.wait_for(
@@ -779,7 +744,7 @@ async def test_server_teardown_requests_browser_stop_then_waits_for_ack() -> Non
     assert result == TerminalSessionResult(
         session_id=session_id,
         outcome=SessionOutcome.FAILED,
-        error="sideband connection failed",
+        error="transport failed",
     )
     assert launcher.handles[0].closed_calls == 1
     assert controller.status == "idle"
@@ -866,36 +831,6 @@ async def test_missing_browser_ack_is_bounded_and_persists_final_trace_atomicall
     assert trace_path.is_file()
     assert "teardown_requested" in trace_path.read_text(encoding="utf-8")
     assert not list(tmp_path.glob(f".{trace_path.name}.*.tmp"))
-
-
-@pytest.mark.asyncio
-async def test_stopping_session_rejects_new_sideband_tool_work() -> None:
-    controller = VoiceSessionController(
-        DeterministicLauncher(),
-        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-reject-work"])),
-        session_id_factory=SequenceFactory(["local-reject-work"]),
-        browser_ack_timeout_seconds=0.01,
-    )
-    activation = await controller.activate("http://127.0.0.1:8765/voice")
-    session_id = activation.session_id
-    assert session_id is not None
-
-    teardown = asyncio.create_task(
-        controller.request_teardown(
-            session_id,
-            outcome=SessionOutcome.CANCELLED,
-            reason=StopReason.NATIVE_CANCEL,
-        )
-    )
-    await asyncio.wait_for(controller.wait_for_outbound_message(session_id), 0.1)
-
-    with pytest.raises(StaleControlMessage, match="stopping"):
-        await controller.process_sideband_event(
-            session_id,
-            {"type": "response.function_call_arguments.done"},
-        )
-
-    await teardown
 
 
 @pytest.mark.asyncio

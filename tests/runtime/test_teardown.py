@@ -32,9 +32,6 @@ class HookRecorder:
         if self.coordinator is not None and self.fail_step != "request_browser_stop":
             self.coordinator.acknowledge_browser_teardown()
 
-    async def close_sideband(self) -> None:
-        await self._record("close_sideband")
-
     async def close_browser(self) -> None:
         await self._record("close_browser")
 
@@ -55,7 +52,6 @@ class HookRecorder:
         return TeardownHooks(
             mark_stopping=self.mark_stopping,
             request_browser_stop=self.request_browser_stop,
-            close_sideband=self.close_sideband,
             close_browser=self.close_browser,
             persist_trace=self.persist_trace,
             finalize=self.finalize,
@@ -78,7 +74,6 @@ async def test_teardown_runs_the_required_order_and_records_acknowledgement() ->
     assert recorder.events == [
         "mark_stopping",
         "request_browser_stop",
-        "close_sideband",
         "close_browser",
         "release_profile_lock",
         "persist_trace",
@@ -106,7 +101,6 @@ async def test_duplicate_teardown_runs_once_and_first_request_wins() -> None:
     hooks = TeardownHooks(
         mark_stopping=hooks.mark_stopping,
         request_browser_stop=blocking_browser_stop,
-        close_sideband=hooks.close_sideband,
         close_browser=hooks.close_browser,
         persist_trace=hooks.persist_trace,
         finalize=hooks.finalize,
@@ -142,7 +136,6 @@ async def test_duplicate_teardown_runs_once_and_first_request_wins() -> None:
     [
         "mark_stopping",
         "request_browser_stop",
-        "close_sideband",
         "close_browser",
         "release_profile_lock",
         "persist_trace",
@@ -185,7 +178,6 @@ async def test_missing_browser_ack_is_bounded_and_cleanup_continues() -> None:
         TeardownHooks(
             mark_stopping=hooks.mark_stopping,
             request_browser_stop=no_ack,
-            close_sideband=hooks.close_sideband,
             close_browser=hooks.close_browser,
             persist_trace=hooks.persist_trace,
             finalize=hooks.finalize,
@@ -225,7 +217,6 @@ async def test_caller_cancellation_does_not_cancel_shared_teardown() -> None:
         TeardownHooks(
             mark_stopping=hooks.mark_stopping,
             request_browser_stop=wait_for_ack,
-            close_sideband=hooks.close_sideband,
             close_browser=hooks.close_browser,
             persist_trace=hooks.persist_trace,
             finalize=hooks.finalize,
@@ -258,8 +249,8 @@ async def test_unshielded_shutdown_cancellation_finalizes_and_leaves_no_task() -
     recorder = HookRecorder()
     entered = asyncio.Event()
 
-    async def blocked_sideband_close() -> None:
-        recorder.events.append("close_sideband")
+    async def blocked_browser_close() -> None:
+        recorder.events.append("close_browser")
         entered.set()
         await asyncio.Event().wait()
 
@@ -268,8 +259,7 @@ async def test_unshielded_shutdown_cancellation_finalizes_and_leaves_no_task() -
         TeardownHooks(
             mark_stopping=hooks.mark_stopping,
             request_browser_stop=hooks.request_browser_stop,
-            close_sideband=blocked_sideband_close,
-            close_browser=hooks.close_browser,
+            close_browser=blocked_browser_close,
             persist_trace=hooks.persist_trace,
             finalize=hooks.finalize,
         ),
@@ -292,5 +282,5 @@ async def test_unshielded_shutdown_cancellation_finalizes_and_leaves_no_task() -
     assert shared_task.done()
     assert shared_task.cancelled()
     assert recorder.events.count("finalize") == 1
-    assert "close_browser" not in recorder.events
+    assert recorder.events.count("close_browser") == 1
     assert "persist_trace" not in recorder.events
