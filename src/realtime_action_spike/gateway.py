@@ -597,9 +597,8 @@ def create_app(
             raise HTTPException(status_code=400, detail="Conflicting local session bindings")
 
         if query_session_id is not None:
-            authorization = request.headers.get("authorization", "")
-            if not authorization.startswith("Bearer ek_"):
-                raise HTTPException(status_code=403, detail="Invalid Realtime client credential")
+            if request.headers.get(LOCAL_CLIENT_HEADER) != LOCAL_CLIENT_HEADER_VALUE:
+                raise HTTPException(status_code=403, detail="Invalid local voice client")
             if _LOCAL_SESSION_ID_RE.fullmatch(query_session_id) is None:
                 raise HTTPException(status_code=400, detail="Invalid local session binding")
             if _controller.active_session_id != query_session_id:

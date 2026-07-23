@@ -1,5 +1,3 @@
-import { OpenAIRealtimeWebRTC } from "@openai/agents-realtime";
-
 "use strict";
 
 const startButton = document.getElementById("start-button");
@@ -29,8 +27,12 @@ if (activationToken) {
   history.replaceState(null, "", `${initialUrl.pathname}${initialUrl.search}${initialUrl.hash}`);
 }
 
-let realtimeTransport = null;
+let peerConnection = null;
+let dataChannel = null;
 let localStream = null;
+let executionScope = null;
+let disconnectAfterResponse = false;
+const handledCallIds = new Set();
 let receivedExecutionCount = 0;
 let isStopping = false;
 let controllerSocket = null;
@@ -452,7 +454,79 @@ function observeResponseFirstAudio() {
   waitingForNextAudio = false;
 }
 
-async function handleRealtimeEvent(event) {
+function sendRealtimeEvent(event, channel = dataChannel) {
+  if (!channel || channel.readyState !== "open") {
+    throw new Error("Realtime data channel is not open");
+  }
+  channel.send(JSON.stringify(event));
+}
+
+async function executeFunctionCall(item, sessionContext) {
+  const callId = item.call_id;
+  if (!callId || handledCallIds.has(callId)) return;
+  handledCallIds.add(callId);
+
+  let output;
+  try {
+    const response = await fetch("/execute", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Okay-Hermes-Client": "voice-page-v1",
+      },
+      body: JSON.stringify({
+        scope: sessionContext.scope,
+        call_id: callId,
+        name: item.name,
+        arguments: item.arguments || "{}",
+      }),
+    });
+    output = await response.json().catch(() => ({}));
+    if (!response.ok && !output.error) {
+      output = {
+        ok: false,
+        call_id: callId,
+        error: { type: "gateway_error", message: `Gateway returned ${response.status}` },
+      };
+    }
+  } catch (error) {
+    output = {
+      ok: false,
+      call_id: callId,
+      error: { type: "gateway_unreachable", message: error.message || String(error) },
+    };
+  }
+
+  if (
+    peerConnection !== sessionContext.pc ||
+    dataChannel !== sessionContext.dc ||
+    executionScope !== sessionContext.scope
+  ) {
+    return;
+  }
+
+  createActionStateCard(output);
+  if (!output.ok) {
+    setStatus("connected", "Connected — tools unavailable");
+  }
+  sendRealtimeEvent(
+    {
+      type: "conversation.item.create",
+      item: {
+        type: "function_call_output",
+        call_id: callId,
+        output: JSON.stringify(output),
+      },
+    },
+    sessionContext.dc
+  );
+  sendRealtimeEvent({ type: "response.create" }, sessionContext.dc);
+  if (output.ok && output.result?.end_session) {
+    disconnectAfterResponse = true;
+  }
+}
+
+async function handleRealtimeEvent(event, sessionContext) {
   appendEvent(event);
 
   if (event.type === "conversation.item.input_audio_transcription.delta") {
@@ -479,6 +553,17 @@ async function handleRealtimeEvent(event) {
     setStatus("thinking", "Thinking");
   } else if (event.type === "response.created") {
     setStatus("responding", "Responding");
+  } else if (event.type === "response.function_call_arguments.done") {
+    await executeFunctionCall(
+      {
+        type: "function_call",
+        call_id: event.call_id,
+        name: event.name,
+        arguments: event.arguments,
+        item_id: event.item_id,
+      },
+      sessionContext
+    );
   } else if (
     event.type === "response.output_audio.delta" ||
     event.type === "response.output_audio.started"
@@ -489,32 +574,23 @@ async function handleRealtimeEvent(event) {
   } else if (event.type === "response.done") {
     recordRealtimeResponseDone(event);
     observeResponseCancellation(event);
-    setStatus("connected", "Connected — speak naturally");
+    const functionCalls = (event.response?.output || []).filter(
+      (item) => item.type === "function_call"
+    );
+    if (functionCalls.length > 0) {
+      for (const item of functionCalls) {
+        await executeFunctionCall(item, sessionContext);
+      }
+    } else if (disconnectAfterResponse) {
+      disconnectAfterResponse = false;
+      window.setTimeout(() => stopConversation({ reason: "model_request" }), 500);
+    } else {
+      setStatus("connected", "Connected — speak naturally");
+    }
   } else if (event.type === "error") {
     recordRealtimeError(event.error);
     showError(event.error?.message || "The Realtime session returned an error.");
   }
-}
-
-async function fetchClientSecret() {
-  const headers = { "X-Okay-Hermes-Client": "voice-page-v1" };
-  if (localSessionId) {
-    headers["X-Okay-Hermes-Session-ID"] = localSessionId;
-  }
-  const response = await fetch("/client-secret", { method: "POST", headers });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(payload.detail || `Client secret request failed (${response.status})`);
-  }
-  if (
-    typeof payload.value !== "string" ||
-    !payload.value.startsWith("ek_") ||
-    !payload.session ||
-    typeof payload.session.model !== "string"
-  ) {
-    throw new Error("Gateway returned an invalid Realtime client secret");
-  }
-  return payload;
 }
 
 async function startConversation() {
@@ -535,64 +611,90 @@ async function startConversation() {
       },
     });
 
-    setStatus("connecting", "Creating Realtime session");
-    const clientSecret = await fetchClientSecret();
-    const transport = new OpenAIRealtimeWebRTC({
-      audioElement: remoteAudio,
-      mediaStream: localStream,
-    });
-    realtimeTransport = transport;
-
-    transport.on("*", (event) => {
-      if (realtimeTransport === transport) {
-        void handleRealtimeEvent(event);
-      }
-    });
-    transport.on("connection_change", (state) => {
-      if (realtimeTransport !== transport) return;
-      appendEvent({ type: "webrtc.connection_state", state });
-      recordTiming("peer_connection_state", { state });
-      if (state === "connected") {
-        setStatus("connected", "Connected — speak naturally");
-      } else if (state === "disconnected" && !isStopping) {
-        failConversation("Realtime WebRTC transport disconnected");
-      }
-    });
-    transport.on("error", (transportError) => {
-      if (realtimeTransport !== transport) return;
-      const cause = transportError?.error || transportError;
-      if (cause?.type === "error") return;
-      const detail = {
-        type: "transport_error",
-        code: typeof cause?.name === "string" ? cause.name : null,
-        message:
-          typeof cause?.message === "string"
-            ? cause.message
-            : "The Realtime transport returned an error.",
-      };
-      appendEvent({ type: "error", error: detail });
-      recordRealtimeError(detail);
-      showError(detail.message);
-    });
-
-    const connectPromise = transport.connect({
-      apiKey: clientSecret.value,
-      model: clientSecret.session.model,
-      url: localSessionId
-        ? `${window.location.origin}/session?local_session_id=${encodeURIComponent(localSessionId)}`
-        : undefined,
-      initialSessionConfig: {
-        providerData: clientSecret.session,
-      },
-    });
-
-    await connectPromise;
-    if (realtimeTransport !== transport) return;
-
-    if (localSessionId) {
-      sendControlMessage({ type: "page_started" });
+    const pc = new RTCPeerConnection();
+    peerConnection = pc;
+    pc.ontrack = (event) => {
+      if (peerConnection !== pc) return;
+      remoteAudio.srcObject = event.streams[0];
+      remoteAudio.play().catch(() => {});
+    };
+    for (const track of localStream.getTracks()) {
+      pc.addTrack(track, localStream);
     }
-    stopButton.disabled = false;
+
+    const dc = pc.createDataChannel("oai-events");
+    dataChannel = dc;
+    dc.addEventListener("open", () => {
+      if (peerConnection !== pc || dataChannel !== dc) return;
+      setStatus("connected", "Connected — speak naturally");
+      stopButton.disabled = false;
+      if (localSessionId) {
+        sendControlMessage({ type: "page_started" });
+      }
+    });
+    dc.addEventListener("message", (message) => {
+      if (peerConnection !== pc || dataChannel !== dc) return;
+      try {
+        const event = JSON.parse(message.data);
+        void handleRealtimeEvent(event, { pc, dc, scope: executionScope });
+      } catch (error) {
+        showError(`Could not parse a Realtime event: ${error.message || String(error)}`);
+      }
+    });
+    dc.addEventListener("error", () => {
+      if (peerConnection === pc && dataChannel === dc && !isStopping) {
+        failConversation("Realtime data channel failed");
+      }
+    });
+    dc.addEventListener("close", () => {
+      if (peerConnection === pc && dataChannel === dc && !isStopping) {
+        failConversation("Realtime data channel closed unexpectedly");
+      }
+    });
+    pc.addEventListener("connectionstatechange", () => {
+      if (peerConnection !== pc) return;
+      appendEvent({ type: "webrtc.connection_state", state: pc.connectionState });
+      recordTiming("peer_connection_state", { state: pc.connectionState });
+      if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+        failConversation(`WebRTC ${pc.connectionState}`);
+      }
+    });
+
+    setStatus("connecting", "Creating Realtime session");
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    recordTiming("sdp_offer_created");
+    const headers = {
+      "Content-Type": "application/sdp",
+      "X-Okay-Hermes-Client": "voice-page-v1",
+    };
+    if (localSessionId) {
+      headers["X-Okay-Hermes-Session-ID"] = localSessionId;
+    }
+    const sessionUrl = localSessionId
+      ? `/session?local_session_id=${encodeURIComponent(localSessionId)}`
+      : "/session";
+    const response = await fetch(sessionUrl, {
+      method: "POST",
+      body: offer.sdp,
+      headers,
+    });
+    if (!response.ok) {
+      let detail = await response.text();
+      try {
+        detail = JSON.parse(detail).detail || detail;
+      } catch (_error) {
+        // Keep plain-text provider or gateway errors readable.
+      }
+      throw new Error(detail || `Session gateway returned ${response.status}`);
+    }
+    executionScope = response.headers.get("X-Okay-Hermes-Execution-Scope");
+    if (localSessionId && !executionScope) {
+      throw new Error("Session gateway did not return a local execution scope");
+    }
+    const answer = { type: "answer", sdp: await response.text() };
+    await pc.setRemoteDescription(answer);
+    recordTiming("sdp_answer_applied");
   } catch (error) {
     showError(error.message || String(error));
     stopConversation({ preserveError: true, reason: "transport_failure" });
@@ -612,10 +714,13 @@ function stopConversation(options = {}) {
       stopMessageSent = true;
     }
 
-    if (realtimeTransport) {
-      const transport = realtimeTransport;
-      realtimeTransport = null;
-      transport.close();
+    if (dataChannel) {
+      if (dataChannel.readyState !== "closed") dataChannel.close();
+      dataChannel = null;
+    }
+    if (peerConnection) {
+      if (peerConnection.connectionState !== "closed") peerConnection.close();
+      peerConnection = null;
     }
 
     if (localStream) {
@@ -625,6 +730,9 @@ function stopConversation(options = {}) {
       localStream = null;
     }
 
+    executionScope = null;
+    handledCallIds.clear();
+    disconnectAfterResponse = false;
     remoteAudio.srcObject = null;
     resetSdkInterruptionDiagnostics();
     startButton.disabled = false;

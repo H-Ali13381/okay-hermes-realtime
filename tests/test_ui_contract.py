@@ -88,12 +88,12 @@ def test_assets_are_split_files() -> None:
 
     assert "<style>" not in index_html
     assert "<script>" not in index_html
-    assert "OpenAIRealtimeWebRTC = class" in script_js
+    assert "new RTCPeerConnection" in script_js
     assert "oai-events" in script_js
     assert ".voice-card" in css
 
 
-def test_js_uses_openai_realtime_webrtc_transport() -> None:
+def test_js_uses_direct_realtime_webrtc_transport_and_scoped_tools() -> None:
     script = _read(JS_PATH)
     start_block = _extract_block(
         script,
@@ -102,33 +102,20 @@ def test_js_uses_openai_realtime_webrtc_transport() -> None:
     )
 
     assert "navigator.mediaDevices.getUserMedia" in script
-    assert "new OpenAIRealtimeWebRTC" in start_block
-    assert 'fetch("/client-secret"' in script
+    assert "new RTCPeerConnection" in start_block
+    assert 'createDataChannel("oai-events")' in start_block
+    assert "fetch(sessionUrl" in script
+    assert "`/session?local_session_id=${encodeURIComponent(localSessionId)}`" in script
+    assert '"Content-Type": "application/sdp"' in script
+    assert 'X-Okay-Hermes-Execution-Scope' in script
+    assert 'fetch("/execute"' in script
     assert '"X-Okay-Hermes-Client": "voice-page-v1"' in script
-    assert "initialSessionConfig" in start_block
-    assert "providerData: clientSecret.session" in start_block
-    assert 'transport.on("*"' in start_block
-    assert 'transport.on("connection_change"' in start_block
-    assert 'transport.on("error"' in start_block
-    assert 'if (cause?.type === "error") return' in start_block
-    assert "const connectPromise = transport.connect" in start_block
-    assert "await connectPromise" in start_block
-    assert (
-        "url: localSessionId"
-        " ? `${window.location.origin}/session?local_session_id="
-        "${encodeURIComponent(localSessionId)}`"
-        in start_block
-    )
-    assert "new RTCPeerConnection" not in start_block
-    assert "createDataChannel" not in start_block
-    assert 'fetch("/session"' not in script
-    assert 'type: "response.create"' not in start_block
-    assert "conversation.item.create" not in start_block
-    assert "function_call_output" not in start_block
-    assert "executeFunctionCall" not in start_block
-    assert "handleActionState" in script
-    assert "sanitizeActionState" in script
-    assert "action_state" in script
+    assert 'type: "response.create"' in script
+    assert "conversation.item.create" in script
+    assert "function_call_output" in script
+    assert "executeFunctionCall" in script
+    assert "OpenAIRealtimeWebRTC" not in script
+    assert 'fetch("/client-secret"' not in script
 
 
 def test_js_keeps_same_origin_and_session_state_guards() -> None:
@@ -136,8 +123,8 @@ def test_js_keeps_same_origin_and_session_state_guards() -> None:
 
     assert "GATEWAY_ORIGIN" not in script
     assert "__GATEWAY_ORIGIN__" not in script
-    assert "realtimeTransport !== transport" in script
-    assert 'fetch("/client-secret"' in script
+    assert "peerConnection" in script
+    assert "dataChannel" in script
     assert 'headers["X-Okay-Hermes-Session-ID"] = localSessionId' in script
 
 
@@ -167,7 +154,8 @@ def test_ui_contract_keeps_cleanup_guards() -> None:
     script = _read(JS_PATH)
 
     assert "track.stop()" in script
-    assert "transport.close()" in script
+    assert "dataChannel.close()" in script
+    assert "peerConnection.close()" in script
     assert "remoteAudio.srcObject = null" in script
     assert "remoteAudio.pause()" not in script
     assert "remoteAudio.muted = true" not in script
@@ -204,9 +192,9 @@ def test_activation_mode_uses_same_origin_control_websocket_and_auto_start() -> 
     assert 'type: "realtime_connected"' not in script
     assert "provider_call_id: providerCallId" not in script
     assert 'type: "page_started"' in script
-    assert start_block.index("const connectPromise = transport.connect") < start_block.index(
-        "await connectPromise"
-    ) < start_block.index('sendControlMessage({ type: "page_started" })')
+    assert start_block.index('createDataChannel("oai-events")') < start_block.index(
+        'sendControlMessage({ type: "page_started" })'
+    )
     assert "startConversation()" in script
     assert 'type: "stop"' in script
     assert 'type: "teardown_complete"' in script
@@ -291,7 +279,8 @@ def test_js_teardown_order_is_transport_then_tracks_then_ack() -> None:
         "window.addEventListener(\"beforeunload\"",
     )
 
-    assert "transport.close();" in stop_block
+    assert "dataChannel.close();" in stop_block
+    assert "peerConnection.close();" in stop_block
     assert "for (const track of localStream.getTracks())" in stop_block
     assert "track.stop();" in stop_block
     assert 'sendControlMessage({ type: "teardown_complete"' in stop_block
@@ -299,7 +288,8 @@ def test_js_teardown_order_is_transport_then_tracks_then_ack() -> None:
     _assert_order(
         stop_block,
         [
-            "transport.close();",
+            "dataChannel.close();",
+            "peerConnection.close();",
             "for (const track of localStream.getTracks())",
             'sendControlMessage({ type: "teardown_complete"',
         ],

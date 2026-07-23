@@ -475,7 +475,7 @@ def test_session_endpoint_starts_sideband_for_exact_controller_session() -> None
         "/session?local_session_id=local-session-1234",
         content="v=0\r\nmock-offer",
         headers={
-            "Authorization": "Bearer ek_test_ephemeral",
+            LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE,
             "Content-Type": "application/sdp",
         },
     )
@@ -518,7 +518,7 @@ def test_session_endpoint_rejects_stale_query_binding_before_upstream() -> None:
         "/session?local_session_id=stale-session-1234",
         content="v=0\r\nmock-offer",
         headers={
-            "Authorization": "Bearer ek_test_ephemeral",
+            LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE,
             "Content-Type": "application/sdp",
         },
     )
@@ -639,7 +639,7 @@ def test_bound_session_issues_scope_and_execute_replays_identical_call() -> None
         "/session?local_session_id=local-session-1234",
         content="v=0\r\nmock-offer",
         headers={
-            "Authorization": "Bearer ek_test_ephemeral",
+            LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE,
             "Content-Type": "application/sdp",
         },
     )
