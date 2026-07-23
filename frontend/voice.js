@@ -124,6 +124,22 @@ function recordTiming(name, data = {}) {
   });
 }
 
+function hasLiveMedia() {
+  return (
+    peerConnection?.connectionState === "connected" && dataChannel?.readyState === "open"
+  );
+}
+
+function handleControllerSocketLoss(message) {
+  if (hasLiveMedia()) {
+    launchMode.textContent = "Wake activation mode · controller unavailable";
+    setStatus("connected", "Connected — controller unavailable");
+    appendEvent({ type: "control.degraded", message });
+    return;
+  }
+  failConversation(message);
+}
+
 function openControllerSocket() {
   if (!activationToken || !localSessionId) return;
 
@@ -170,13 +186,15 @@ function openControllerSocket() {
   });
   socket.addEventListener("error", () => {
     if (controllerSocket === socket && !controllerSessionClosed) {
-      failConversation("Could not connect to the local voice controller");
+      handleControllerSocketLoss("Could not connect to the local voice controller");
     }
   });
   socket.addEventListener("close", () => {
     if (controllerSocket === socket) {
       controllerSocket = null;
-      stopConversation({ preserveError: true, reason: "transport_failure", sendStopMessage: false });
+      if (!controllerSessionClosed) {
+        handleControllerSocketLoss("Local voice controller disconnected");
+      }
     }
   });
 }

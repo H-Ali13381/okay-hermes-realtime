@@ -140,6 +140,20 @@ def test_js_gives_transient_webrtc_disconnect_three_second_grace() -> None:
     assert "clearTransportFailureTimer()" in script
 
 
+def test_control_socket_loss_degrades_after_media_is_live() -> None:
+    script = _read(JS_PATH)
+
+    assert "function hasLiveMedia" in script
+    assert "function handleControllerSocketLoss" in script
+    assert 'dataChannel?.readyState === "open"' in script
+    assert "controller unavailable" in script
+    assert "stopConversation" not in _extract_block(
+        script,
+        "function handleControllerSocketLoss",
+        "function openControllerSocket",
+    )
+
+
 def test_js_keeps_same_origin_and_session_state_guards() -> None:
     script = _read(JS_PATH)
 

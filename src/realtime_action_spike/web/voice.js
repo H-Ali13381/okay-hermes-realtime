@@ -106,6 +106,18 @@ function recordTiming(name, data = {}) {
     data: controlTimingData(name, data)
   });
 }
+function hasLiveMedia() {
+  return peerConnection?.connectionState === "connected" && dataChannel?.readyState === "open";
+}
+function handleControllerSocketLoss(message) {
+  if (hasLiveMedia()) {
+    launchMode.textContent = "Wake activation mode \xB7 controller unavailable";
+    setStatus("connected", "Connected \u2014 controller unavailable");
+    appendEvent({ type: "control.degraded", message });
+    return;
+  }
+  failConversation(message);
+}
 function openControllerSocket() {
   if (!activationToken || !localSessionId) return;
   launchMode.textContent = "Wake activation mode \xB7 connecting controller";
@@ -149,13 +161,15 @@ function openControllerSocket() {
   });
   socket.addEventListener("error", () => {
     if (controllerSocket === socket && !controllerSessionClosed) {
-      failConversation("Could not connect to the local voice controller");
+      handleControllerSocketLoss("Could not connect to the local voice controller");
     }
   });
   socket.addEventListener("close", () => {
     if (controllerSocket === socket) {
       controllerSocket = null;
-      stopConversation({ preserveError: true, reason: "transport_failure", sendStopMessage: false });
+      if (!controllerSessionClosed) {
+        handleControllerSocketLoss("Local voice controller disconnected");
+      }
     }
   });
 }
