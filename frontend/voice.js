@@ -177,9 +177,7 @@ function openControllerSocket() {
         socket.close();
         return;
       }
-      if (event.type === "action_state") {
-        handleActionState(event);
-      }
+
     } catch (_error) {
       failConversation("Controller returned an invalid message");
     }
@@ -420,29 +418,8 @@ function createActionStateCard(state) {
   executionList.prepend(card);
 }
 
-function sanitizeActionState(rawState) {
-  if (!rawState || typeof rawState !== "object") {
-    return rawState;
-  }
 
-  const keys = ["type", "call_id", "capability", "execution", "ok", "error", "result"];
-  const sanitized = {};
-  for (const key of keys) {
-    if (key in rawState) {
-      sanitized[key] = rawState[key];
-    }
-  }
-
-  return sanitized;
-}
-
-function handleActionState(eventData) {
-  const actionState = eventData?.action_state;
-  const payload = sanitizeActionState(actionState ?? eventData);
-  createActionStateCard(payload);
-}
-
-function resetSdkInterruptionDiagnostics() {
+function resetInterruptionDiagnostics() {
   interruptionStartedMs = null;
   waitingForNextAudio = false;
   interruptionStateText.textContent = "No interruption measured";
@@ -457,14 +434,14 @@ function elapsedSinceInterruption() {
   return Number((performance.now() - interruptionStartedMs).toFixed(2));
 }
 
-function formatSdkTiming(value) {
+function formatInterruptionTiming(value) {
   return value === null ? "—" : `${value.toFixed(2)} ms`;
 }
 
 function observeSpeechStarted() {
   interruptionStartedMs = performance.now();
   waitingForNextAudio = true;
-  interruptionStateText.textContent = "Speech detected · SDK interruption active";
+  interruptionStateText.textContent = "Speech detected · interruption active";
   speechSilenceMs.textContent = "0.00 ms";
   responseCancelMs.textContent = "—";
   truncationMs.textContent = "—";
@@ -473,20 +450,20 @@ function observeSpeechStarted() {
 
 function observeResponseCancellation(event) {
   if (event.response?.status !== "cancelled" || interruptionStartedMs === null) return;
-  responseCancelMs.textContent = formatSdkTiming(elapsedSinceInterruption());
+  responseCancelMs.textContent = formatInterruptionTiming(elapsedSinceInterruption());
   interruptionStateText.textContent = "Response cancelled · waiting for next response";
 }
 
 function observeOutputBufferCleared() {
   if (interruptionStartedMs === null) return;
-  truncationMs.textContent = formatSdkTiming(elapsedSinceInterruption());
+  truncationMs.textContent = formatInterruptionTiming(elapsedSinceInterruption());
   interruptionStateText.textContent = "Output buffer cleared · listening";
 }
 
 function observeResponseFirstAudio() {
   if (!waitingForNextAudio || interruptionStartedMs === null) return;
-  listeningRestoredMs.textContent = formatSdkTiming(elapsedSinceInterruption());
-  interruptionStateText.textContent = "Playback restored by SDK";
+  listeningRestoredMs.textContent = formatInterruptionTiming(elapsedSinceInterruption());
+  interruptionStateText.textContent = "Playback restored";
   waitingForNextAudio = false;
 }
 
@@ -632,7 +609,7 @@ async function handleRealtimeEvent(event, sessionContext) {
 async function startConversation() {
   clearError();
   resetTranscript();
-  resetSdkInterruptionDiagnostics();
+  resetInterruptionDiagnostics();
   stopMessageSent = false;
   teardownCompleteSent = false;
   startButton.disabled = true;
@@ -775,7 +752,7 @@ function stopConversation(options = {}) {
     handledCallIds.clear();
     disconnectAfterResponse = false;
     remoteAudio.srcObject = null;
-    resetSdkInterruptionDiagnostics();
+    resetInterruptionDiagnostics();
     startButton.disabled = false;
     stopButton.disabled = true;
     voiceCard.dataset.active = "false";
