@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import json
+import logging
+import traceback
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -12,6 +15,17 @@ import websockets
 
 JsonObject = Mapping[str, Any]
 MAX_SIDEBAND_EVENT_BYTES = 256_000
+
+logger = logging.getLogger(__name__)
+
+# TEMPORARY DIAGNOSTIC (2026-07): full firehose logging of the sideband event
+# stream to hunt an intermittent ValueError that fails otherwise-healthy
+# sessions. This logs raw provider events UNREDACTED (transcript text, tool
+# arguments) by explicit user request. Strip back to the bare minimum once the
+# ValueError is identified. See conversation + realtime-api-verification pitfall
+# #15 (retain raw events before narrow projections).
+_DIAGNOSTIC_FIREHOSE = True
+_DIAGNOSTIC_RING_SIZE = 40
 
 
 @dataclass(frozen=True)
@@ -64,6 +78,10 @@ class RealtimeSidebandClient:
         self._connect_lock = asyncio.Lock()
         self._closed = False
         self._failed = False
+        # TEMPORARY DIAGNOSTIC: bounded raw-event ring for post-failure dumps.
+        self._diagnostic_ring: collections.deque[str] = collections.deque(
+            maxlen=_DIAGNOSTIC_RING_SIZE
+        )
 
     @property
     def closed(self) -> bool:
@@ -101,6 +119,13 @@ class RealtimeSidebandClient:
             raise RuntimeError("sideband client is closed")
         data = json.dumps(payload, separators=(",", ":"))
 
+        if _DIAGNOSTIC_FIREHOSE:
+            logger.warning(
+                "sideband_tx session_id=%s event=%s",
+                self.local_session_id,
+                data,
+            )
+
         async with self._send_lock:
             websocket = self._websocket
             if websocket is None:
@@ -132,9 +157,22 @@ class RealtimeSidebandClient:
         if websocket is None:
             return
 
+        raw_message: Any = None
         try:
             while True:
                 raw_message = await websocket.recv()
+                if _DIAGNOSTIC_FIREHOSE:
+                    ring_text = (
+                        raw_message.decode("utf-8", "replace")
+                        if isinstance(raw_message, bytes)
+                        else str(raw_message)
+                    )
+                    self._diagnostic_ring.append(ring_text)
+                    logger.warning(
+                        "sideband_rx session_id=%s event=%s",
+                        self.local_session_id,
+                        ring_text,
+                    )
                 message = self._decode_message(raw_message)
                 await self._on_event(
                     SidebandEvent(local_session_id=self.local_session_id, payload=message)
@@ -142,7 +180,33 @@ class RealtimeSidebandClient:
         except asyncio.CancelledError:
             return
         except Exception as error:
+            self._log_reader_failure(error, raw_message)
             await self._fail(error)
+
+    def _log_reader_failure(self, error: Exception, raw_message: Any) -> None:
+        # TEMPORARY DIAGNOSTIC: dump the offending event, the full traceback, and
+        # the recent raw-event ring so an intermittent ValueError is fully
+        # attributable. Strip once the root cause is fixed.
+        if not _DIAGNOSTIC_FIREHOSE:
+            return
+        offending = (
+            raw_message.decode("utf-8", "replace")
+            if isinstance(raw_message, bytes)
+            else repr(raw_message)
+        )
+        formatted_traceback = "".join(
+            traceback.format_exception(type(error), error, error.__traceback__)
+        )
+        logger.error(
+            "sideband_reader_failure session_id=%s error_type=%s error=%s\n"
+            "offending_event=%s\ntraceback=\n%s\nrecent_events=\n%s",
+            self.local_session_id,
+            type(error).__name__,
+            error,
+            offending,
+            formatted_traceback,
+            "\n".join(self._diagnostic_ring),
+        )
 
     def _decode_message(self, raw_message: Any) -> JsonObject:
         raw_text = raw_message.decode("utf-8") if isinstance(raw_message, bytes) else raw_message
