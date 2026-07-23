@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -79,6 +80,14 @@ def test_page_retains_dom_controls_and_panels() -> None:
     assert 'Start conversation' in html
     assert 'Stop' in html
     assert 'id="launch-mode"' in html
+
+
+def test_package_metadata_has_no_agents_sdk_dependencies() -> None:
+    package = json.loads((PROJECT_ROOT / "package.json").read_text(encoding="utf-8"))
+    dependencies = package.get("dependencies", {})
+
+    assert "@openai/agents-realtime" not in dependencies
+    assert "zod" not in dependencies
 
 
 def test_assets_are_split_files() -> None:
