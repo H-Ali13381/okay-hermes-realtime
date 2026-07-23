@@ -15,6 +15,10 @@ import websockets
 
 JsonObject = Mapping[str, Any]
 MAX_SIDEBAND_EVENT_BYTES = 256_000
+# Hard ceiling on a single raw frame before parsing. OpenAI can embed the full
+# input audio (~1MB base64) in retrieved conversation items; we allow the frame
+# in, strip the audio we do not use, then apply MAX_SIDEBAND_EVENT_BYTES.
+MAX_SIDEBAND_FRAME_BYTES = 4_000_000
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +47,26 @@ def build_sideband_url(call_id: str) -> str:
         raise ValueError("call_id must be non-empty")
     encoded = quote(call_id, safe="")
     return f"wss://api.openai.com/v1/realtime?call_id={encoded}"
+
+
+# Keys whose (potentially huge) string values the server sideband never uses.
+# Base64 input/output audio embedded in retrieved conversation items falls here.
+_UNUSED_LARGE_STRING_KEYS = ("audio",)
+
+
+def _strip_embedded_audio(node: Any) -> None:
+    """Recursively drop unused large audio strings from a parsed event in place."""
+
+    if isinstance(node, dict):
+        for key in _UNUSED_LARGE_STRING_KEYS:
+            value = node.get(key)
+            if isinstance(value, str):
+                node[key] = ""
+        for value in node.values():
+            _strip_embedded_audio(value)
+    elif isinstance(node, list):
+        for item in node:
+            _strip_embedded_audio(item)
 
 
 class RealtimeSidebandClient:
@@ -212,12 +236,26 @@ class RealtimeSidebandClient:
         raw_text = raw_message.decode("utf-8") if isinstance(raw_message, bytes) else raw_message
         if not isinstance(raw_text, str):
             raise TypeError("sideband message must be text")
-        if len(raw_text.encode("utf-8")) > MAX_SIDEBAND_EVENT_BYTES:
-            raise ValueError("sideband message is too large")
+        # Hard ceiling guards against a pathological frame before we even parse.
+        # OpenAI can legitimately echo conversation items that embed the full
+        # input audio as base64 (~1MB), so this ceiling is generous; the real
+        # semantic cap is applied after we drop audio we never consume.
+        if len(raw_text.encode("utf-8")) > MAX_SIDEBAND_FRAME_BYTES:
+            raise ValueError("sideband frame exceeds hard ceiling")
 
         message = json.loads(raw_text)
         if not isinstance(message, dict):
             raise TypeError("sideband message payload must be a JSON object")
+
+        # Suppress embedded audio: the server sideband only consumes function-call
+        # and response lifecycle events. Base64 audio in retrieved conversation
+        # items is never used here and previously blew past the size cap, killing
+        # otherwise-healthy sessions. Strip it before the semantic size check.
+        _strip_embedded_audio(message)
+
+        encoded_size = len(json.dumps(message, separators=(",", ":")).encode("utf-8"))
+        if encoded_size > MAX_SIDEBAND_EVENT_BYTES:
+            raise ValueError("sideband message is too large")
         return message
 
     async def _fail(self, error: Exception) -> None:

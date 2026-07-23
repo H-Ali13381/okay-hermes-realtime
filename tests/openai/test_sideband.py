@@ -601,3 +601,52 @@ async def test_voice_end_session_farewell_timeout_still_tears_down() -> None:
     assert result.outcome is SessionOutcome.COMPLETED
     assert controller.status == "idle"
     assert ws.closed
+
+
+def _decode_only_client() -> RealtimeSidebandClient:
+    async def _noop_event(_event: SidebandEvent) -> None:
+        return None
+
+    async def _noop_failure(_session_id: str, _error: Exception) -> None:
+        return None
+
+    return RealtimeSidebandClient(
+        local_session_id="local-decode-01",
+        call_id="call_decode",
+        api_key="test-key",
+        on_event=_noop_event,
+        on_terminal_failure=_noop_failure,
+        websocket_connect=lambda _url, _headers: None,  # type: ignore[arg-type,return-value]
+    )
+
+
+def test_decode_strips_embedded_audio_so_large_retrieved_items_survive() -> None:
+    # Reproduces the real crash: OpenAI echoes a retrieved conversation item with
+    # the full input audio embedded (~1MB base64), which previously blew past the
+    # size cap and killed the session with "sideband message is too large".
+    huge_audio = "A" * (MAX_SIDEBAND_EVENT_BYTES + 500_000)
+    event = {
+        "type": "conversation.item.retrieved",
+        "event_id": "event_x",
+        "item": {
+            "id": "item_x",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_audio", "transcript": "hi", "audio": huge_audio}],
+        },
+    }
+
+    decoded = _decode_only_client()._decode_message(json.dumps(event))
+
+    # Audio dropped, but the useful structure (type, transcript) is preserved.
+    assert decoded["type"] == "conversation.item.retrieved"
+    assert decoded["item"]["content"][0]["audio"] == ""
+    assert decoded["item"]["content"][0]["transcript"] == "hi"
+
+
+def test_decode_still_rejects_oversized_non_audio_event() -> None:
+    # The size cap must still protect us from a genuinely large non-audio event.
+    event = {"type": "unknown.event", "blob": "B" * (MAX_SIDEBAND_EVENT_BYTES + 10_000)}
+
+    with pytest.raises(ValueError, match="too large"):
+        _decode_only_client()._decode_message(json.dumps(event))
