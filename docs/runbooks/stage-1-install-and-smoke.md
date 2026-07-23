@@ -146,6 +146,8 @@ systemctl --user show okay-hermes-realtime-wakeword.service -p Result
 
 ps -eo args= | grep '[u]ser-data-dir=.*/okay-hermes-realtime/brave-profile' || true
 coredumpctl --no-pager --since '5 minutes ago' list | grep brave || true
+journalctl --user -u okay-hermes-realtime-controller.service --since '5 minutes ago' --no-pager \
+  | grep -Ei 'sideband|provider_call_id|reattach' || true
 ```
 
 Expected:
@@ -153,6 +155,7 @@ Expected:
 - both `Result=success`;
 - no replacement-profile Brave process;
 - no new Brave core dump;
+- no sideband attachment, provider call-ID relay, or sideband reattach marker;
 - a final `teardown_complete` event in the session trace;
 - wakeword can be turned ON and activated again.
 
