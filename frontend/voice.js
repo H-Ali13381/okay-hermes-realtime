@@ -32,6 +32,7 @@ let dataChannel = null;
 let localStream = null;
 let executionScope = null;
 let disconnectAfterResponse = false;
+let transportFailureTimer = null;
 const handledCallIds = new Set();
 let receivedExecutionCount = 0;
 let isStopping = false;
@@ -197,6 +198,23 @@ function showError(message) {
 function clearError() {
   errorBanner.textContent = "";
   errorBanner.dataset.visible = "false";
+}
+
+function clearTransportFailureTimer() {
+  if (transportFailureTimer !== null) {
+    window.clearTimeout(transportFailureTimer);
+    transportFailureTimer = null;
+  }
+}
+
+function scheduleTransportFailure(pc) {
+  clearTransportFailureTimer();
+  transportFailureTimer = window.setTimeout(() => {
+    transportFailureTimer = null;
+    if (peerConnection === pc && pc.connectionState === "disconnected") {
+      failConversation(`WebRTC ${pc.connectionState}`);
+    }
+  }, 3000);
 }
 
 function failConversation(message) {
@@ -655,8 +673,12 @@ async function startConversation() {
       if (peerConnection !== pc) return;
       appendEvent({ type: "webrtc.connection_state", state: pc.connectionState });
       recordTiming("peer_connection_state", { state: pc.connectionState });
-      if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+      if (pc.connectionState === "failed") {
         failConversation(`WebRTC ${pc.connectionState}`);
+      } else if (pc.connectionState === "disconnected") {
+        scheduleTransportFailure(pc);
+      } else {
+        clearTransportFailureTimer();
       }
     });
 
@@ -704,6 +726,7 @@ async function startConversation() {
 function stopConversation(options = {}) {
   if (isStopping || teardownCompleteSent) return;
   isStopping = true;
+  clearTransportFailureTimer();
   const shouldSendStopMessage = options.sendStopMessage !== false;
 
   try {

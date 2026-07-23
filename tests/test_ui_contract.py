@@ -118,6 +118,19 @@ def test_js_uses_direct_realtime_webrtc_transport_and_scoped_tools() -> None:
     assert 'fetch("/client-secret"' not in script
 
 
+def test_js_gives_transient_webrtc_disconnect_three_second_grace() -> None:
+    script = _read(JS_PATH)
+    source = _read(PROJECT_ROOT / "frontend/voice.js")
+
+    assert "function scheduleTransportFailure" in script
+    assert "window.setTimeout" in script
+    assert "}, 3000);" in source
+    assert "function clearTransportFailureTimer" in script
+    assert 'pc.connectionState === "disconnected"' in script
+    assert "scheduleTransportFailure(pc)" in script
+    assert "clearTransportFailureTimer()" in script
+
+
 def test_js_keeps_same_origin_and_session_state_guards() -> None:
     script = _read(JS_PATH)
 
