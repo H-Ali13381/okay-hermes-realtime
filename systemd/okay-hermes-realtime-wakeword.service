@@ -7,7 +7,7 @@ After=okay-hermes-realtime-controller.service pipewire.service wireplumber.servi
 Type=simple
 EnvironmentFile=%h/.config/okay-hermes-realtime/config.env
 Environment=LD_LIBRARY_PATH=%h/.local/lib/okay-hermes-realtime:%h/.local/lib/okay-hermes-realtime/lib
-ExecStart=%h/.local/lib/okay-hermes-realtime/okay-hermes-realtime-wake-listener --model %h/.local/share/okay-hermes-realtime/models/okay-hermes-realtime-wakeword.onnx --handler %h/.local/share/okay-hermes-realtime/venv/bin/okay-hermes-realtime-activation --threshold 0.6973556280136108 --consecutive-windows 2 --inference-interval-ms 250 --capture-health %h/.local/state/okay-hermes-realtime/capture-health
+ExecStart=%h/.local/lib/okay-hermes-realtime/okay-hermes-realtime-wake-listener --model %h/.local/share/okay-hermes-realtime/models/okay-hermes-realtime-wakeword.onnx --handler %h/.local/share/okay-hermes-realtime/venv/bin/okay-hermes-realtime-activation --threshold 0.6973556280136108 --consecutive-windows 2 --inference-interval-ms 250 --capture-health %h/.local/state/okay-hermes-realtime/capture-health --activation-archive-dir "%h/Desktop/Hermes Wakeword Activations"
 Restart=on-failure
 RestartSec=2s
 

@@ -31,6 +31,7 @@ WAKEWORD_MODEL = (
 )
 SOCKET_ENV = "ACTIVATION_SOCKET_PATH=%t/okay-hermes-realtime/activation.sock"
 CAPTURE_HEALTH = "%h/.local/state/okay-hermes-realtime/capture-health"
+ACTIVATION_ARCHIVE = "%h/Desktop/Hermes Wakeword Activations"
 
 
 def _read_lines(path: Path) -> list[str]:
@@ -105,6 +106,7 @@ def test_wakeword_unit_contract_and_args():
     assert "--consecutive-windows 2" in exec_cmd
     assert "--inference-interval-ms 250" in exec_cmd
     assert f"--capture-health {CAPTURE_HEALTH}" in exec_cmd
+    assert f'--activation-archive-dir "{ACTIVATION_ARCHIVE}"' in exec_cmd
 
 
 def test_pyproject_has_package_entrypoints_and_build_backend():

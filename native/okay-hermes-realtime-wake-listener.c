@@ -53,6 +53,7 @@ struct listener_options
 {
     const char *model_path;
     const char *capture_health_path;
+    const char *activation_archive_dir;
     char capture_health_buffer[4096];
 
     const char **handler_argv;
@@ -97,6 +98,7 @@ struct listener_data
 };
 
 static struct listener_data *g_listener;
+static _Atomic unsigned int g_activation_archive_sequence;
 
 static double monotonic_seconds(void)
 {
@@ -189,6 +191,149 @@ static int ensure_parent_dir(const char *path)
         return -1;
 
     return 0;
+}
+
+static void put_u16_le(uint8_t *out, uint16_t value)
+{
+    out[0] = (uint8_t)(value & 0xffU);
+    out[1] = (uint8_t)((value >> 8U) & 0xffU);
+}
+
+static void put_u32_le(uint8_t *out, uint32_t value)
+{
+    out[0] = (uint8_t)(value & 0xffU);
+    out[1] = (uint8_t)((value >> 8U) & 0xffU);
+    out[2] = (uint8_t)((value >> 16U) & 0xffU);
+    out[3] = (uint8_t)((value >> 24U) & 0xffU);
+}
+
+static int write_activation_wav(const char *path, const float *samples, size_t sample_count)
+{
+    uint8_t header[44] = {0};
+    int16_t *pcm = NULL;
+    char temporary[8192];
+    uint32_t data_size;
+    int fd = -1;
+    int result = -1;
+
+    if (path == NULL || samples == NULL || sample_count == 0 ||
+        sample_count > (UINT32_MAX / sizeof(int16_t)))
+        return -1;
+    if (ensure_parent_dir(path) < 0)
+        return -1;
+    if (snprintf(temporary, sizeof(temporary), "%s.tmp.%ld", path, (long)getpid()) < 0)
+        return -1;
+
+    pcm = malloc(sample_count * sizeof(*pcm));
+    if (pcm == NULL)
+        return -1;
+    for (size_t i = 0; i < sample_count; i++) {
+        float bounded = fmaxf(-1.0f, fminf(1.0f, samples[i]));
+        pcm[i] = (int16_t)lrintf(bounded * (bounded < 0.0f ? 32768.0f : 32767.0f));
+    }
+
+    data_size = (uint32_t)(sample_count * sizeof(*pcm));
+    memcpy(header, "RIFF", 4);
+    put_u32_le(header + 4, 36U + data_size);
+    memcpy(header + 8, "WAVEfmt ", 8);
+    put_u32_le(header + 16, 16U);
+    put_u16_le(header + 20, 1U);
+    put_u16_le(header + 22, 1U);
+    put_u32_le(header + 24, MODEL_RATE);
+    put_u32_le(header + 28, MODEL_RATE * sizeof(int16_t));
+    put_u16_le(header + 32, sizeof(int16_t));
+    put_u16_le(header + 34, 16U);
+    memcpy(header + 36, "data", 4);
+    put_u32_le(header + 40, data_size);
+
+    fd = open(temporary, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    if (fd >= 0 && write_all(fd, (const char *)header, sizeof(header)) >= 0 &&
+        write_all(fd, (const char *)pcm, data_size) >= 0 && fsync(fd) == 0 &&
+        close(fd) == 0) {
+        fd = -1;
+        if (rename(temporary, path) == 0)
+            result = 0;
+    }
+    if (fd >= 0)
+        close(fd);
+    if (result != 0)
+        unlink(temporary);
+    free(pcm);
+    return result;
+}
+
+static int archive_activation(const char *directory,
+                              const float *samples,
+                              size_t sample_count,
+                              float probability,
+                              bool self_test)
+{
+    struct timespec now;
+    struct tm utc;
+    char timestamp[32];
+    char stem[4096];
+    char wav_path[8192];
+    char metadata_path[8192];
+    char metadata_tmp[8192];
+    unsigned int sequence;
+    FILE *metadata = NULL;
+
+    if (directory == NULL || directory[0] == '\0')
+        return 0;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || gmtime_r(&now.tv_sec, &utc) == NULL)
+        return -1;
+    if (strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &utc) == 0)
+        return -1;
+    sequence = atomic_fetch_add(&g_activation_archive_sequence, 1U);
+
+    if (snprintf(stem,
+                 sizeof(stem),
+                 "%s/activation_%s_%03ld_%ld_%u%s",
+                 directory,
+                 timestamp,
+                 now.tv_nsec / 1000000L,
+                 (long)getpid(),
+                 sequence,
+                 self_test ? "_selftest" : "") >= (int)sizeof(stem) ||
+        snprintf(wav_path, sizeof(wav_path), "%s.wav", stem) >= (int)sizeof(wav_path) ||
+        snprintf(metadata_path, sizeof(metadata_path), "%s.json", stem) >= (int)sizeof(metadata_path) ||
+        snprintf(metadata_tmp, sizeof(metadata_tmp), "%s.tmp", metadata_path) >= (int)sizeof(metadata_tmp))
+        return -1;
+
+    if (write_activation_wav(wav_path, samples, sample_count) < 0)
+        return -1;
+
+    metadata = fopen(metadata_tmp, "w");
+    if (metadata == NULL)
+        goto metadata_failure;
+    if (fprintf(metadata,
+                "{\"probability\":%.9g,\"sample_rate\":%u,\"sample_count\":%zu,"
+                "\"duration_seconds\":%.1f,\"native_listener\":true,\"self_test\":%s}\n",
+                (double)probability,
+                MODEL_RATE,
+                sample_count,
+                (double)sample_count / MODEL_RATE,
+                self_test ? "true" : "false") < 0 ||
+        fflush(metadata) != 0 || fsync(fileno(metadata)) != 0) {
+        fclose(metadata);
+        metadata = NULL;
+        goto metadata_failure;
+    }
+    if (fclose(metadata) != 0) {
+        metadata = NULL;
+        goto metadata_failure;
+    }
+    metadata = NULL;
+    if (rename(metadata_tmp, metadata_path) != 0)
+        goto metadata_failure;
+    return 0;
+
+metadata_failure:
+    if (metadata != NULL)
+        fclose(metadata);
+    unlink(metadata_tmp);
+    unlink(wav_path);
+    return -1;
 }
 
 static void write_capture_status(const struct listener_data *data, const char *status)
@@ -314,6 +459,7 @@ static void listener_options_destroy(struct listener_options *options)
     options->handler_argc = 0;
     options->model_path = NULL;
     options->capture_health_path = NULL;
+    options->activation_archive_dir = NULL;
     options->capture_health_buffer[0] = '\0';
 }
 
@@ -694,6 +840,13 @@ static void *listener_worker(void *arg)
                         consecutive_hits = 0;
 
                     if (consecutive_hits >= data->options.consecutive_windows) {
+                        if (archive_activation(data->options.activation_archive_dir,
+                                               model_window,
+                                               MODEL_SAMPLES,
+                                               probability,
+                                               false) != 0) {
+                            fprintf(stderr, "failed to archive wakeword activation\n");
+                        }
                         if (data->options.handler_argc == 0) {
                             if (write_activation(data, probability) != 0)
                                 write_capture_status(data, "handler_failed");
@@ -917,6 +1070,7 @@ static int parse_options(int argc, char *argv[], struct listener_options *option
                     "  --model PATH               Path to ONNX wakeword model\n"
                     "  --handler [--] PATH [ARGS..] External activation handler invocation\n"
                     "  --capture-health PATH      Output path for capture status\n"
+                    "  --activation-archive-dir PATH  Save accepted 3-second wake clips and metadata\n"
                     "  --threshold FLOAT          Activation threshold in [0,1] (default %.7f)\n"
                     "  --consecutive-windows N    Consecutive activations required (default %u) [or --consecutive]\n"
                     "  --inference-interval N     Inference interval in milliseconds (default %u) [or --inference-interval-ms]\n"
@@ -948,6 +1102,15 @@ static int parse_options(int argc, char *argv[], struct listener_options *option
                 return -1;
             }
             options->capture_health_path = argv[++i];
+            continue;
+        }
+
+        if (strcmp(argv[i], "--activation-archive-dir") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--activation-archive-dir requires a value\n");
+                return -1;
+            }
+            options->activation_archive_dir = argv[++i];
             continue;
         }
 
@@ -1063,7 +1226,7 @@ static struct pw_properties *stream_properties(void)
                             NULL);
 }
 
-static void self_test_output(void)
+static int self_test_output(const struct listener_options *options)
 {
     struct sample_ring ring = {0};
     const float deterministic_frames[] = {
@@ -1079,12 +1242,13 @@ static void self_test_output(void)
     unsigned int accumulator = 0;
     float sample;
     float latest[16];
+    float *archive_window = NULL;
     char payload[256];
     int len;
 
     if (ring_init(&ring, (size_t)MODEL_RATE * MODEL_SECONDS) < 0) {
         fprintf(stderr, "self-test ring init failure\n");
-        return;
+        return -1;
     }
 
     mix_and_resample_downmix(deterministic_frames,
@@ -1097,7 +1261,7 @@ static void self_test_output(void)
     if (ring_snapshot_latest(&ring, latest, 8) < 8) {
         ring_destroy(&ring);
         fprintf(stderr, "self-test insufficient frames\n");
-        return;
+        return -1;
     }
 
     sample = (latest[0] + latest[1] + latest[2] + latest[3] + latest[4] + latest[5] + latest[6] + latest[7]) /
@@ -1111,9 +1275,27 @@ static void self_test_output(void)
     ring_destroy(&ring);
 
     if (len < 0 || (size_t)len >= sizeof(payload))
-        return;
+        return -1;
 
-    (void)write_all(STDOUT_FILENO, payload, (size_t)len);
+    if (options != NULL && options->activation_archive_dir != NULL) {
+        archive_window = calloc(MODEL_SAMPLES, sizeof(*archive_window));
+        if (archive_window == NULL)
+            return -1;
+        for (size_t i = 0; i < MODEL_SAMPLES; i++)
+            archive_window[i] = (float)((int)(i % 200U) - 100) / 1000.0f;
+        if (archive_activation(options->activation_archive_dir,
+                               archive_window,
+                               MODEL_SAMPLES,
+                               1.0f,
+                               true) != 0) {
+            free(archive_window);
+            fprintf(stderr, "self-test activation archive failure\n");
+            return -1;
+        }
+        free(archive_window);
+    }
+
+    return write_all(STDOUT_FILENO, payload, (size_t)len) < 0 ? -1 : 0;
 }
 
 int main(int argc, char *argv[])
@@ -1132,9 +1314,9 @@ int main(int argc, char *argv[])
     }
 
     if (data.options.self_test) {
-        self_test_output();
+        status = self_test_output(&data.options) == 0 ? 0 : 1;
         listener_options_destroy(&data.options);
-        return 0;
+        return status;
     }
 
     if (snprintf(data.capture_health_path,

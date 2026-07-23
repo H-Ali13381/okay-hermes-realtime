@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import wave
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -156,6 +157,7 @@ def test_fake_onnx_root_and_build_binary_help_self_test(tmp_path: Path) -> None:
     assert "--model" in help_out.stdout
     assert "--handler" in help_out.stdout
     assert "--capture-health" in help_out.stdout
+    assert "--activation-archive-dir" in help_out.stdout
     assert "--threshold" in help_out.stdout
     assert "--consecutive" in help_out.stdout
     assert "--inference-interval-ms" in help_out.stdout
@@ -171,6 +173,48 @@ def test_fake_onnx_root_and_build_binary_help_self_test(tmp_path: Path) -> None:
     assert event["event"] == "self_test"
     assert event["status"] == "ok"
     assert "score" in event
+
+
+def test_self_test_writes_activation_wav_and_metadata_when_archive_is_enabled(
+    tmp_path: Path,
+) -> None:
+    onnx_root = compile_fake_onnx_root(tmp_path)
+    output = tmp_path / "okay-hermes-realtime-wake-listener"
+    archive = tmp_path / "activations"
+    build_listener(onnx_root, output)
+
+    subprocess.run(
+        [
+            str(output),
+            "--self-test",
+            "--activation-archive-dir",
+            str(archive),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    wav_files = list(archive.glob("activation_*_selftest.wav"))
+    metadata_files = list(archive.glob("activation_*_selftest.json"))
+    assert len(wav_files) == 1
+    assert len(metadata_files) == 1
+
+    with wave.open(str(wav_files[0]), "rb") as recording:
+        assert recording.getnchannels() == 1
+        assert recording.getsampwidth() == 2
+        assert recording.getframerate() == 16_000
+        assert recording.getnframes() == 48_000
+
+    metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
+    assert metadata == {
+        "probability": 1.0,
+        "sample_rate": 16_000,
+        "sample_count": 48_000,
+        "duration_seconds": 3.0,
+        "native_listener": True,
+        "self_test": True,
+    }
 
 
 def test_binary_links_with_origin_libpath_and_colocated_soname(tmp_path: Path) -> None:
