@@ -618,20 +618,79 @@ def test_older_session_completion_cannot_replace_newer_openai_scope() -> None:
     asyncio.run(run_scenario())
 
 
-def test_execute_endpoint_is_not_exposed() -> None:
-    client = TestClient(create_app(settings()))
+def test_bound_session_issues_scope_and_execute_replays_identical_call() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_direct_tools"},
+        )
+    )
+    controller = SidebandStartController(active_session_id="local-session-1234")
+    client = TestClient(
+        create_app(
+            settings(),
+            upstream_client=upstream,
+            controller=controller,  # type: ignore[arg-type]
+        )
+    )
 
-    response = client.post(
-        "/execute",
-        json={
-            "session_id": "retired-browser-authority",
-            "call_id": "call_retired",
-            "name": "assistant_get_current_time",
-            "arguments": {},
+    session = client.post(
+        "/session?local_session_id=local-session-1234",
+        content="v=0\r\nmock-offer",
+        headers={
+            "Authorization": "Bearer ek_test_ephemeral",
+            "Content-Type": "application/sdp",
         },
     )
 
-    assert response.status_code == 404
+    assert session.status_code == 200
+    scope = session.headers.get("x-okay-hermes-execution-scope")
+    assert scope is not None
+    request = {
+        "scope": scope,
+        "call_id": "call_time_01",
+        "name": "assistant_get_current_time",
+        "arguments": {"timezone": "UTC"},
+    }
+    headers = {LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE}
+
+    first = client.post("/execute", json=request, headers=headers)
+    replay = client.post("/execute", json=request, headers=headers)
+    conflict = client.post(
+        "/execute",
+        json={**request, "arguments": {"timezone": "America/Toronto"}},
+        headers=headers,
+    )
+
+    assert first.status_code == 200
+    assert first.json()["ok"] is True
+    assert replay.status_code == 200
+    assert replay.content == first.content
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["type"] == "call_id_conflict"
+
+
+def test_execute_rejects_missing_or_stale_scope() -> None:
+    controller = SidebandStartController(active_session_id="local-session-1234")
+    client = TestClient(create_app(settings(), controller=controller))  # type: ignore[arg-type]
+    request = {
+        "scope": "stale-execution-scope",
+        "call_id": "call_time_01",
+        "name": "assistant_get_current_time",
+        "arguments": {"timezone": "UTC"},
+    }
+
+    stale = client.post(
+        "/execute",
+        json=request,
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
+    )
+    missing_client = client.post("/execute", json=request)
+
+    assert stale.status_code == 409
+    assert stale.json()["error"]["type"] == "stale_session"
+    assert missing_client.status_code == 403
 
 
 def test_same_origin_requests_require_no_cross_origin_cors_headers() -> None:

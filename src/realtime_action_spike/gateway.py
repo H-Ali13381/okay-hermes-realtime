@@ -16,11 +16,14 @@ from typing import Any, Protocol
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.websockets import WebSocketDisconnect
 
 from .capabilities import (
     CAPABILITIES,
     CapabilityBroker,
+    ExecutionContractError,
+    UnknownCapabilityError,
 )
 from .config import Settings, build_realtime_session
 from .openai.calls import (
@@ -45,6 +48,8 @@ OPENAI_REALTIME_SESSION_HEADER = "X-OpenAI-Realtime-Session-ID"
 LOCAL_CLIENT_HEADER = "X-Okay-Hermes-Client"
 LOCAL_CLIENT_HEADER_VALUE = "voice-page-v1"
 LOCAL_CONTROLLER_SESSION_HEADER = "X-Okay-Hermes-Session-ID"
+LOCAL_EXECUTION_SCOPE_HEADER = "X-Okay-Hermes-Execution-Scope"
+MAX_OPENAI_CALLS_PER_SESSION = 512
 _LOCAL_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,128}$")
 logger = logging.getLogger(__name__)
 
@@ -55,6 +60,28 @@ def _safe_http_status(error: Exception) -> int | None:
     if isinstance(status_code, int) and 100 <= status_code <= 599:
         return status_code
     return None
+
+
+class ExecutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: str = Field(min_length=16, max_length=200)
+    call_id: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=128)
+    arguments: str | dict[str, Any]
+
+
+def _execution_fingerprint(execution_request: ExecutionRequest) -> str:
+    arguments: Any = execution_request.arguments
+    if isinstance(arguments, str):
+        with contextlib.suppress(json.JSONDecodeError):
+            arguments = json.loads(arguments)
+    canonical_request = json.dumps(
+        {"name": execution_request.name, "arguments": arguments},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical_request.encode()).hexdigest()
 
 
 class AsyncPostClient(Protocol):
@@ -291,6 +318,8 @@ def create_app(
     )
 
     active_session_id: str | None = None
+    active_execution_scope: str | None = None
+    execution_results_by_call_id: dict[str, tuple[str, int, str]] = {}
     latest_session_attempt = 0
 
     def _is_loopback_client(request: Request) -> bool:
@@ -378,6 +407,96 @@ def create_app(
             "controller_status": _controller.status,
         }
 
+    @app.post("/execute")
+    async def execute_capability(
+        execution_request: ExecutionRequest,
+        request: Request,
+    ) -> Response:
+        if not _is_loopback_client(request):
+            raise HTTPException(status_code=403, detail="Only local clients can execute tools")
+        if request.headers.get(LOCAL_CLIENT_HEADER) != LOCAL_CLIENT_HEADER_VALUE:
+            raise HTTPException(status_code=403, detail="Invalid local voice client")
+        if (
+            active_execution_scope is None
+            or execution_request.scope != active_execution_scope
+            or active_session_id is None
+            or _controller.active_session_id != active_session_id
+        ):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "call_id": execution_request.call_id,
+                    "error": {
+                        "type": "stale_session",
+                        "message": "Local Realtime execution scope is not current",
+                    },
+                },
+            )
+
+        fingerprint = _execution_fingerprint(execution_request)
+        cached = execution_results_by_call_id.get(execution_request.call_id)
+        if cached is not None:
+            cached_fingerprint, cached_status, cached_body = cached
+            if cached_fingerprint != fingerprint:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "ok": False,
+                        "call_id": execution_request.call_id,
+                        "error": {
+                            "type": "call_id_conflict",
+                            "message": "OpenAI call_id was reused with a different request",
+                        },
+                    },
+                )
+            return Response(
+                content=cached_body,
+                status_code=cached_status,
+                media_type="application/json",
+            )
+
+        if len(execution_results_by_call_id) >= MAX_OPENAI_CALLS_PER_SESSION:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "ok": False,
+                    "call_id": execution_request.call_id,
+                    "error": {
+                        "type": "session_call_limit_exceeded",
+                        "message": "Realtime session reached its execution safety limit",
+                    },
+                },
+            )
+
+        try:
+            result = broker.execute(execution_request.name, execution_request.arguments)
+        except UnknownCapabilityError as exc:
+            status_code = 400
+            body = {
+                "ok": False,
+                "call_id": execution_request.call_id,
+                "error": {"type": "unknown_capability", "message": str(exc)},
+            }
+        except ExecutionContractError as exc:
+            status_code = 400
+            body = {
+                "ok": False,
+                "call_id": execution_request.call_id,
+                "error": {"type": "invalid_arguments", "message": str(exc)},
+            }
+        else:
+            status_code = 200
+            body = {"call_id": execution_request.call_id, **result}
+
+        body_json = json.dumps(body, separators=(",", ":"))
+        execution_results_by_call_id[execution_request.call_id] = (
+            fingerprint,
+            status_code,
+            body_json,
+        )
+        return Response(content=body_json, status_code=status_code, media_type="application/json")
+
     @app.post("/client-secret")
     async def create_client_secret(request: Request) -> Response:
         if not _is_loopback_client(request):
@@ -457,7 +576,7 @@ def create_app(
 
     @app.post("/session")
     async def create_realtime_session(request: Request) -> Response:
-        nonlocal active_session_id, latest_session_attempt
+        nonlocal active_execution_scope, active_session_id, latest_session_attempt
         if settings.api_key_value() is None:
             raise HTTPException(
                 status_code=503,
@@ -571,13 +690,18 @@ def create_app(
                 )
 
         active_session_id = local_session_id or secrets.token_urlsafe(24)
+        active_execution_scope = secrets.token_urlsafe(24) if local_session_id is not None else None
+        execution_results_by_call_id.clear()
         call_handle_registry.clear()
         call_handle_registry.set(active_session_id, handle)
 
+        headers = {OPENAI_REALTIME_SESSION_HEADER: active_session_id}
+        if active_execution_scope is not None:
+            headers[LOCAL_EXECUTION_SCOPE_HEADER] = active_execution_scope
         return Response(
             content=handle.sdp_answer,
             media_type="application/sdp",
-            headers={OPENAI_REALTIME_SESSION_HEADER: active_session_id},
+            headers=headers,
         )
 
     return app
