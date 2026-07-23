@@ -22402,6 +22402,20 @@ function formatJson(value) {
     return String(value);
   }
 }
+function sanitizeDiagnosticValue(value) {
+  if (Array.isArray(value)) {
+    return value.map(sanitizeDiagnosticValue);
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, nestedValue]) => [
+      key,
+      key === "audio" && typeof nestedValue === "string" ? `[embedded audio omitted: ${nestedValue.length} characters]` : sanitizeDiagnosticValue(nestedValue)
+    ])
+  );
+}
 function appendEvent(event) {
   const noisy = event.type === "timing" ? false : event.type.endsWith(".delta") || event.type === "rate_limits.updated";
   if (noisy) {
@@ -22448,6 +22462,11 @@ function summarizeEvent(event) {
       session_id: event.session?.id,
       model: event.session?.model,
       voice: event.session?.audio?.output?.voice
+    };
+  }
+  if (event.type === "conversation.item.retrieved") {
+    return {
+      item: sanitizeDiagnosticValue(event.item)
     };
   }
   if (event.type === "error") return event.error || event;

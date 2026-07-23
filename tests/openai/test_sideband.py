@@ -6,9 +6,11 @@ from collections import deque
 from dataclasses import dataclass, field
 
 import pytest
+from websockets.exceptions import ConnectionClosedError
 
 from realtime_action_spike.openai.sideband import (
     MAX_SIDEBAND_EVENT_BYTES,
+    MAX_SIDEBAND_FRAME_BYTES,
     RealtimeSidebandClient,
     SidebandEvent,
     build_sideband_url,
@@ -72,6 +74,16 @@ class _Connector:
         return self.websocket
 
 
+class _SequenceConnector:
+    def __init__(self, *websockets: _FakeWebSocket) -> None:
+        self.websockets = deque(websockets)
+        self.calls: list[tuple[str, dict[str, str]]] = []
+
+    async def __call__(self, url: str, headers: dict[str, str]) -> _FakeWebSocket:
+        self.calls.append((url, headers))
+        return self.websockets.popleft()
+
+
 async def test_build_sideband_url_encodes_call_id_for_query_param() -> None:
     assert (
         build_sideband_url("call/needs encoding%")
@@ -111,6 +123,26 @@ async def test_connect_uses_authorized_websocket_url_and_uses_secret_only_header
     assert len(failures) == 1
     assert failures[0][0] == "session-1"
     assert "test-api-key" not in url
+
+
+async def test_default_connector_uses_audio_aware_wire_size_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_connect(url: str, **kwargs: object) -> object:
+        captured.update(url=url, **kwargs)
+        return object()
+
+    monkeypatch.setattr("realtime_action_spike.openai.sideband.websockets.connect", fake_connect)
+    client = _decode_only_client()
+
+    await client._default_websocket_connect(
+        "wss://api.openai.com/v1/realtime?call_id=call_test",
+        {"Authorization": "Bearer test-key"},
+    )
+
+    assert captured["max_size"] == MAX_SIDEBAND_FRAME_BYTES
 
 
 async def test_sideband_event_json_is_decoded_and_dispatched_as_dict_payload() -> None:
@@ -257,6 +289,84 @@ async def test_remote_sideband_close_reports_failure() -> None:
     assert len(failures) == 1
     assert failures[0][0] == "session-1"
     assert isinstance(failures[0][1], Exception)
+
+
+async def test_abnormal_close_reattaches_and_continues_event_delivery() -> None:
+    first = _FakeWebSocket(messages=deque([ConnectionClosedError(None, None)]))
+    second = _FakeWebSocket(messages=deque(['{"type":"response.done"}']))
+    connector = _SequenceConnector(first, second)
+    events: list[SidebandEvent] = []
+    failures: list[tuple[str, Exception]] = []
+
+    async def on_event(event: SidebandEvent) -> None:
+        events.append(event)
+
+    async def on_failure(session_id: str, error: Exception) -> None:
+        failures.append((session_id, error))
+
+    client = RealtimeSidebandClient(
+        local_session_id="session-reconnect",
+        call_id="call_reconnect",
+        api_key="test-api-key",
+        on_event=on_event,
+        on_terminal_failure=on_failure,
+        websocket_connect=connector,
+        reconnect_delays=(0.0,),
+    )
+
+    await client.connect()
+    for _ in range(10):
+        if events:
+            break
+        await asyncio.sleep(0)
+
+    assert len(connector.calls) == 2
+    assert first.closed
+    assert events == [
+        SidebandEvent(local_session_id="session-reconnect", payload={"type": "response.done"})
+    ]
+    assert not failures
+    assert not client.closed
+    await client.close()
+
+
+async def test_abnormal_close_reports_failure_after_reconnects_are_exhausted() -> None:
+    first = _FakeWebSocket(messages=deque([ConnectionClosedError(None, None)]))
+    connector = _SequenceConnector(first)
+    failures: list[tuple[str, Exception]] = []
+
+    async def reconnect_fails(_url: str, _headers: dict[str, str]) -> _FakeWebSocket:
+        connector.calls.append((_url, _headers))
+        if len(connector.calls) == 1:
+            return first
+        raise OSError("reattach failed")
+
+    async def on_event(_event: SidebandEvent) -> None:
+        return None
+
+    async def on_failure(session_id: str, error: Exception) -> None:
+        failures.append((session_id, error))
+
+    client = RealtimeSidebandClient(
+        local_session_id="session-reconnect-fails",
+        call_id="call_reconnect_fails",
+        api_key="test-api-key",
+        on_event=on_event,
+        on_terminal_failure=on_failure,
+        websocket_connect=reconnect_fails,
+        reconnect_delays=(0.0, 0.0),
+    )
+
+    await client.connect()
+    for _ in range(10):
+        if failures:
+            break
+        await asyncio.sleep(0)
+
+    assert len(connector.calls) == 3
+    assert len(failures) == 1
+    assert isinstance(failures[0][1], OSError)
+    assert client.closed
 
 
 async def test_oversized_sideband_event_reports_terminal_failure() -> None:

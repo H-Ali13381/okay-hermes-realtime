@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import collections
 import contextlib
 import json
 import logging
-import traceback
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
 import websockets
+from websockets.exceptions import ConnectionClosedError
 
 JsonObject = Mapping[str, Any]
 MAX_SIDEBAND_EVENT_BYTES = 256_000
@@ -22,14 +21,7 @@ MAX_SIDEBAND_FRAME_BYTES = 4_000_000
 
 logger = logging.getLogger(__name__)
 
-# TEMPORARY DIAGNOSTIC (2026-07): full firehose logging of the sideband event
-# stream to hunt an intermittent ValueError that fails otherwise-healthy
-# sessions. This logs raw provider events UNREDACTED (transcript text, tool
-# arguments) by explicit user request. Strip back to the bare minimum once the
-# ValueError is identified. See conversation + realtime-api-verification pitfall
-# #15 (retain raw events before narrow projections).
-_DIAGNOSTIC_FIREHOSE = True
-_DIAGNOSTIC_RING_SIZE = 40
+DEFAULT_RECONNECT_DELAYS = (0.15, 0.5)
 
 
 @dataclass(frozen=True)
@@ -81,6 +73,7 @@ class RealtimeSidebandClient:
         on_event: Callable[[SidebandEvent], Awaitable[None]],
         on_terminal_failure: Callable[[str, Exception], Awaitable[None]],
         websocket_connect: Callable[[str, dict[str, str]], Awaitable[Any]] | None = None,
+        reconnect_delays: tuple[float, ...] = DEFAULT_RECONNECT_DELAYS,
     ) -> None:
         if not local_session_id:
             raise ValueError("local_session_id must be non-empty")
@@ -95,6 +88,7 @@ class RealtimeSidebandClient:
         self._on_event = on_event
         self._on_terminal_failure = on_terminal_failure
         self._connect = websocket_connect or self._default_websocket_connect
+        self._reconnect_delays = reconnect_delays
 
         self._websocket: Any | None = None
         self._reader_task: asyncio.Task[None] | None = None
@@ -102,10 +96,6 @@ class RealtimeSidebandClient:
         self._connect_lock = asyncio.Lock()
         self._closed = False
         self._failed = False
-        # TEMPORARY DIAGNOSTIC: bounded raw-event ring for post-failure dumps.
-        self._diagnostic_ring: collections.deque[str] = collections.deque(
-            maxlen=_DIAGNOSTIC_RING_SIZE
-        )
 
     @property
     def closed(self) -> bool:
@@ -118,12 +108,8 @@ class RealtimeSidebandClient:
             if self._websocket is not None:
                 return
 
-            headers = {"Authorization": f"Bearer {self._api_key}"}
             try:
-                websocket = await self._connect(
-                    build_sideband_url(self.call_id),
-                    headers,
-                )
+                websocket = await self._open_websocket()
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -142,13 +128,6 @@ class RealtimeSidebandClient:
         if self._closed:
             raise RuntimeError("sideband client is closed")
         data = json.dumps(payload, separators=(",", ":"))
-
-        if _DIAGNOSTIC_FIREHOSE:
-            logger.warning(
-                "sideband_tx session_id=%s event=%s",
-                self.local_session_id,
-                data,
-            )
 
         async with self._send_lock:
             websocket = self._websocket
@@ -177,60 +156,92 @@ class RealtimeSidebandClient:
                 await reader_task
 
     async def _run_reader(self) -> None:
-        websocket = self._websocket
-        if websocket is None:
-            return
-
-        raw_message: Any = None
-        try:
-            while True:
-                raw_message = await websocket.recv()
-                if _DIAGNOSTIC_FIREHOSE:
-                    ring_text = (
-                        raw_message.decode("utf-8", "replace")
-                        if isinstance(raw_message, bytes)
-                        else str(raw_message)
+        while not self._closed:
+            websocket = self._websocket
+            if websocket is None:
+                return
+            try:
+                while True:
+                    raw_message = await websocket.recv()
+                    message = self._decode_message(raw_message)
+                    await self._on_event(
+                        SidebandEvent(local_session_id=self.local_session_id, payload=message)
                     )
-                    self._diagnostic_ring.append(ring_text)
-                    logger.warning(
-                        "sideband_rx session_id=%s event=%s",
-                        self.local_session_id,
-                        ring_text,
-                    )
-                message = self._decode_message(raw_message)
-                await self._on_event(
-                    SidebandEvent(local_session_id=self.local_session_id, payload=message)
+            except asyncio.CancelledError:
+                return
+            except Exception as error:
+                reattached, terminal_error = await self._reattach_after_abnormal_close(
+                    error,
+                    websocket,
                 )
-        except asyncio.CancelledError:
-            return
-        except Exception as error:
-            self._log_reader_failure(error, raw_message)
-            await self._fail(error)
+                if reattached:
+                    continue
+                logger.error(
+                    "sideband_reader_failure session_id=%s error_type=%s error=%s",
+                    self.local_session_id,
+                    type(terminal_error).__name__,
+                    terminal_error,
+                    exc_info=(
+                        type(terminal_error),
+                        terminal_error,
+                        terminal_error.__traceback__,
+                    ),
+                )
+                await self._fail(terminal_error)
+                return
 
-    def _log_reader_failure(self, error: Exception, raw_message: Any) -> None:
-        # TEMPORARY DIAGNOSTIC: dump the offending event, the full traceback, and
-        # the recent raw-event ring so an intermittent ValueError is fully
-        # attributable. Strip once the root cause is fixed.
-        if not _DIAGNOSTIC_FIREHOSE:
-            return
-        offending = (
-            raw_message.decode("utf-8", "replace")
-            if isinstance(raw_message, bytes)
-            else repr(raw_message)
-        )
-        formatted_traceback = "".join(
-            traceback.format_exception(type(error), error, error.__traceback__)
-        )
-        logger.error(
-            "sideband_reader_failure session_id=%s error_type=%s error=%s\n"
-            "offending_event=%s\ntraceback=\n%s\nrecent_events=\n%s",
-            self.local_session_id,
-            type(error).__name__,
-            error,
-            offending,
-            formatted_traceback,
-            "\n".join(self._diagnostic_ring),
-        )
+    async def _reattach_after_abnormal_close(
+        self,
+        error: Exception,
+        failed_websocket: Any,
+    ) -> tuple[bool, Exception]:
+        if (
+            not isinstance(error, ConnectionClosedError)
+            or error.rcvd is not None
+            or error.sent is not None
+        ):
+            return False, error
+
+        if self._websocket is failed_websocket:
+            self._websocket = None
+        with contextlib.suppress(Exception):
+            await failed_websocket.close()
+
+        last_error: Exception = error
+        for attempt, delay in enumerate(self._reconnect_delays, start=1):
+            if self._closed:
+                return False, last_error
+            logger.warning(
+                "sideband_reattach_attempt session_id=%s attempt=%d status_code=1006",
+                self.local_session_id,
+                attempt,
+            )
+            await asyncio.sleep(delay)
+            if self._closed:
+                return False, last_error
+            try:
+                websocket = await self._open_websocket()
+            except asyncio.CancelledError:
+                raise
+            except Exception as reconnect_error:
+                last_error = reconnect_error
+                continue
+            if self._closed:
+                with contextlib.suppress(Exception):
+                    await websocket.close()
+                return False, last_error
+            self._websocket = websocket
+            logger.warning(
+                "sideband_reattached session_id=%s attempt=%d",
+                self.local_session_id,
+                attempt,
+            )
+            return True, last_error
+        return False, last_error
+
+    async def _open_websocket(self) -> Any:
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+        return await self._connect(build_sideband_url(self.call_id), headers)
 
     def _decode_message(self, raw_message: Any) -> JsonObject:
         raw_text = raw_message.decode("utf-8") if isinstance(raw_message, bytes) else raw_message
@@ -272,4 +283,8 @@ class RealtimeSidebandClient:
             await self._on_terminal_failure(self.local_session_id, error)
 
     async def _default_websocket_connect(self, url: str, headers: dict[str, str]) -> Any:
-        return await websockets.connect(url, additional_headers=headers)
+        return await websockets.connect(
+            url,
+            additional_headers=headers,
+            max_size=MAX_SIDEBAND_FRAME_BYTES,
+        )

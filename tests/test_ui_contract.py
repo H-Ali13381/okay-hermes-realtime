@@ -178,6 +178,14 @@ def test_ui_contract_keeps_cleanup_guards() -> None:
     assert "appendEvent({" in script
 
 
+def test_event_diagnostics_redact_embedded_audio_before_rendering() -> None:
+    script = _read(JS_PATH)
+
+    assert "function sanitizeDiagnosticValue" in script
+    assert 'key === "audio"' in script
+    assert "sanitizeDiagnosticValue(event.item)" in script
+
+
 def test_activation_mode_uses_same_origin_control_websocket_and_auto_start() -> None:
     script = _read(JS_PATH)
     html = _read(INDEX_PATH)
