@@ -38,6 +38,9 @@ class HookRecorder:
     async def close_browser(self) -> None:
         await self._record("close_browser")
 
+    async def release_profile_lock(self) -> None:
+        await self._record("release_profile_lock")
+
     async def persist_trace(self, _failures: tuple[object, ...]) -> None:
         await self._record("persist_trace")
 
@@ -56,6 +59,7 @@ class HookRecorder:
             close_browser=self.close_browser,
             persist_trace=self.persist_trace,
             finalize=self.finalize,
+            release_profile_lock=self.release_profile_lock,
         )
 
 
@@ -76,6 +80,7 @@ async def test_teardown_runs_the_required_order_and_records_acknowledgement() ->
         "request_browser_stop",
         "close_sideband",
         "close_browser",
+        "release_profile_lock",
         "persist_trace",
         "finalize",
     ]
@@ -139,6 +144,7 @@ async def test_duplicate_teardown_runs_once_and_first_request_wins() -> None:
         "request_browser_stop",
         "close_sideband",
         "close_browser",
+        "release_profile_lock",
         "persist_trace",
         "finalize",
     ],
@@ -200,6 +206,8 @@ async def test_missing_browser_ack_is_bounded_and_cleanup_continues() -> None:
 
     assert report.browser_acknowledged is False
     assert any(failure.step == "browser_ack" for failure in report.failures)
+    # This coordinator uses the default no-op release_profile_lock, so it is
+    # not recorded; the ordered cleanup tail is otherwise unchanged.
     assert recorder.events[-3:] == ["close_browser", "persist_trace", "finalize"]
 
 

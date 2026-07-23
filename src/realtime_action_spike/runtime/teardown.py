@@ -29,6 +29,11 @@ class TeardownReport:
     failures: tuple[TeardownStepFailure, ...]
 
 
+async def _noop_release_profile_lock() -> None:
+    """Default profile-lock release for browsers without a dedicated lock."""
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class TeardownHooks:
     mark_stopping: Callable[[TeardownRequest], Awaitable[None]]
@@ -40,6 +45,7 @@ class TeardownHooks:
         [TeardownRequest, tuple[TeardownStepFailure, ...]],
         Awaitable[None],
     ]
+    release_profile_lock: Callable[[], Awaitable[None]] = _noop_release_profile_lock
 
 
 class TeardownCoordinator:
@@ -117,6 +123,11 @@ class TeardownCoordinator:
 
             await self._run_step("close_sideband", self._hooks.close_sideband, failures)
             await self._run_step("close_browser", self._hooks.close_browser, failures)
+            await self._run_step(
+                "release_profile_lock",
+                self._hooks.release_profile_lock,
+                failures,
+            )
             await self._run_step(
                 "persist_trace",
                 lambda: self._hooks.persist_trace(tuple(failures)),

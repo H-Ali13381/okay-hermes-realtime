@@ -172,6 +172,9 @@ def test_ui_contract_keeps_cleanup_guards() -> None:
     assert "remoteAudio.pause()" not in script
     assert "remoteAudio.muted = true" not in script
     assert "beforeunload" in script
+    # X / window-close must fire a best-effort teardown even when beforeunload is
+    # unreliable (bfcache, background kill), so pagehide is registered too.
+    assert "pagehide" in script
     assert "appendEvent({" in script
 
 

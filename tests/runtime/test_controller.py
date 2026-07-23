@@ -73,6 +73,15 @@ class FirstCloseFailsLauncher(DeterministicLauncher):
         return handle
 
 
+class LockReleasingLauncher(DeterministicLauncher):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release_calls = 0
+
+    def release_profile_lock(self) -> None:
+        self.release_calls += 1
+
+
 class SequenceFactory:
     def __init__(self, values: list[str]) -> None:
         self._values = list(values)
@@ -212,6 +221,28 @@ async def test_control_message_flow_tracks_state_and_idempotent_stop_teardown() 
     assert launcher.handles[0].closed_calls == 1
     assert controller.status == "idle"
     assert observed_statuses == ["launching", "connecting", "live", "stopping", "idle"]
+
+
+@pytest.mark.asyncio
+async def test_teardown_releases_profile_lock_after_browser_close() -> None:
+    launcher = LockReleasingLauncher()
+    controller = VoiceSessionController(
+        launcher,
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-lock"])),
+        session_id_factory=SequenceFactory(["local-session-lock"]),
+    )
+
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id is not None
+
+    # Any terminal path (button, X-close, native cancel) converges here.
+    await controller.close_active_session()
+
+    assert controller.status == "idle"
+    assert launcher.handles[0].closed_calls == 1
+    # The profile lock is released exactly once, after the browser was closed.
+    assert launcher.release_calls == 1
 
 
 @pytest.mark.asyncio

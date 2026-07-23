@@ -491,3 +491,43 @@ def _find_unused_pid() -> int:
             continue
         candidate += 1
     raise RuntimeError("could not find an unused pid for the test")
+
+
+def test_release_singleton_lock_removes_lock_files(tmp_path: Path) -> None:
+    from realtime_action_spike.runtime.browser.brave_origin import release_singleton_lock
+
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    (profile / "SingletonLock").symlink_to(f"localhost-host-{_find_unused_pid()}")
+    (profile / "SingletonCookie").symlink_to("16376446489542904688")
+    (profile / "SingletonSocket").symlink_to("/tmp/org.chromium.Chromium.X/SingletonSocket")
+
+    release_singleton_lock(profile)
+
+    assert not (profile / "SingletonLock").is_symlink()
+    assert not (profile / "SingletonCookie").is_symlink()
+    assert not (profile / "SingletonSocket").is_symlink()
+
+
+def test_release_singleton_lock_spares_live_owner(tmp_path: Path) -> None:
+    from realtime_action_spike.runtime.browser.brave_origin import release_singleton_lock
+
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    (profile / "SingletonLock").symlink_to(f"localhost-host-{os.getpid()}")
+
+    # Teardown-time release must never yank a lock owned by a live instance.
+    release_singleton_lock(profile)
+
+    assert (profile / "SingletonLock").is_symlink()
+
+
+def test_release_singleton_lock_is_idempotent_when_absent(tmp_path: Path) -> None:
+    from realtime_action_spike.runtime.browser.brave_origin import release_singleton_lock
+
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+
+    # No lock present: must be a safe no-op, not an error.
+    release_singleton_lock(profile)
+    release_singleton_lock(profile)

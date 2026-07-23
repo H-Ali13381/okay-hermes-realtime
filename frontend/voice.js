@@ -625,5 +625,12 @@ function stopConversation(options = {}) {
 
 startButton.addEventListener("click", startConversation);
 stopButton.addEventListener("click", () => stopConversation({ reason: "button" }));
+// X / close: best-effort graceful teardown. pagehide is the reliable unload
+// signal (fires on bfcache and background kill where beforeunload does not);
+// beforeunload is kept for browsers that still favor it. Both are idempotent
+// via the isStopping / teardownCompleteSent guards in stopConversation, and the
+// controller's teardown pipeline releases the profile lock regardless of whether
+// these frames actually flush before the socket drops.
+window.addEventListener("pagehide", () => stopConversation({ reason: "native_cancel" }));
 window.addEventListener("beforeunload", () => stopConversation({ reason: "native_cancel" }));
 openControllerSocket();

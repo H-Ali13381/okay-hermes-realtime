@@ -22707,5 +22707,6 @@ function stopConversation(options = {}) {
 }
 startButton.addEventListener("click", startConversation);
 stopButton.addEventListener("click", () => stopConversation({ reason: "button" }));
+window.addEventListener("pagehide", () => stopConversation({ reason: "native_cancel" }));
 window.addEventListener("beforeunload", () => stopConversation({ reason: "native_cancel" }));
 openControllerSocket();

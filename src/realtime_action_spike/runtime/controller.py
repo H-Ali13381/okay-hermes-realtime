@@ -605,6 +605,15 @@ class VoiceSessionController:
             if browser_handle is not None:
                 await asyncio.to_thread(browser_handle.close)
 
+        async def release_profile_lock() -> None:
+            # Runs after close_browser, so the owned process group has exited and
+            # the dedicated profile's singleton lock can be released safely. This
+            # keeps the profile from going stale even on hard-kill / timeout paths.
+            release = getattr(self._launcher, "release_profile_lock", None)
+            if release is None:
+                return
+            await asyncio.to_thread(release)
+
         async def persist_trace(failures: tuple[TeardownStepFailure, ...]) -> None:
             for failure in failures:
                 session.trace.record(
@@ -674,6 +683,7 @@ class VoiceSessionController:
                 close_browser=close_browser,
                 persist_trace=persist_trace,
                 finalize=finalize,
+                release_profile_lock=release_profile_lock,
             ),
             acknowledgement_timeout=self._browser_ack_timeout_seconds,
             step_timeout=self._teardown_step_timeout_seconds,

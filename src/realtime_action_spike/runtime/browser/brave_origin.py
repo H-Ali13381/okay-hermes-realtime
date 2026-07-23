@@ -46,6 +46,14 @@ class DedicatedBraveLauncher:
     def brave_profile(self) -> Path:
         return self._brave_profile
 
+    def release_profile_lock(self) -> None:
+        """Release this profile's singleton lock after the browser has exited.
+
+        Safe to call from teardown regardless of how the browser stopped; a live
+        owner is spared and an absent lock is a no-op.
+        """
+        release_singleton_lock(self._brave_profile)
+
     def _build_loopback_url(self, activation_token: str) -> str:
         return build_activation_loopback_url(self._loopback_base_url, activation_token)
 
@@ -146,17 +154,37 @@ def _clear_stale_singleton_lock(profile_path: Path) -> None:
     When a prior dedicated browser dies without cleaning up, the stale lock makes
     the next launch hand the URL to a nonexistent instance and exit immediately,
     so the controller only ever sees a browser-startup timeout. Clear the lock
-    only when its owning PID is dead; never disturb a live instance.
+    only when its owning PID is dead; refuse to launch if a live instance owns it.
     """
 
+    if _singleton_lock_owner_is_alive(profile_path):
+        raise BrowserLaunchError("dedicated Brave profile is already in use by a live instance")
+    _unlink_singleton_lock_files(profile_path)
+
+
+def release_singleton_lock(profile_path: Path) -> None:
+    """Release this profile's singleton lock during teardown.
+
+    Mirrors :func:`_clear_stale_singleton_lock` but is safe to call after the
+    dedicated browser process group has exited: it removes the lock files so the
+    profile never goes stale, while sparing a lock that a live instance still
+    owns (a hard-kill race) and staying a no-op when no lock is present.
+    """
+
+    if _singleton_lock_owner_is_alive(profile_path):
+        return
+    _unlink_singleton_lock_files(profile_path)
+
+
+def _singleton_lock_owner_is_alive(profile_path: Path) -> bool:
     lock_path = profile_path / "SingletonLock"
     if not lock_path.is_symlink():
-        return
-
+        return False
     owner_pid = _parse_singleton_lock_pid(os.readlink(lock_path))
-    if owner_pid is not None and _pid_is_alive(owner_pid):
-        raise BrowserLaunchError("dedicated Brave profile is already in use by a live instance")
+    return owner_pid is not None and _pid_is_alive(owner_pid)
 
+
+def _unlink_singleton_lock_files(profile_path: Path) -> None:
     for name in _SINGLETON_LOCK_FILES:
         candidate = profile_path / name
         if candidate.is_symlink() or candidate.exists():
