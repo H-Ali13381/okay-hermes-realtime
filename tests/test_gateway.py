@@ -228,7 +228,7 @@ def test_session_configuration_uses_fast_natural_voice_defaults() -> None:
     }
     assert session["audio"]["input"]["transcription"] == {"model": "gpt-4o-mini-transcribe"}
     assert session["tool_choice"] == "auto"
-    assert len(session["tools"]) == 2
+    assert len(session["tools"]) == 4
     assert "Do not claim an action succeeded before its tool result" in session["instructions"]
 
 
@@ -245,6 +245,8 @@ def test_health_reports_model_and_missing_key_without_secret_material() -> None:
         "capabilities": [
             "assistant_get_current_time",
             "voice_end_session",
+            "handoff_to_heavy_agent",
+            "check_heavy_agent_task",
         ],
         "controller_status": "idle",
     }
@@ -466,6 +468,67 @@ def test_execute_rejects_missing_or_stale_scope() -> None:
     assert stale.status_code == 409
     assert stale.json()["error"]["type"] == "stale_session"
     assert missing_client.status_code == 403
+
+
+def test_execute_handoff_failure_returns_controlled_error_not_500(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a handoff failure inside /execute must surface as a 400, not an ASGI 500."""
+    from realtime_action_spike import capabilities
+    from realtime_action_spike.capabilities import clear_handoff_ledger
+
+    def missing_hermes(cmd: list[str], **_kwargs: Any) -> Any:
+        raise FileNotFoundError(cmd[0])
+
+    monkeypatch.setenv("HERMES_KANBAN_BIN", "/nonexistent/fake-hermes")
+    monkeypatch.setattr(capabilities.subprocess, "run", missing_hermes)
+    clear_handoff_ledger()
+
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_handoff"},
+        )
+    )
+    controller = ActiveSessionController(active_session_id="local-session-handoff")
+    client = TestClient(
+        create_app(
+            settings(),
+            upstream_client=upstream,
+            controller=controller,  # type: ignore[arg-type]
+        )
+    )
+
+    session = client.post(
+        "/session?local_session_id=local-session-handoff",
+        content="v=0\r\nmock-offer",
+        headers={
+            LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE,
+            "Content-Type": "application/sdp",
+        },
+    )
+    assert session.status_code == 200
+    scope = session.headers.get("x-okay-hermes-execution-scope")
+    assert scope is not None
+
+    response = client.post(
+        "/execute",
+        json={
+            "scope": scope,
+            "call_id": "call_handoff_01",
+            "name": "handoff_to_heavy_agent",
+            "arguments": {"request": "probe controlled failure"},
+        },
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
+    )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["ok"] is False
+    assert body["error"]["type"] == "invalid_arguments"
+    assert "Hermes executable not found" in body["error"]["message"]
+    clear_handoff_ledger()
 
 
 def test_same_origin_requests_require_no_cross_origin_cors_headers() -> None:
