@@ -9,81 +9,65 @@ import json
 import logging
 import re
 import secrets
-from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.websockets import WebSocketDisconnect
 
 from .capabilities import (
     CAPABILITIES,
     CapabilityBroker,
+    ExecutionContractError,
+    UnknownCapabilityError,
 )
 from .config import Settings, build_realtime_session
-from .openai.calls import (
-    RealtimeCallHandle,
-    RealtimeCallHandleParseError,
-    parse_realtime_call_handle,
-)
 from .runtime.browser import NoopBrowserHandle
 from .runtime.controller import StaleControlMessage, VoiceSessionController
-from .runtime.protocol import (
-    RealtimeConnectedMessage,
-    SessionOutcome,
-    StopMessage,
-    StopReason,
-    parse_loopback_message,
-)
+from .runtime.protocol import StopMessage
 from .runtime.tokens import LaunchTokenStore
 
 OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
-OPENAI_REALTIME_CLIENT_SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets"
+
 OPENAI_REALTIME_SESSION_HEADER = "X-OpenAI-Realtime-Session-ID"
 LOCAL_CLIENT_HEADER = "X-Okay-Hermes-Client"
 LOCAL_CLIENT_HEADER_VALUE = "voice-page-v1"
 LOCAL_CONTROLLER_SESSION_HEADER = "X-Okay-Hermes-Session-ID"
+LOCAL_EXECUTION_SCOPE_HEADER = "X-Okay-Hermes-Execution-Scope"
+MAX_OPENAI_CALLS_PER_SESSION = 512
 _LOCAL_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,128}$")
 logger = logging.getLogger(__name__)
 
 
-def _safe_http_status(error: Exception) -> int | None:
-    response = getattr(error, "response", None)
-    status_code = getattr(response, "status_code", None)
-    if isinstance(status_code, int) and 100 <= status_code <= 599:
-        return status_code
-    return None
+
+class ExecutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: str = Field(min_length=16, max_length=200)
+    call_id: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=128)
+    arguments: str | dict[str, Any]
+
+
+def _execution_fingerprint(execution_request: ExecutionRequest) -> str:
+    arguments: Any = execution_request.arguments
+    if isinstance(arguments, str):
+        with contextlib.suppress(json.JSONDecodeError):
+            arguments = json.loads(arguments)
+    canonical_request = json.dumps(
+        {"name": execution_request.name, "arguments": arguments},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical_request.encode()).hexdigest()
 
 
 class AsyncPostClient(Protocol):
     async def post(self, url: str, **kwargs: Any) -> httpx.Response: ...
 
-
-class RealtimeCallHandleRegistry(Protocol):
-    def get(self, local_session_id: str) -> RealtimeCallHandle | None:
-        ...
-
-    def set(self, local_session_id: str, handle: RealtimeCallHandle) -> None:
-        ...
-
-    def clear(self) -> None:
-        ...
-
-
-class _InMemoryRealtimeCallHandleRegistry:
-    def __init__(self) -> None:
-        self._handles: dict[str, RealtimeCallHandle] = {}
-
-    def get(self, local_session_id: str) -> RealtimeCallHandle | None:
-        return self._handles.get(local_session_id)
-
-    def set(self, local_session_id: str, handle: RealtimeCallHandle) -> None:
-        self._handles = {local_session_id: handle}
-
-    def clear(self) -> None:
-        self._handles.clear()
 
 
 def _safety_identifier() -> str:
@@ -122,34 +106,10 @@ async def _post_to_openai(
         return await client.post(OPENAI_REALTIME_CALLS_URL, **request_kwargs)
 
 
-async def _post_client_secret(
-    *,
-    settings: Settings,
-    session: dict[str, Any],
-    upstream_client: AsyncPostClient | None,
-) -> httpx.Response:
-    api_key = settings.api_key_value()
-    assert api_key is not None
-    request_kwargs = {
-        "headers": {
-            "Authorization": f"Bearer {api_key}",
-            "OpenAI-Safety-Identifier": _safety_identifier(),
-            "Content-Type": "application/json",
-        },
-        "json": {"session": session},
-    }
-    if upstream_client is not None:
-        return await upstream_client.post(OPENAI_REALTIME_CLIENT_SECRETS_URL, **request_kwargs)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-        return await client.post(OPENAI_REALTIME_CLIENT_SECRETS_URL, **request_kwargs)
-
-
 async def _relay_control_websocket(
     websocket: WebSocket,
     controller: VoiceSessionController,
     session_id: str,
-    *,
-    bind_realtime_call: Callable[[str, str], Awaitable[None]] | None = None,
 ) -> None:
     async def send_text(payload: str) -> bool:
         try:
@@ -161,7 +121,7 @@ async def _relay_control_websocket(
     receive_task = asyncio.create_task(websocket.receive_text())
     outbound_task = asyncio.create_task(controller.wait_for_outbound_message(session_id))
     server_stop_sent = False
-    realtime_call_bound = False
+
     try:
         while True:
             done, _pending = await asyncio.wait(
@@ -173,43 +133,24 @@ async def _relay_control_websocket(
                 try:
                     raw_message = receive_task.result()
                 except WebSocketDisconnect:
-                    with contextlib.suppress(StaleControlMessage):
-                        await controller.request_teardown(
-                            session_id,
-                            outcome=SessionOutcome.FAILED,
-                            reason=StopReason.TRANSPORT_FAILURE,
-                            error="control websocket disconnected",
-                        )
                     return
 
                 try:
-                    message = parse_loopback_message(raw_message)
-                    if isinstance(message, RealtimeConnectedMessage):
-                        if bind_realtime_call is None or realtime_call_bound:
-                            raise ValueError("realtime call binder is unavailable")
-                        try:
-                            await bind_realtime_call(session_id, message.provider_call_id)
-                        except Exception as exc:
-                            logger.error(
-                                "realtime sideband binding failed session_id=%s "
-                                "error_type=%s status_code=%s",
-                                session_id,
-                                type(exc).__name__,
-                                _safe_http_status(exc),
-                            )
-                            with contextlib.suppress(StaleControlMessage, TimeoutError):
-                                await controller.request_teardown(
-                                    session_id,
-                                    outcome=SessionOutcome.FAILED,
-                                    reason=StopReason.TRANSPORT_FAILURE,
-                                    error="sideband connection failed",
-                                )
-                            with contextlib.suppress(RuntimeError, WebSocketDisconnect):
-                                await websocket.close(code=1011)
-                            return
-                        realtime_call_bound = True
                     closed = await controller.process_control_message(session_id, raw_message)
-                except (StaleControlMessage, ValueError):
+                except (StaleControlMessage, ValueError) as exc:
+                    logger.warning(
+                        "control_message_rejected %s",
+                        json.dumps(
+                            {
+                                "session_id": session_id,
+                                "error_type": type(exc).__name__,
+                                "error": str(exc),
+                                "message_prefix": raw_message[:200],
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
                     with contextlib.suppress(RuntimeError, WebSocketDisconnect):
                         await websocket.close(code=4403)
                     return
@@ -264,13 +205,12 @@ def create_app(
     upstream_client: AsyncPostClient | None = None,
     broker: CapabilityBroker | None = None,
     controller: VoiceSessionController | None = None,
-    call_handle_registry: RealtimeCallHandleRegistry | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     broker = broker or CapabilityBroker()
     web_root = Path(__file__).resolve().parent / "web"
     index_html = web_root / "index.html"
-    call_handle_registry = call_handle_registry or _InMemoryRealtimeCallHandleRegistry()
+
     web_assets = {
         "voice.css": "text/css",
         "voice.js": "text/javascript",
@@ -291,6 +231,8 @@ def create_app(
     )
 
     active_session_id: str | None = None
+    active_execution_scope: str | None = None
+    execution_results_by_call_id: dict[str, tuple[str, int, str]] = {}
     latest_session_attempt = 0
 
     def _is_loopback_client(request: Request) -> bool:
@@ -307,7 +249,6 @@ def create_app(
         return HTMLResponse(content=html.replace("</head>", marker + "</head>", 1))
 
     app = FastAPI(title="OpenAI Realtime Action Spike Gateway", version="0.1.0")
-    app.state.get_realtime_call_handle = call_handle_registry.get
 
     @app.get("/voice", include_in_schema=False)
     async def voice_page(activation: str | None = None) -> HTMLResponse:
@@ -348,25 +289,7 @@ def create_app(
             await websocket.close(code=4403)
             return
 
-        async def bind_realtime_call(local_session_id: str, provider_call_id: str) -> None:
-            api_key = settings.api_key_value()
-            if api_key is None:
-                raise ValueError("OPENAI_API_KEY is not configured")
-            try:
-                await _controller.start_realtime_sideband(
-                    local_session_id=local_session_id,
-                    call_id=provider_call_id,
-                    api_key=api_key,
-                )
-            except StaleControlMessage as exc:
-                raise ValueError("Local voice session is no longer active") from exc
-
-        await _relay_control_websocket(
-            websocket,
-            _controller,
-            session_id,
-            bind_realtime_call=bind_realtime_call,
-        )
+        await _relay_control_websocket(websocket, _controller, session_id)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -378,86 +301,99 @@ def create_app(
             "controller_status": _controller.status,
         }
 
-    @app.post("/client-secret")
-    async def create_client_secret(request: Request) -> Response:
+    @app.post("/execute")
+    async def execute_capability(
+        execution_request: ExecutionRequest,
+        request: Request,
+    ) -> Response:
         if not _is_loopback_client(request):
-            raise HTTPException(status_code=403, detail="Only local clients can create sessions")
+            raise HTTPException(status_code=403, detail="Only local clients can execute tools")
         if request.headers.get(LOCAL_CLIENT_HEADER) != LOCAL_CLIENT_HEADER_VALUE:
             raise HTTPException(status_code=403, detail="Invalid local voice client")
-        if settings.api_key_value() is None:
-            raise HTTPException(
-                status_code=503,
-                detail="OPENAI_API_KEY is not configured on the gateway",
-            )
-
-        local_session_id = request.headers.get(LOCAL_CONTROLLER_SESSION_HEADER)
-        if local_session_id is not None:
-            if _LOCAL_SESSION_ID_RE.fullmatch(local_session_id) is None:
-                raise HTTPException(status_code=400, detail="Invalid local session binding")
-            if _controller.active_session_id != local_session_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Local voice session is no longer active",
-                )
-
-        session = build_realtime_session(settings)
-        if local_session_id is None:
-            session = {
-                **session,
-                "instructions": (
-                    f"{session['instructions']}\n\n"
-                    "Manual diagnostic mode cannot execute tools or external actions. "
-                    "Respond conversationally and do not claim to perform actions."
-                ),
-                "tools": [],
-                "tool_choice": "none",
-            }
-
-        try:
-            upstream = await _post_client_secret(
-                settings=settings,
-                session=session,
-                upstream_client=upstream_client,
-            )
-        except httpx.HTTPError:
+        if (
+            active_execution_scope is None
+            or execution_request.scope != active_execution_scope
+            or active_session_id is None
+            or _controller.active_session_id != active_session_id
+        ):
             return JSONResponse(
-                status_code=502,
-                content={"detail": "OpenAI Realtime client secret request failed"},
-            )
-        if not upstream.is_success:
-            return JSONResponse(
-                status_code=502,
+                status_code=409,
                 content={
-                    "detail": "OpenAI Realtime client secret creation failed",
-                    "upstream_status": upstream.status_code,
+                    "ok": False,
+                    "call_id": execution_request.call_id,
+                    "error": {
+                        "type": "stale_session",
+                        "message": "Local Realtime execution scope is not current",
+                    },
+                },
+            )
+
+        fingerprint = _execution_fingerprint(execution_request)
+        cached = execution_results_by_call_id.get(execution_request.call_id)
+        if cached is not None:
+            cached_fingerprint, cached_status, cached_body = cached
+            if cached_fingerprint != fingerprint:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "ok": False,
+                        "call_id": execution_request.call_id,
+                        "error": {
+                            "type": "call_id_conflict",
+                            "message": "OpenAI call_id was reused with a different request",
+                        },
+                    },
+                )
+            return Response(
+                content=cached_body,
+                status_code=cached_status,
+                media_type="application/json",
+            )
+
+        if len(execution_results_by_call_id) >= MAX_OPENAI_CALLS_PER_SESSION:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "ok": False,
+                    "call_id": execution_request.call_id,
+                    "error": {
+                        "type": "session_call_limit_exceeded",
+                        "message": "Realtime session reached its execution safety limit",
+                    },
                 },
             )
 
         try:
-            payload = upstream.json()
-            value = payload["value"]
-            expires_at = payload["expires_at"]
-            if not isinstance(value, str) or not value.startswith("ek_"):
-                raise ValueError
-            if not isinstance(expires_at, int):
-                raise ValueError
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            return JSONResponse(
-                status_code=502,
-                content={"detail": "OpenAI returned an invalid client secret"},
-            )
-
-        return JSONResponse(
-            content={
-                "value": value,
-                "expires_at": expires_at,
-                "session": session,
+            result = broker.execute(execution_request.name, execution_request.arguments)
+        except UnknownCapabilityError as exc:
+            status_code = 400
+            body = {
+                "ok": False,
+                "call_id": execution_request.call_id,
+                "error": {"type": "unknown_capability", "message": str(exc)},
             }
+        except ExecutionContractError as exc:
+            status_code = 400
+            body = {
+                "ok": False,
+                "call_id": execution_request.call_id,
+                "error": {"type": "invalid_arguments", "message": str(exc)},
+            }
+        else:
+            status_code = 200
+            body = {"call_id": execution_request.call_id, **result}
+
+        body_json = json.dumps(body, separators=(",", ":"))
+        execution_results_by_call_id[execution_request.call_id] = (
+            fingerprint,
+            status_code,
+            body_json,
         )
+        return Response(content=body_json, status_code=status_code, media_type="application/json")
 
     @app.post("/session")
     async def create_realtime_session(request: Request) -> Response:
-        nonlocal active_session_id, latest_session_attempt
+        nonlocal active_execution_scope, active_session_id, latest_session_attempt
         if settings.api_key_value() is None:
             raise HTTPException(
                 status_code=503,
@@ -478,9 +414,8 @@ def create_app(
             raise HTTPException(status_code=400, detail="Conflicting local session bindings")
 
         if query_session_id is not None:
-            authorization = request.headers.get("authorization", "")
-            if not authorization.startswith("Bearer ek_"):
-                raise HTTPException(status_code=403, detail="Invalid Realtime client credential")
+            if request.headers.get(LOCAL_CLIENT_HEADER) != LOCAL_CLIENT_HEADER_VALUE:
+                raise HTTPException(status_code=403, detail="Invalid local voice client")
             if _LOCAL_SESSION_ID_RE.fullmatch(query_session_id) is None:
                 raise HTTPException(status_code=400, detail="Invalid local session binding")
             if _controller.active_session_id != query_session_id:
@@ -536,48 +471,17 @@ def create_app(
                 },
             )
 
-        try:
-            handle = parse_realtime_call_handle(
-                location=upstream.headers.get("Location"),
-                headers=upstream.headers,
-                sdp_answer=upstream.text,
-            )
-        except RealtimeCallHandleParseError:
-            return JSONResponse(
-                status_code=502,
-                content={
-                    "detail": "OpenAI Realtime session creation failed",
-                },
-            )
-
-        if local_session_id is not None:
-            api_key = settings.api_key_value()
-            assert api_key is not None
-            try:
-                await _controller.start_realtime_sideband(
-                    local_session_id=local_session_id,
-                    call_id=handle.call_id,
-                    api_key=api_key,
-                )
-            except StaleControlMessage:
-                return JSONResponse(
-                    status_code=409,
-                    content={"detail": "Local voice session is no longer active"},
-                )
-            except Exception:
-                return JSONResponse(
-                    status_code=502,
-                    content={"detail": "OpenAI Realtime sideband connection failed"},
-                )
-
         active_session_id = local_session_id or secrets.token_urlsafe(24)
-        call_handle_registry.clear()
-        call_handle_registry.set(active_session_id, handle)
+        active_execution_scope = secrets.token_urlsafe(24) if local_session_id is not None else None
+        execution_results_by_call_id.clear()
 
+        headers = {OPENAI_REALTIME_SESSION_HEADER: active_session_id}
+        if active_execution_scope is not None:
+            headers[LOCAL_EXECUTION_SCOPE_HEADER] = active_execution_scope
         return Response(
-            content=handle.sdp_answer,
+            content=upstream.text,
             media_type="application/sdp",
-            headers={OPENAI_REALTIME_SESSION_HEADER: active_session_id},
+            headers=headers,
         )
 
     return app

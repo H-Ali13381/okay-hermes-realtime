@@ -15,12 +15,15 @@ class TimingName(StrEnum):
     NEXT_RESPONSE_FIRST_AUDIO = "next_response_first_audio"
     LISTENING_RESTORED = "listening_restored"
     PEER_CONNECTION_STATE = "peer_connection_state"
+    ICE_CONNECTION_STATE = "ice_connection_state"
+    ICE_GATHERING_STATE = "ice_gathering_state"
     DATA_CHANNEL_STATE = "data_channel_state"
     SDP_OFFER_CREATED = "sdp_offer_created"
     SDP_ANSWER_APPLIED = "sdp_answer_applied"
     TRANSPORT_FAILURE = "transport_failure"
     REALTIME_RESPONSE_DONE = "realtime_response_done"
     REALTIME_ERROR = "realtime_error"
+    PAGE_ERROR = "page_error"
 
 
 class StopReason(StrEnum):
@@ -39,7 +42,7 @@ class SessionOutcome(StrEnum):
 
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,128}$")
-_PROVIDER_CALL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
+
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PROVIDER_RESPONSE_ID_RE = re.compile(r"^[A-Za-z0-9._~-]{1,256}$")
 _SECRET_KEY_NAMES = {
@@ -49,7 +52,6 @@ _SECRET_KEY_NAMES = {
     "token",
     "password",
     "secret",
-    "sideband_url",
     "call_id",
 }
 
@@ -114,24 +116,6 @@ class PageStartedMessage(_StrictBaseModel):
         return _validate_session_id(value)
 
 
-class RealtimeConnectedMessage(_StrictBaseModel):
-    type: Literal["realtime_connected"] = "realtime_connected"
-    session_id: str
-    provider_call_id: str
-
-    @field_validator("session_id")
-    @classmethod
-    def _validate_session_id(cls, value: str) -> str:
-        return _validate_session_id(value)
-
-    @field_validator("provider_call_id")
-    @classmethod
-    def _validate_provider_call_id(cls, value: str) -> str:
-        if _PROVIDER_CALL_ID_RE.fullmatch(value) is None:
-            raise ValueError("provider_call_id must be a bounded opaque identifier")
-        return value
-
-
 class TimingMessage(_StrictBaseModel):
     type: Literal["timing"] = "timing"
     session_id: str
@@ -146,14 +130,18 @@ class TimingMessage(_StrictBaseModel):
 
     @field_validator("monotonic_ms", mode="before")
     @classmethod
-    def _validate_monotonic_ms(cls, value: float) -> float:
-        if not isinstance(value, float):
-            raise ValueError("monotonic_ms must be a float")
-        if not math.isfinite(value):
+    def _validate_monotonic_ms(cls, value: float | int) -> float:
+        # JSON cannot distinguish 360 from 360.0 — the browser's
+        # Number(x.toFixed(2)) serializes whole values as integers. Accept
+        # ints and coerce; bools and other types are still rejected.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("monotonic_ms must be a number")
+        coerced = float(value)
+        if not math.isfinite(coerced):
             raise ValueError("monotonic_ms must be finite")
-        if value < 0.0:
+        if coerced < 0.0:
             raise ValueError("monotonic_ms must be >= 0")
-        return value
+        return coerced
 
     @field_validator("name", mode="before")
     @classmethod
@@ -198,36 +186,16 @@ class SessionClosedMessage(_StrictBaseModel):
         return _validate_session_id(value)
 
 
-class ActionStateMessage(_StrictBaseModel):
-    type: Literal["action_state"] = "action_state"
-    session_id: str
-    capability: str = Field(pattern=r"^[a-z][a-z0-9_]{0,127}$")
-    state: Literal["running", "completed", "failed", "closing"]
-    message: str | None = Field(default=None, min_length=1, max_length=240)
-
-    @field_validator("session_id")
-    @classmethod
-    def _validate_session_id(cls, value: str) -> str:
-        return _validate_session_id(value)
-
-    @field_validator("message")
-    @classmethod
-    def _validate_message(cls, value: str | None) -> str | None:
-        if value is not None and any(ord(character) < 32 for character in value):
-            raise ValueError("action message must not contain control characters")
-        return value
-
-
 LoopbackMessage = Annotated[
     ActivationMessage
     | PageReadyMessage
     | PageStartedMessage
-    | RealtimeConnectedMessage
+
     | TimingMessage
     | StopMessage
     | TeardownCompleteMessage
     | SessionClosedMessage
-    | ActionStateMessage,
+    ,
     Field(discriminator="type"),
 ]
 
@@ -327,6 +295,52 @@ def _validate_timing_message_data(name: TimingName, data: dict[str, Any]) -> Non
             raise ValueError("invalid peer_connection_state state")
         if not isinstance(data["state"], str):
             raise ValueError("state must be a string")
+        return
+
+    if name == TimingName.ICE_CONNECTION_STATE:
+        provided = set(data.keys())
+        if unknown := provided - {"state"}:
+            raise ValueError(f"unexpected timing data keys: {sorted(unknown)}")
+        if "state" not in data:
+            raise ValueError("state is required")
+        if data["state"] not in {
+            "new",
+            "checking",
+            "connected",
+            "completed",
+            "failed",
+            "disconnected",
+            "closed",
+        }:
+            raise ValueError("invalid ice_connection_state state")
+        if not isinstance(data["state"], str):
+            raise ValueError("state must be a string")
+        return
+
+    if name == TimingName.ICE_GATHERING_STATE:
+        provided = set(data.keys())
+        if unknown := provided - {"state"}:
+            raise ValueError(f"unexpected timing data keys: {sorted(unknown)}")
+        if "state" not in data:
+            raise ValueError("state is required")
+        if data["state"] not in {"new", "gathering", "complete"}:
+            raise ValueError("invalid ice_gathering_state state")
+        if not isinstance(data["state"], str):
+            raise ValueError("state must be a string")
+        return
+
+    if name == TimingName.PAGE_ERROR:
+        provided = set(data.keys())
+        if unknown := provided - {"kind", "message"}:
+            raise ValueError(f"unexpected timing data keys: {sorted(unknown)}")
+        if "kind" not in data or "message" not in data:
+            raise ValueError("kind and message are required")
+        if data["kind"] not in {"error", "unhandledrejection"}:
+            raise ValueError("invalid page_error kind")
+        if not isinstance(data["message"], str):
+            raise ValueError("message must be a string")
+        if len(data["message"]) > 512:
+            raise ValueError("message is too long")
         return
 
     if name == TimingName.DATA_CHANNEL_STATE:

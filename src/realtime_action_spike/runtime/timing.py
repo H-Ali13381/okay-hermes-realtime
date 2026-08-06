@@ -33,7 +33,6 @@ _CORRELATION_KEYS: frozenset[str] = frozenset(
     {
         "local_session_id",
         "openai_request_id",
-        "provider_call_id",
         "event_id",
         "item_id",
         "peer_connection_state",

@@ -1,6 +1,6 @@
 # OpenAI Realtime Voice Replacement — Stage 1 status
 
-Status is synchronized to `feature/webrtc-wakeword-replacement` on 2026-07-22. A checked item is implemented and verified on this branch.
+This is a historical Stage 1 ledger synchronized on 2026-07-22. Tasks 8–10 were implemented and verified, then intentionally superseded by the approved direct-WebRTC lifecycle simplification on 2026-07-23.
 
 ## Completed and integrated
 
@@ -8,12 +8,12 @@ Status is synchronized to `feature/webrtc-wakeword-replacement` on 2026-07-22. A
   - Isolated app profile, actual Brave executable ownership, bounded main-PID TERM and owned-group KILL fallback.
 - [x] **Task 7 — Native activation bridge**
   - Native listener activation socket, one active session, wake pause/rearm.
-- [x] **Task 8 — Preserve the OpenAI call handle**
-  - Exact local/provider session binding without exposing provider identifiers to the page.
-- [x] **Task 9 — OpenAI sideband connection**
-  - Server-owned sideband events, stale-session rejection, concurrent-shutdown cleanup.
-- [x] **Task 10 — Move tool execution to sideband**
-  - Bounded parser, controller-owned allowlisted execution, canonical deduplication, resumable output delivery, safe page action state.
+- [x] **Task 8 — Preserve the OpenAI call handle (superseded)**
+  - Removed when direct SDP forwarding made provider call IDs unnecessary.
+- [x] **Task 9 — OpenAI sideband connection (superseded)**
+  - Removed in favor of one browser-owned WebRTC transport.
+- [x] **Task 10 — Move tool execution to sideband (superseded)**
+  - Replaced by the browser data channel relaying calls to the scoped local `/execute` broker.
 - [x] **Task 11 — Interruption timeline**
   - Speech, suppression, cancellation, truncation, listening restoration, and next-response timing.
 - [x] **Task 12 — Residual playback suppression**

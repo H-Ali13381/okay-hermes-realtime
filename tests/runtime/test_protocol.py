@@ -6,12 +6,10 @@ import pytest
 from pydantic import ValidationError
 
 from realtime_action_spike.runtime.protocol import (
-    ActionStateMessage,
     ActivationMessage,
     LoopbackMessage,
     PageReadyMessage,
     PageStartedMessage,
-    RealtimeConnectedMessage,
     SessionClosedMessage,
     SessionOutcome,
     StopMessage,
@@ -49,11 +47,7 @@ def test_valid_session_bound_messages_round_trip() -> None:
     messages: list[LoopbackMessage] = [
         PageReadyMessage(type="page_ready", session_id=session_id),
         PageStartedMessage(type="page_started", session_id=session_id),
-        RealtimeConnectedMessage(
-            type="realtime_connected",
-            session_id=session_id,
-            provider_call_id="call_provider_01",
-        ),
+
         TimingMessage(
             type="timing",
             session_id=session_id,
@@ -68,56 +62,12 @@ def test_valid_session_bound_messages_round_trip() -> None:
             session_id=session_id,
             outcome=SessionOutcome.COMPLETED,
         ),
-        ActionStateMessage(
-            type="action_state",
-            session_id=session_id,
-            capability="assistant_get_current_time",
-            state="completed",
-            message="Current time retrieved",
-        ),
+
     ]
 
     for message in messages:
         assert parse_loopback_message(encode_loopback_message(message)) == message
 
-
-@pytest.mark.parametrize(
-    "provider_call_id",
-    ["", "call id", "https://api.openai.com/v1/realtime/calls/call_01", "call_01\nsecret"],
-)
-def test_realtime_connected_rejects_malformed_provider_call_id(
-    provider_call_id: str,
-) -> None:
-    with pytest.raises(ValidationError):
-        parse_loopback_message(
-            {
-                "type": "realtime_connected",
-                "session_id": "local-session-01",
-                "provider_call_id": provider_call_id,
-            }
-        )
-
-
-@pytest.mark.parametrize(
-    "extra",
-    [
-        {"call_id": "call_provider_secret"},
-        {"arguments": {"timezone": "UTC"}},
-        {"api_key": "secret"},
-        {"result": {"iso_time": "2026-07-21T22:00:00Z"}},
-    ],
-)
-def test_action_state_rejects_provider_and_execution_material(extra: dict[str, object]) -> None:
-    payload: dict[str, object] = {
-        "type": "action_state",
-        "session_id": "local-session-01",
-        "capability": "assistant_get_current_time",
-        "state": "completed",
-        **extra,
-    }
-
-    with pytest.raises(ValidationError):
-        parse_loopback_message(payload)
 
 
 def test_parse_accepts_bytes_and_string_payloads() -> None:
@@ -216,16 +166,67 @@ def test_strict_no_coercion_for_probability_detected_at_and_native_listener() ->
             }
         )
 
+
+def test_monotonic_ms_accepts_integer_json_values() -> None:
+    """Regression test for the silent-session failure family.
+
+    The browser computes Number(performance.now().toFixed(2)), which JSON
+    serializes as an integer whenever the value is whole (e.g. 360 not
+    360.0). Strict float validation rejected those messages, the gateway
+    closed the control socket, and the session died at the startup deadline
+    with zero browser traces — the exact production failure observed at
+    20:29 (monotonic_ms=360 rejected from sdp_offer_created).
+    """
+    message = parse_loopback_message(
+        {
+            "type": "timing",
+            "session_id": "local-session-01",
+            "name": TimingName.PLAYBACK_SUPPRESSED.value,
+            "monotonic_ms": 360,
+            "data": {"suppressed": True},
+        }
+    )
+    assert isinstance(message, TimingMessage)
+    assert message.monotonic_ms == 360.0
+
+    # Bools and non-numbers are still rejected.
     with pytest.raises((ValidationError, TypeError)):
         parse_loopback_message(
             {
                 "type": "timing",
                 "session_id": "local-session-01",
                 "name": TimingName.PLAYBACK_SUPPRESSED.value,
-                "monotonic_ms": 1,
+                "monotonic_ms": True,
                 "data": {"suppressed": True},
             }
         )
+    with pytest.raises((ValidationError, TypeError)):
+        parse_loopback_message(
+            {
+                "type": "timing",
+                "session_id": "local-session-01",
+                "name": TimingName.PLAYBACK_SUPPRESSED.value,
+                "monotonic_ms": "360.0",
+                "data": {"suppressed": True},
+            }
+        )
+
+
+def test_browser_emitted_timing_shapes_round_trip() -> None:
+    """Every timing name the browser emits must carry the data the protocol
+    requires — the controlTimingData allowlist and the protocol validators
+    must not drift apart. Regression for ice_gathering_state being emitted
+    with data={} and rejected on first use."""
+    base = {"type": "timing", "session_id": "local-session-01", "monotonic_ms": 10.0}
+    for name, data in (
+        ("peer_connection_state", {"state": "connecting"}),
+        ("ice_connection_state", {"state": "checking"}),
+        ("ice_gathering_state", {"state": "gathering"}),
+        ("data_channel_state", {"state": "open"}),
+        ("page_error", {"kind": "error", "message": "boom"}),
+    ):
+        message = parse_loopback_message({**base, "name": name, "data": data})
+        assert isinstance(message, TimingMessage)
 
 
 @pytest.mark.parametrize(
@@ -390,6 +391,122 @@ def test_timing_name_keys_are_narrow_and_required() -> None:
                 "name": TimingName.TRANSPORT_FAILURE.value,
                 "monotonic_ms": 10.0,
                 "data": {"state": "bad"},
+            }
+        )
+
+
+def test_ice_connection_state_timing_schema() -> None:
+    """The browser emits ice_connection_state so a stalled WebRTC session can be
+    diagnosed from the persisted trace instead of guessed at."""
+    base_session_id = "local-session-01"
+
+    for state in ("new", "checking", "connected", "completed", "failed", "disconnected", "closed"):
+        message = parse_loopback_message(
+            {
+                "type": "timing",
+                "session_id": base_session_id,
+                "name": "ice_connection_state",
+                "monotonic_ms": 10.0,
+                "data": {"state": state},
+            }
+        )
+        assert isinstance(message, TimingMessage)
+
+    with pytest.raises((ValidationError, ValueError)):
+        parse_loopback_message(
+            {
+                "type": "timing",
+                "session_id": base_session_id,
+                "name": "ice_connection_state",
+                "monotonic_ms": 10.0,
+                "data": {"state": "connected", "extra": "nope"},
+            }
+        )
+
+    with pytest.raises((ValidationError, ValueError)):
+        parse_loopback_message(
+            {
+                "type": "timing",
+                "session_id": base_session_id,
+                "name": "ice_connection_state",
+                "monotonic_ms": 10.0,
+                "data": {"state": "bogus"},
+            }
+        )
+
+
+def test_ice_gathering_state_timing_schema() -> None:
+    base_session_id = "local-session-01"
+
+    for state in ("new", "gathering", "complete"):
+        message = parse_loopback_message(
+            {
+                "type": "timing",
+                "session_id": base_session_id,
+                "name": "ice_gathering_state",
+                "monotonic_ms": 10.0,
+                "data": {"state": state},
+            }
+        )
+        assert isinstance(message, TimingMessage)
+
+    with pytest.raises((ValidationError, ValueError)):
+        parse_loopback_message(
+            {
+                "type": "timing",
+                "session_id": base_session_id,
+                "name": "ice_gathering_state",
+                "monotonic_ms": 10.0,
+                "data": {"state": "bogus"},
+            }
+        )
+
+
+def test_page_error_timing_schema() -> None:
+    base_session_id = "local-session-01"
+
+    for kind in ("error", "unhandledrejection"):
+        message = parse_loopback_message(
+            {
+                "type": "timing",
+                "session_id": base_session_id,
+                "name": "page_error",
+                "monotonic_ms": 10.0,
+                "data": {"kind": kind, "message": "boom"},
+            }
+        )
+        assert isinstance(message, TimingMessage)
+
+    with pytest.raises((ValidationError, ValueError)):
+        parse_loopback_message(
+            {
+                "type": "timing",
+                "session_id": base_session_id,
+                "name": "page_error",
+                "monotonic_ms": 10.0,
+                "data": {"kind": "bogus", "message": "boom"},
+            }
+        )
+
+    with pytest.raises((ValidationError, ValueError)):
+        parse_loopback_message(
+            {
+                "type": "timing",
+                "session_id": base_session_id,
+                "name": "page_error",
+                "monotonic_ms": 10.0,
+                "data": {"kind": "error", "message": "x" * 513},
+            }
+        )
+
+    with pytest.raises((ValidationError, ValueError)):
+        parse_loopback_message(
+            {
+                "type": "timing",
+                "session_id": base_session_id,
+                "name": "page_error",
+                "monotonic_ms": 10.0,
+                "data": {"kind": "error", "message": "boom", "extra": "nope"},
             }
         )
 

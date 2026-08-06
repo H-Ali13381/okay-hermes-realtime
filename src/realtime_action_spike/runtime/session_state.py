@@ -37,6 +37,7 @@ class SessionState:
         SessionPhase.IDLE: {SessionPhase.LAUNCHING},
         SessionPhase.LAUNCHING: {
             SessionPhase.CONNECTING,
+            SessionPhase.LIVE,
             SessionPhase.STOPPING,
             SessionPhase.FAILED,
         },

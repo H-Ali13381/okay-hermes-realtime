@@ -14,6 +14,8 @@ from realtime_action_spike.capabilities import (
 EXPECTED_CAPABILITIES = {
     "assistant_get_current_time",
     "voice_end_session",
+    "handoff_to_heavy_agent",
+    "check_heavy_agent_task",
 }
 
 
@@ -21,11 +23,11 @@ def fixed_now(_timezone) -> datetime:
     return datetime.fromisoformat("2026-07-17T15:04:05+00:00")
 
 
-def test_tool_catalog_exposes_only_stage1_capabilities() -> None:
+def test_tool_catalog_exposes_all_capabilities() -> None:
     tools = build_openai_tools()
 
     assert {tool["name"] for tool in tools} == EXPECTED_CAPABILITIES
-    assert len(tools) == 2
+    assert len(tools) == 4
     assert all(tool["type"] == "function" for tool in tools)
     assert all(tool["description"].strip() for tool in tools)
     assert all(tool["parameters"]["type"] == "object" for tool in tools)

@@ -1,6 +1,6 @@
 # Okay Hermes Realtime — Stage 1 replacement candidate
 
-An OpenAI-specific, independently installable replacement candidate for [Okay Hermes Voice (OHV)](https://github.com/H-Ali13381/okay-hermes-voice). A native wake listener and tray launch a dedicated Brave app window; OpenAI's maintained `OpenAIRealtimeWebRTC` transport owns microphone, model audio, interruption, and response sequencing while the local controller owns session scope, sideband tools, authorization, traces, and teardown.
+An OpenAI-specific, independently installable replacement candidate for [Okay Hermes Voice (OHV)](https://github.com/H-Ali13381/okay-hermes-voice). A native wake listener and tray launch a dedicated Brave app window; the page owns one direct WebRTC conversation while the local controller owns session scope, allowlisted tool authorization, traces, and teardown.
 
 This branch does not modify or reuse the OHV runtime. It has separate units, binaries, config, state, browser profile, and installer paths.
 
@@ -9,11 +9,10 @@ This branch does not modify or reuse the OHV runtime. It has separate units, bin
 ```text
 native wake listener ──activation socket──> local controller
        ▲                                      │
-       │ pause/rearm                          ├─ OpenAI Realtime sideband
-       │                                      ├─ allowlisted tool execution
-replacement tray                              └─ dedicated Brave app process
-                                                       │
-                                                WebRTC mic + audio
+       │ pause/rearm                          ├─ scoped /execute broker
+       │                                      └─ dedicated Brave app process
+replacement tray                                      │
+                                               WebRTC + oai-events
                                                        │
                                               OpenAI Realtime call
 ```
@@ -28,9 +27,9 @@ Implemented and exercised:
 - native Qt tray with Turn ON, Turn OFF, Open Voice Page, status, and diagnostics;
 - dedicated Brave app profile and real microphone capture;
 - OpenAI `gpt-realtime-2.1-mini` WebRTC conversation;
-- server-side OpenAI sideband connection bound from the SDK's authenticated call ID;
-- controller-owned `assistant_get_current_time` and `voice_end_session` execution;
-- SDK-owned interruption handling with passive browser/provider diagnostics;
+- browser-owned direct `RTCPeerConnection` and `oai-events` data channel;
+- session-scoped controller-owned `assistant_get_current_time` and `voice_end_session` execution;
+- provider-owned interruption handling with passive browser diagnostics;
 - bounded, idempotent teardown and wake rearm;
 - deterministic lifecycle, race, replay, failure, and installer tests.
 
@@ -110,8 +109,8 @@ The installer refuses collisions unless `--force` is explicit and records replac
 ## Security boundary
 
 - `OPENAI_API_KEY` remains in the mode-0600 server config and never enters browser JavaScript.
-- The page receives a short-lived OpenAI `ek_...` client secret and the SDK's call ID. The standard API key never enters browser JavaScript, and the call ID is sent only over the activation-authenticated loopback control socket.
-- The controller validates session IDs, sideband events, function names, and bounded JSON arguments.
+- The server posts browser SDP to OpenAI; no OpenAI credential or provider call ID enters browser JavaScript.
+- A bound local session receives a short-lived opaque execution scope. The controller validates that scope, function names, bounded JSON arguments, and call-ID replay consistency.
 - Tool execution is allowlisted; model-generated shell/code is never evaluated.
 - Late/stale events and changed-payload call-ID reuse are rejected.
 - The gateway binds to loopback only.
@@ -120,7 +119,7 @@ The installer refuses collisions unless `--force` is explicit and records replac
 
 The current diagnostics include:
 
-- SDK connection-state changes;
+- direct WebRTC connection-state changes;
 - response completion status and output types;
 - structured Realtime error type, code, and bounded message;
 - browser-observed time from speech start to provider cancellation, output-buffer clear, and next response audio in the visible diagnostics panel.

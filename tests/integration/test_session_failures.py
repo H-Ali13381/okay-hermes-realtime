@@ -9,7 +9,6 @@ import pytest
 from realtime_action_spike.capabilities import CapabilityBroker
 from realtime_action_spike.runtime.controller import StaleControlMessage, VoiceSessionController
 from realtime_action_spike.runtime.protocol import (
-    ActionStateMessage,
     PageReadyMessage,
     PageStartedMessage,
     SessionOutcome,
@@ -23,7 +22,6 @@ from realtime_action_spike.runtime.protocol import (
 from realtime_action_spike.runtime.tokens import LaunchTokenStore
 from tests.fakes.fake_activation_client import ActivationTranscript, FakeActivationClient
 from tests.fakes.fake_browser import FakeBrowserLauncher
-from tests.fakes.fake_sideband import FakeSidebandConnector, FakeSidebandWebSocket
 
 
 class SequenceFactory:
@@ -112,30 +110,6 @@ async def test_browser_crash_releases_activation_and_returns_idle() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sideband_loss_releases_activation_and_returns_idle() -> None:
-    launcher = FakeBrowserLauncher()
-    controller = make_controller(launcher, "local-sideband-loss-01")
-    _, activation_task, session_id, _ = await open_client(controller)
-    await mark_live(controller, session_id)
-    websocket = FakeSidebandWebSocket()
-    await controller.start_realtime_sideband(
-        local_session_id=session_id,
-        call_id="call-sideband-loss",
-        api_key="server-secret",
-        websocket_connect=FakeSidebandConnector(websocket),
-    )
-
-    websocket.push(RuntimeError("injected provider disconnect secret-value"))
-    transcript = await asyncio.wait_for(activation_task, timeout=0.3)
-
-    assert transcript.terminal is not None
-    assert transcript.terminal.outcome is SessionOutcome.FAILED
-    assert transcript.terminal.error == "sideband connection failed"
-    assert controller.status == "idle"
-    assert websocket.closed
-
-
-@pytest.mark.asyncio
 async def test_setup_timeout_uses_shared_teardown_and_returns_idle() -> None:
     launcher = FakeBrowserLauncher()
     controller = make_controller(launcher, "local-setup-timeout-01")
@@ -165,40 +139,6 @@ async def test_setup_timeout_uses_shared_teardown_and_returns_idle() -> None:
     assert transcript.terminal is not None
     assert transcript.terminal.outcome is SessionOutcome.TIMED_OUT
     assert controller.status == "idle"
-
-
-@pytest.mark.asyncio
-async def test_close_phrase_farewell_timeout_converges_on_shared_teardown() -> None:
-    launcher = FakeBrowserLauncher()
-    controller = make_controller(
-        launcher,
-        "local-close-phrase-01",
-        broker=EndSessionBroker(),
-    )
-    _, activation_task, session_id, _ = await open_client(controller)
-    websocket = FakeSidebandWebSocket()
-    await controller.start_realtime_sideband(
-        local_session_id=session_id,
-        call_id="call-close-phrase",
-        api_key="server-secret",
-        websocket_connect=FakeSidebandConnector(websocket),
-    )
-
-    await controller.process_sideband_event(
-        session_id,
-        {
-            "type": "response.function_call_arguments.done",
-            "call_id": "call-end-session",
-            "name": "voice_end_session",
-            "arguments": "{}",
-        },
-    )
-    transcript = await asyncio.wait_for(activation_task, timeout=0.3)
-
-    assert transcript.terminal is not None
-    assert transcript.terminal.outcome is SessionOutcome.COMPLETED
-    assert controller.status == "idle"
-    assert websocket.closed
 
 
 @pytest.mark.asyncio
@@ -253,26 +193,6 @@ async def test_busy_replay_stale_events_and_repeated_cleanup_are_isolated() -> N
                 first_id,
                 encode_loopback_message(message),
             )
-    with pytest.raises(StaleControlMessage):
-        await controller.process_sideband_event(
-            first_id,
-            {
-                "type": "response.function_call_arguments.done",
-                "call_id": "call-stale",
-                "name": "assistant_get_current_time",
-                "arguments": "{}",
-            },
-        )
-    with pytest.raises(StaleControlMessage):
-        await controller.publish_action_state(
-            ActionStateMessage(
-                type="action_state",
-                session_id=first_id,
-                capability="assistant_get_current_time",
-                state="running",
-                message="stale",
-            )
-        )
 
     assert controller.active_session_id == "local-isolation-02"
     await controller.close_active_session()

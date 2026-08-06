@@ -17,7 +17,6 @@ from realtime_action_spike.runtime.controller import (
     VoiceSessionController,
 )
 from realtime_action_spike.runtime.protocol import (
-    ActionStateMessage,
     PageReadyMessage,
     PageStartedMessage,
     SessionClosedMessage,
@@ -493,6 +492,114 @@ async def test_page_started_cancels_browser_startup_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_page_started_before_page_ready_is_accepted_and_cancels_startup_timeout() -> None:
+    """The browser may observe session.updated before its page_ready handshake.
+
+    The Realtime session can acknowledge over the data channel before the
+    control websocket finishes its page_ready turn (e.g. fast reconnect, or
+    the provider answering session.updated ahead of the loopback handshake).
+    The controller must still accept page_started and cancel the startup
+    deadline; rejecting it would reintroduce the 20s "activation failed"
+    timeout family on an otherwise healthy session.
+    """
+    launcher = DeterministicLauncher()
+    controller = VoiceSessionController(
+        launcher,
+        token_store=LaunchTokenStore(
+            token_factory=SequenceFactory(["token-started-first"]),
+        ),
+        session_id_factory=SequenceFactory(["session-started-first"]),
+        browser_start_timeout_seconds=0.01,
+        browser_ack_timeout_seconds=0.01,
+        teardown_step_timeout_seconds=0.05,
+    )
+
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    assert activation.session_id is not None
+
+    # page_started arrives while the session is still in LAUNCHING (no page_ready).
+    await controller.process_control_message(
+        activation.session_id,
+        encode_loopback_message(
+            PageStartedMessage(type="page_started", session_id=activation.session_id)
+        ),
+    )
+
+    await asyncio.sleep(0.03)
+
+    assert controller.status == "live"
+    assert launcher.handles[0].closed_calls == 0
+    await controller.close_active_session()
+    assert controller.status == "idle"
+
+
+@pytest.mark.asyncio
+async def test_stuck_at_connecting_expires_as_timed_out_and_teardown_is_bounded() -> None:
+    """Regression replay of the observed stuck-at-connecting failure family.
+
+    Real trace pattern (e.g. Z2DkHx8cuaq0GAFyJA0odA): the browser connects the
+    control socket, sends page_ready, creates the SDP offer and applies the
+    answer, then the peer connection stalls at "connecting" — page_started
+    never arrives because session.updated is never acknowledged. The startup
+    deadline must expire the session as timed_out, teardown must complete in
+    bounded time even though the browser never acknowledges the stop, and the
+    controller must return to idle so the wakeword listener can re-arm.
+    """
+    launcher = DeterministicLauncher()
+    controller = VoiceSessionController(
+        launcher,
+        token_store=LaunchTokenStore(
+            token_factory=SequenceFactory(["token-stuck", "token-follow-up"]),
+        ),
+        session_id_factory=SequenceFactory(["session-stuck", "session-follow-up"]),
+        browser_start_timeout_seconds=0.02,
+        browser_ack_timeout_seconds=0.01,
+        teardown_step_timeout_seconds=0.02,
+    )
+
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    assert activation.session_id is not None
+
+    # Browser reaches CONNECTING (page_ready) and traces the observed events:
+    # SDP offer, answer, peer stuck at "connecting" — but never page_started.
+    await controller.process_control_message(
+        activation.session_id,
+        encode_loopback_message(
+            PageReadyMessage(type="page_ready", session_id=activation.session_id)
+        ),
+    )
+    for name, data in (
+        (TimingName.PEER_CONNECTION_STATE, {"state": "connecting"}),
+    ):
+        await controller.process_control_message(
+            activation.session_id,
+            encode_loopback_message(
+                TimingMessage(
+                    type="timing",
+                    session_id=activation.session_id,
+                    name=name,
+                    monotonic_ms=1.0,
+                    data=data,
+                )
+            ),
+        )
+
+    terminal = await asyncio.wait_for(
+        controller.wait_for_terminal_result(activation.session_id),
+        timeout=2.0,
+    )
+
+    assert terminal.outcome == SessionOutcome.TIMED_OUT
+    assert controller.status == "idle"
+    assert launcher.handles[0].closed_calls >= 1
+
+    # The session slot must be free for the next wake activation.
+    follow_up = await controller.activate("http://127.0.0.1:8765/voice")
+    assert follow_up.status == "opened"
+    await controller.close_active_session()
+
+
+@pytest.mark.asyncio
 async def test_launch_failure_resolves_terminal_result_and_releases_slot() -> None:
     launcher = FailingLauncher(RuntimeError("launch failed"))
     controller = VoiceSessionController(
@@ -694,40 +801,6 @@ async def test_controller_retains_completed_session_interruption_traces() -> Non
 
 
 @pytest.mark.asyncio
-async def test_action_state_queue_is_fifo_and_exact_session_scoped() -> None:
-    controller = VoiceSessionController(
-        DeterministicLauncher(),
-        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-actions"])),
-        session_id_factory=SequenceFactory(["local-actions-01"]),
-    )
-    activation = await controller.activate("http://127.0.0.1:8765/voice")
-    assert activation.session_id == "local-actions-01"
-    running = ActionStateMessage(
-        type="action_state",
-        session_id="local-actions-01",
-        capability="assistant_get_current_time",
-        state="running",
-    )
-    completed = ActionStateMessage(
-        type="action_state",
-        session_id="local-actions-01",
-        capability="assistant_get_current_time",
-        state="completed",
-        message="Current time retrieved",
-    )
-
-    await controller.publish_action_state(running)
-    await controller.publish_action_state(completed)
-
-    assert await controller.wait_for_outbound_message("local-actions-01") == running
-    assert await controller.wait_for_outbound_message("local-actions-01") == completed
-    with pytest.raises(StaleControlMessage):
-        await controller.publish_action_state(
-            completed.model_copy(update={"session_id": "local-stale-02"})
-        )
-
-
-@pytest.mark.asyncio
 async def test_server_teardown_requests_browser_stop_then_waits_for_ack() -> None:
     launcher = DeterministicLauncher()
     controller = VoiceSessionController(
@@ -748,7 +821,7 @@ async def test_server_teardown_requests_browser_stop_then_waits_for_ack() -> Non
             session_id,
             outcome=SessionOutcome.FAILED,
             reason=StopReason.TRANSPORT_FAILURE,
-            error="sideband connection failed",
+            error="transport failed",
         )
     )
     outbound = await asyncio.wait_for(
@@ -779,7 +852,7 @@ async def test_server_teardown_requests_browser_stop_then_waits_for_ack() -> Non
     assert result == TerminalSessionResult(
         session_id=session_id,
         outcome=SessionOutcome.FAILED,
-        error="sideband connection failed",
+        error="transport failed",
     )
     assert launcher.handles[0].closed_calls == 1
     assert controller.status == "idle"
@@ -866,36 +939,6 @@ async def test_missing_browser_ack_is_bounded_and_persists_final_trace_atomicall
     assert trace_path.is_file()
     assert "teardown_requested" in trace_path.read_text(encoding="utf-8")
     assert not list(tmp_path.glob(f".{trace_path.name}.*.tmp"))
-
-
-@pytest.mark.asyncio
-async def test_stopping_session_rejects_new_sideband_tool_work() -> None:
-    controller = VoiceSessionController(
-        DeterministicLauncher(),
-        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-reject-work"])),
-        session_id_factory=SequenceFactory(["local-reject-work"]),
-        browser_ack_timeout_seconds=0.01,
-    )
-    activation = await controller.activate("http://127.0.0.1:8765/voice")
-    session_id = activation.session_id
-    assert session_id is not None
-
-    teardown = asyncio.create_task(
-        controller.request_teardown(
-            session_id,
-            outcome=SessionOutcome.CANCELLED,
-            reason=StopReason.NATIVE_CANCEL,
-        )
-    )
-    await asyncio.wait_for(controller.wait_for_outbound_message(session_id), 0.1)
-
-    with pytest.raises(StaleControlMessage, match="stopping"):
-        await controller.process_sideband_event(
-            session_id,
-            {"type": "response.function_call_arguments.done"},
-        )
-
-    await teardown
 
 
 @pytest.mark.asyncio

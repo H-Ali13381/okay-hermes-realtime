@@ -6,24 +6,19 @@ import copy
 import json
 import logging
 import secrets
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from realtime_action_spike.capabilities import CapabilityBroker
-from realtime_action_spike.openai.events import FunctionCallEventParser
-from realtime_action_spike.openai.sideband import RealtimeSidebandClient, SidebandEvent
-from realtime_action_spike.openai.tool_loop import ToolActionState, ToolCall, TrustedToolLoop
 
 from .browser import BrowserHandle
 from .protocol import (
-    ActionStateMessage,
     LoopbackMessage,
     PageReadyMessage,
     PageStartedMessage,
-    RealtimeConnectedMessage,
     SessionClosedMessage,
     SessionOutcome,
     StopMessage,
@@ -46,20 +41,6 @@ from .tokens import LaunchTokenStore
 
 logger = logging.getLogger(__name__)
 
-
-def _safe_close_code(error: Exception) -> int | None:
-    """Extract a websocket close code from a sideband failure, if present."""
-
-    for attribute in ("code", "status_code"):
-        value = getattr(error, attribute, None)
-        if isinstance(value, int):
-            return value
-    for frame_attribute in ("rcvd", "sent"):
-        frame = getattr(error, frame_attribute, None)
-        code = getattr(frame, "code", None)
-        if isinstance(code, int):
-            return code
-    return None
 
 if TYPE_CHECKING:
     from realtime_action_spike.openai.interruption import (
@@ -149,13 +130,7 @@ class VoiceSessionController:
         self._terminal_futures: dict[str, asyncio.Future[TerminalSessionResult]] = {}
         self._terminal_results: dict[str, TerminalSessionResult] = {}
         self._last_closed_interruption_traces: tuple[InterruptionTrace, ...] = ()
-        self._sideband_clients: dict[str, RealtimeSidebandClient] = {}
-        self._function_call_parsers: dict[str, FunctionCallEventParser] = {}
-        self._tool_loops: dict[str, TrustedToolLoop] = {}
-        self._close_after_response: set[str] = set()
         self._outbound_messages: dict[str, asyncio.Queue[LoopbackMessage]] = {}
-        self._farewell_events: dict[str, asyncio.Event] = {}
-        self._farewell_tasks: dict[str, asyncio.Task[None]] = {}
         self._teardown_tasks: dict[str, asyncio.Task[TeardownReport]] = {}
 
     @property
@@ -217,7 +192,7 @@ class VoiceSessionController:
             self._notify_status()
             self._terminal_futures[session_id] = terminal_future
             self._outbound_messages[session_id] = asyncio.Queue(maxsize=64)
-            self._farewell_events[session_id] = asyncio.Event()
+
             self._last_closed_session_id = None
             self._last_closed_interruption_traces = ()
             try:
@@ -233,7 +208,7 @@ class VoiceSessionController:
                 )
                 self._active_session = None
                 self._outbound_messages.pop(session_id, None)
-                self._farewell_events.pop(session_id, None)
+
                 _transition(session, SessionPhase.FAILED)
                 self._notify_status()
                 self._terminal_futures.pop(session_id, None)
@@ -273,18 +248,6 @@ class VoiceSessionController:
             coordinator = self._begin_teardown_locked(session, request)
 
         await coordinator.run(request)
-
-    async def publish_action_state(self, message: ActionStateMessage) -> None:
-        """Queue a sanitized action-state message for the exact active page."""
-
-        async with self._lock:
-            active = self._require_active_session(message.session_id)
-            if active.state.phase is SessionPhase.STOPPING:
-                raise StaleControlMessage("session is stopping")
-            queue = self._outbound_messages[message.session_id]
-            if queue.full():
-                queue.get_nowait()
-            queue.put_nowait(message)
 
     async def wait_for_outbound_message(self, session_id: str) -> LoopbackMessage:
         """Wait for the next sanitized controller-to-page message."""
@@ -379,193 +342,6 @@ class VoiceSessionController:
             )
             return True
 
-    async def start_realtime_sideband(
-        self,
-        *,
-        local_session_id: str,
-        call_id: str,
-        api_key: str,
-        websocket_connect: Callable[[str, dict[str, str]], Any] | None = None,
-    ) -> None:
-        """Start a server-side sideband connection for the exact local session."""
-
-        async def on_event(event: SidebandEvent) -> None:
-            try:
-                await self.process_sideband_event(event.local_session_id, event.payload)
-            except StaleControlMessage:
-                await self._detach_sideband(event.local_session_id)
-            except Exception as error:  # pragma: no cover - defensive path
-                await self._handle_sideband_failure(event.local_session_id, error)
-
-        async def on_terminal_failure(local_session_id: str, error: Exception) -> None:
-            await self._handle_sideband_failure(local_session_id, error)
-
-        async def publish_tool_action(action: ToolActionState) -> None:
-            await self.publish_action_state(
-                ActionStateMessage(
-                    type="action_state",
-                    session_id=local_session_id,
-                    capability=action.capability,
-                    state=action.state,
-                    message=action.message,
-                )
-            )
-
-        sideband = RealtimeSidebandClient(
-            local_session_id=local_session_id,
-            call_id=call_id,
-            api_key=api_key,
-            on_event=on_event,
-            on_terminal_failure=on_terminal_failure,
-            websocket_connect=websocket_connect,
-        )
-        parser = FunctionCallEventParser()
-        tool_loop = TrustedToolLoop(
-            broker=self._capability_broker,
-            send_provider_event=lambda payload: self.send_sideband_event(
-                local_session_id,
-                payload,
-            ),
-            publish_action_state=publish_tool_action,
-        )
-
-        async with self._lock:
-            self._require_active_session(local_session_id)
-            previous_sideband = self._sideband_clients.pop(local_session_id, None)
-            self._sideband_clients[local_session_id] = sideband
-            self._function_call_parsers[local_session_id] = parser
-            self._tool_loops[local_session_id] = tool_loop
-            self._close_after_response.discard(local_session_id)
-
-        if previous_sideband is not None:
-            await previous_sideband.close()
-
-        try:
-            await sideband.connect()
-        except Exception:
-            async with self._lock:
-                current = self._sideband_clients.get(local_session_id)
-                if current is sideband:
-                    self._sideband_clients.pop(local_session_id, None)
-                    self._function_call_parsers.pop(local_session_id, None)
-                    self._tool_loops.pop(local_session_id, None)
-                    self._close_after_response.discard(local_session_id)
-            await sideband.close()
-            raise
-
-    async def process_sideband_event(
-        self,
-        local_session_id: str,
-        payload: Any,
-    ) -> None:
-        """Apply one sideband event for an exact local session."""
-
-        async with self._lock:
-            active = self._require_active_session(local_session_id)
-            if active.state.phase is SessionPhase.STOPPING:
-                raise StaleControlMessage("session is stopping")
-            if not isinstance(payload, dict):
-                raise TypeError("sideband event payload must be an object")
-            parser = self._function_call_parsers.get(local_session_id)
-            tool_loop = self._tool_loops.get(local_session_id)
-            if parser is None or tool_loop is None:
-                raise RuntimeError("sideband tool loop is not connected")
-
-        requests = parser.consume(payload)
-        for request in requests:
-            result = await tool_loop.handle(
-                ToolCall(
-                    call_id=request.call_id,
-                    name=request.name,
-                    arguments=dict(request.arguments),
-                )
-            )
-            if result.close_after_farewell:
-                async with self._lock:
-                    self._require_active_session(local_session_id)
-                    self._close_after_response.add(local_session_id)
-                    if local_session_id not in self._farewell_tasks:
-                        task = asyncio.create_task(
-                            self._wait_for_farewell(local_session_id),
-                            name=f"voice-farewell-{local_session_id}",
-                        )
-                        self._farewell_tasks[local_session_id] = task
-
-        if payload.get("type") == "response.done":
-            async with self._lock:
-                farewell_event = self._farewell_events.get(local_session_id)
-                if local_session_id not in self._close_after_response:
-                    farewell_event = None
-                if farewell_event is not None:
-                    farewell_event.set()
-
-    async def _wait_for_farewell(self, local_session_id: str) -> None:
-        async with self._lock:
-            farewell_event = self._farewell_events.get(local_session_id)
-        if farewell_event is None:
-            return
-
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(
-                farewell_event.wait(),
-                timeout=self._farewell_timeout_seconds,
-            )
-
-        try:
-            await self.request_teardown(
-                local_session_id,
-                outcome=SessionOutcome.COMPLETED,
-                reason=StopReason.MODEL_REQUEST,
-            )
-        except StaleControlMessage:
-            return
-
-    async def send_sideband_event(
-        self,
-        local_session_id: str,
-        payload: Mapping[str, Any],
-    ) -> None:
-        """Send one event through the authoritative sideband for the exact session."""
-
-        async with self._lock:
-            self._require_active_session(local_session_id)
-            sideband = self._sideband_clients.get(local_session_id)
-            if sideband is None:
-                raise RuntimeError("sideband is not connected")
-
-        await sideband.send_json(payload)
-
-    async def _handle_sideband_failure(self, local_session_id: str, _error: Exception) -> None:
-        logger.warning(
-            "sideband_failure %s",
-            json.dumps(
-                {
-                    "session_id": local_session_id,
-                    "error_type": type(_error).__name__,
-                    "status_code": _safe_close_code(_error),
-                }
-            ),
-        )
-        await self._detach_sideband(local_session_id)
-
-        active = self._active_session
-        if active is None or active.session_id != local_session_id:
-            return
-
-        await self.close_active_session(
-            outcome=SessionOutcome.FAILED,
-            error="sideband connection failed",
-        )
-
-    async def _detach_sideband(self, local_session_id: str) -> None:
-        sideband = self._sideband_clients.pop(local_session_id, None)
-        self._function_call_parsers.pop(local_session_id, None)
-        self._tool_loops.pop(local_session_id, None)
-        self._close_after_response.discard(local_session_id)
-        if sideband is None:
-            return
-        await sideband.close()
-
     def _build_teardown_coordinator(self, session: _WakeSession) -> TeardownCoordinator:
         async def mark_stopping(request: TeardownRequest) -> None:
             async with self._lock:
@@ -589,14 +365,6 @@ class VoiceSessionController:
                     data={"reason": message.reason.value},
                 )
 
-        async def close_sideband() -> None:
-            async with self._lock:
-                sideband = self._sideband_clients.pop(session.session_id, None)
-                self._function_call_parsers.pop(session.session_id, None)
-                self._tool_loops.pop(session.session_id, None)
-                self._close_after_response.discard(session.session_id)
-            if sideband is not None:
-                await sideband.close()
 
         async def close_browser() -> None:
             async with self._lock:
@@ -637,7 +405,6 @@ class VoiceSessionController:
             request: TeardownRequest,
             _failures: tuple[TeardownStepFailure, ...],
         ) -> None:
-            farewell_task: asyncio.Task[None] | None = None
             async with self._lock:
                 active = self._active_session
                 if active is not session:
@@ -656,11 +423,7 @@ class VoiceSessionController:
                 self._notify_status()
                 self._last_closed_session_id = session.session_id
                 self._outbound_messages.pop(session.session_id, None)
-                self._function_call_parsers.pop(session.session_id, None)
-                self._tool_loops.pop(session.session_id, None)
-                self._close_after_response.discard(session.session_id)
-                self._farewell_events.pop(session.session_id, None)
-                farewell_task = self._farewell_tasks.pop(session.session_id, None)
+
                 if session.startup_deadline is not None:
                     session.startup_deadline.cancel()
                     session.startup_deadline = None
@@ -671,15 +434,12 @@ class VoiceSessionController:
                     error=request.error,
                 )
 
-            current_task = asyncio.current_task()
-            if farewell_task is not None and farewell_task is not current_task:
-                farewell_task.cancel()
 
         return TeardownCoordinator(
             TeardownHooks(
                 mark_stopping=mark_stopping,
                 request_browser_stop=request_browser_stop,
-                close_sideband=close_sideband,
+
                 close_browser=close_browser,
                 persist_trace=persist_trace,
                 finalize=finalize,
@@ -787,9 +547,6 @@ class VoiceSessionController:
                 self._notify_status()
                 return None
 
-            if isinstance(message, RealtimeConnectedMessage):
-                active.trace.record("realtime_connected", source="browser", data={})
-                return None
 
             if isinstance(message, TimingMessage):
                 diagnostic_data = sanitize_timing_data(message.data)

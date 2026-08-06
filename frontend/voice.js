@@ -1,6 +1,6 @@
-import { OpenAIRealtimeWebRTC } from "@openai/agents-realtime";
-
 "use strict";
+
+import { canApplyRemoteAnswer } from "./peer-lifecycle.js";
 
 const startButton = document.getElementById("start-button");
 const stopButton = document.getElementById("stop-button");
@@ -29,14 +29,24 @@ if (activationToken) {
   history.replaceState(null, "", `${initialUrl.pathname}${initialUrl.search}${initialUrl.hash}`);
 }
 
-let realtimeTransport = null;
+let peerConnection = null;
+let dataChannel = null;
 let localStream = null;
+let executionScope = null;
+let disconnectAfterResponse = false;
+let farewellResponseId = null;
+let farewellFallbackTimer = null;
+let transportFailureTimer = null;
+const handledCallIds = new Set();
 let receivedExecutionCount = 0;
 let isStopping = false;
 let controllerSocket = null;
 let controllerSessionClosed = false;
 let stopMessageSent = false;
 let teardownCompleteSent = false;
+let pageStartedSent = false;
+let sessionReadyFallbackTimer = null;
+let activeMarkSessionReady = null;
 let interruptionStartedMs = null;
 let waitingForNextAudio = false;
 const transcriptTurns = new Map();
@@ -57,6 +67,18 @@ function sendControlMessage(message) {
 function controlTimingData(name, data) {
   if (name === "peer_connection_state") {
     return { state: data.state };
+  }
+  if (name === "ice_connection_state") {
+    return { state: data.state };
+  }
+  if (name === "ice_gathering_state") {
+    return { state: data.state };
+  }
+  if (name === "data_channel_state") {
+    return { state: data.state };
+  }
+  if (name === "page_error") {
+    return { kind: data.kind, message: String(data.message || "").slice(0, 512) };
   }
   if (name === "realtime_response_done") {
     return {
@@ -121,6 +143,45 @@ function recordTiming(name, data = {}) {
   });
 }
 
+function reportPageError(kind, message) {
+  const bounded = String(message || "unknown").slice(0, 512);
+  appendEvent({ type: "page_error", kind, message: bounded });
+  sendControlMessage({
+    type: "timing",
+    name: "page_error",
+    monotonic_ms: Number(performance.now().toFixed(2)),
+    data: { kind, message: bounded },
+  });
+}
+
+window.addEventListener("error", (event) => {
+  reportPageError("error", event.message || "window error");
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+  const reason = event.reason;
+  reportPageError(
+    "unhandledrejection",
+    reason && reason.message ? reason.message : String(reason),
+  );
+});
+
+function hasLiveMedia() {
+  return (
+    peerConnection?.connectionState === "connected" && dataChannel?.readyState === "open"
+  );
+}
+
+function handleControllerSocketLoss(message) {
+  if (hasLiveMedia()) {
+    launchMode.textContent = "Wake activation mode · controller unavailable";
+    setStatus("connected", "Connected — controller unavailable");
+    appendEvent({ type: "control.degraded", message });
+    return;
+  }
+  failConversation(message);
+}
+
 function openControllerSocket() {
   if (!activationToken || !localSessionId) return;
 
@@ -158,22 +219,30 @@ function openControllerSocket() {
         socket.close();
         return;
       }
-      if (event.type === "action_state") {
-        handleActionState(event);
-      }
+
     } catch (_error) {
       failConversation("Controller returned an invalid message");
     }
   });
   socket.addEventListener("error", () => {
     if (controllerSocket === socket && !controllerSessionClosed) {
-      failConversation("Could not connect to the local voice controller");
+      handleControllerSocketLoss("Could not connect to the local voice controller");
     }
   });
-  socket.addEventListener("close", () => {
+  socket.addEventListener("close", (event) => {
     if (controllerSocket === socket) {
       controllerSocket = null;
-      stopConversation({ preserveError: true, reason: "transport_failure", sendStopMessage: false });
+      appendEvent({
+        type: "control.socket_closed",
+        code: event.code,
+        reason: event.reason || "",
+        was_clean: event.wasClean,
+      });
+      if (!controllerSessionClosed) {
+        handleControllerSocketLoss(
+          `Local voice controller disconnected (code ${event.code})`,
+        );
+      }
     }
   });
 }
@@ -195,6 +264,23 @@ function showError(message) {
 function clearError() {
   errorBanner.textContent = "";
   errorBanner.dataset.visible = "false";
+}
+
+function clearTransportFailureTimer() {
+  if (transportFailureTimer !== null) {
+    window.clearTimeout(transportFailureTimer);
+    transportFailureTimer = null;
+  }
+}
+
+function scheduleTransportFailure(pc) {
+  clearTransportFailureTimer();
+  transportFailureTimer = window.setTimeout(() => {
+    transportFailureTimer = null;
+    if (peerConnection === pc && pc.connectionState === "disconnected") {
+      failConversation(`WebRTC ${pc.connectionState}`);
+    }
+  }, 3000);
 }
 
 function failConversation(message) {
@@ -382,29 +468,8 @@ function createActionStateCard(state) {
   executionList.prepend(card);
 }
 
-function sanitizeActionState(rawState) {
-  if (!rawState || typeof rawState !== "object") {
-    return rawState;
-  }
 
-  const keys = ["type", "call_id", "capability", "execution", "ok", "error", "result"];
-  const sanitized = {};
-  for (const key of keys) {
-    if (key in rawState) {
-      sanitized[key] = rawState[key];
-    }
-  }
-
-  return sanitized;
-}
-
-function handleActionState(eventData) {
-  const actionState = eventData?.action_state;
-  const payload = sanitizeActionState(actionState ?? eventData);
-  createActionStateCard(payload);
-}
-
-function resetSdkInterruptionDiagnostics() {
+function resetInterruptionDiagnostics() {
   interruptionStartedMs = null;
   waitingForNextAudio = false;
   interruptionStateText.textContent = "No interruption measured";
@@ -419,14 +484,14 @@ function elapsedSinceInterruption() {
   return Number((performance.now() - interruptionStartedMs).toFixed(2));
 }
 
-function formatSdkTiming(value) {
+function formatInterruptionTiming(value) {
   return value === null ? "—" : `${value.toFixed(2)} ms`;
 }
 
 function observeSpeechStarted() {
   interruptionStartedMs = performance.now();
   waitingForNextAudio = true;
-  interruptionStateText.textContent = "Speech detected · SDK interruption active";
+  interruptionStateText.textContent = "Speech detected · interruption active";
   speechSilenceMs.textContent = "0.00 ms";
   responseCancelMs.textContent = "—";
   truncationMs.textContent = "—";
@@ -435,27 +500,137 @@ function observeSpeechStarted() {
 
 function observeResponseCancellation(event) {
   if (event.response?.status !== "cancelled" || interruptionStartedMs === null) return;
-  responseCancelMs.textContent = formatSdkTiming(elapsedSinceInterruption());
+  responseCancelMs.textContent = formatInterruptionTiming(elapsedSinceInterruption());
   interruptionStateText.textContent = "Response cancelled · waiting for next response";
 }
 
 function observeOutputBufferCleared() {
   if (interruptionStartedMs === null) return;
-  truncationMs.textContent = formatSdkTiming(elapsedSinceInterruption());
+  truncationMs.textContent = formatInterruptionTiming(elapsedSinceInterruption());
   interruptionStateText.textContent = "Output buffer cleared · listening";
 }
 
 function observeResponseFirstAudio() {
   if (!waitingForNextAudio || interruptionStartedMs === null) return;
-  listeningRestoredMs.textContent = formatSdkTiming(elapsedSinceInterruption());
-  interruptionStateText.textContent = "Playback restored by SDK";
+  listeningRestoredMs.textContent = formatInterruptionTiming(elapsedSinceInterruption());
+  interruptionStateText.textContent = "Playback restored";
   waitingForNextAudio = false;
 }
 
-async function handleRealtimeEvent(event) {
-  appendEvent(event);
+function sendRealtimeEvent(event, channel = dataChannel) {
+  if (!channel || channel.readyState !== "open") {
+    throw new Error("Realtime data channel is not open");
+  }
+  channel.send(JSON.stringify(event));
+}
 
-  if (event.type === "conversation.item.input_audio_transcription.delta") {
+async function executeFunctionCall(item, sessionContext) {
+  const callId = item.call_id;
+  if (!callId || handledCallIds.has(callId)) return;
+  handledCallIds.add(callId);
+
+  let output;
+  try {
+    const response = await fetch("/execute", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Okay-Hermes-Client": "voice-page-v1",
+      },
+      body: JSON.stringify({
+        scope: sessionContext.scope,
+        call_id: callId,
+        name: item.name,
+        arguments: item.arguments || "{}",
+      }),
+    });
+    output = await response.json().catch(() => ({}));
+    if (!response.ok && !output.error) {
+      output = {
+        ok: false,
+        call_id: callId,
+        error: { type: "gateway_error", message: `Gateway returned ${response.status}` },
+      };
+    }
+  } catch (error) {
+    output = {
+      ok: false,
+      call_id: callId,
+      error: { type: "gateway_unreachable", message: error.message || String(error) },
+    };
+  }
+
+  if (
+    peerConnection !== sessionContext.pc ||
+    dataChannel !== sessionContext.dc ||
+    executionScope !== sessionContext.scope
+  ) {
+    return;
+  }
+
+  createActionStateCard(output);
+  if (!output.ok) {
+    setStatus("connected", "Connected — tools unavailable");
+  }
+  sendRealtimeEvent(
+    {
+      type: "conversation.item.create",
+      item: {
+        type: "function_call_output",
+        call_id: callId,
+        output: JSON.stringify(output),
+      },
+    },
+    sessionContext.dc
+  );
+  if (output.ok && output.result?.end_session) {
+    // Lock VAD before the farewell so user speech cannot cancel it, and so the
+    // provider does not auto-create responses from ambient audio while we are
+    // closing. Then request the farewell explicitly.
+    sendRealtimeEvent(
+      {
+        type: "session.update",
+        session: {
+          audio: {
+            input: {
+              turn_detection: {
+                type: "semantic_vad",
+                create_response: false,
+                interrupt_response: false,
+              },
+            },
+          },
+        },
+      },
+      sessionContext.dc
+    );
+    sendRealtimeEvent({ type: "response.create" }, sessionContext.dc);
+    disconnectAfterResponse = true;
+    // Bounded fallback: if output_audio_buffer.stopped never arrives (cancel,
+    // provider error, transport stall), still close so wakeword re-arms.
+    if (farewellFallbackTimer !== null) {
+      clearTimeout(farewellFallbackTimer);
+    }
+    farewellFallbackTimer = window.setTimeout(() => {
+      farewellFallbackTimer = null;
+      if (disconnectAfterResponse) {
+        disconnectAfterResponse = false;
+        farewellResponseId = null;
+        stopConversation({ reason: "model_request" });
+      }
+    }, 15000);
+    return;
+  }
+  sendRealtimeEvent({ type: "response.create" }, sessionContext.dc);
+}
+
+async function handleRealtimeEvent(event, sessionContext) {
+  appendEvent(event);
+  if (event.type === "session.updated") {
+    if (typeof activeMarkSessionReady === "function") {
+      activeMarkSessionReady();
+    }
+  } else if (event.type === "conversation.item.input_audio_transcription.delta") {
     updateTranscriptTurn("user", event.item_id, event.delta, { append: true });
   } else if (event.type === "conversation.item.input_audio_transcription.completed") {
     updateTranscriptTurn("user", event.item_id, event.transcript);
@@ -479,48 +654,74 @@ async function handleRealtimeEvent(event) {
     setStatus("thinking", "Thinking");
   } else if (event.type === "response.created") {
     setStatus("responding", "Responding");
-  } else if (
-    event.type === "response.output_audio.delta" ||
-    event.type === "response.output_audio.started"
-  ) {
+  } else if (event.type === "response.function_call_arguments.done") {
+    await executeFunctionCall(
+      {
+        type: "function_call",
+        call_id: event.call_id,
+        name: event.name,
+        arguments: event.arguments,
+        item_id: event.item_id,
+      },
+      sessionContext
+    );
+  } else if (event.type === "response.output_audio.delta" || event.type === "response.output_audio.started") {
     observeResponseFirstAudio();
   } else if (event.type === "output_audio_buffer.cleared") {
     observeOutputBufferCleared();
+  } else if (event.type === "output_audio_buffer.stopped") {
+    if (
+      disconnectAfterResponse &&
+      (farewellResponseId === null || event.response_id === farewellResponseId)
+    ) {
+      disconnectAfterResponse = false;
+      farewellResponseId = null;
+      if (farewellFallbackTimer !== null) {
+        clearTimeout(farewellFallbackTimer);
+        farewellFallbackTimer = null;
+      }
+      stopConversation({ reason: "model_request" });
+    }
   } else if (event.type === "response.done") {
     recordRealtimeResponseDone(event);
     observeResponseCancellation(event);
-    setStatus("connected", "Connected — speak naturally");
+    const functionCalls = (event.response?.output || []).filter(
+      (item) => item.type === "function_call"
+    );
+    if (functionCalls.length > 0) {
+      for (const item of functionCalls) {
+        await executeFunctionCall(item, sessionContext);
+      }
+    } else if (disconnectAfterResponse) {
+      const status = event.response?.status;
+      if (status === "completed") {
+        // Farewell finished generating; playback completion is signaled by
+        // output_audio_buffer.stopped, matched by response id when available.
+        farewellResponseId = event.response?.id ?? null;
+      } else {
+        // status is "cancelled", "failed", or "incomplete": unlatch and close
+        // so the wakeword listener re-arms instead of leaving the window open.
+        disconnectAfterResponse = false;
+        farewellResponseId = null;
+        if (farewellFallbackTimer !== null) {
+          clearTimeout(farewellFallbackTimer);
+          farewellFallbackTimer = null;
+        }
+        stopConversation({ reason: "model_request" });
+      }
+    } else {
+      setStatus("connected", "Connected — speak naturally");
+    }
   } else if (event.type === "error") {
     recordRealtimeError(event.error);
     showError(event.error?.message || "The Realtime session returned an error.");
   }
 }
 
-async function fetchClientSecret() {
-  const headers = { "X-Okay-Hermes-Client": "voice-page-v1" };
-  if (localSessionId) {
-    headers["X-Okay-Hermes-Session-ID"] = localSessionId;
-  }
-  const response = await fetch("/client-secret", { method: "POST", headers });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(payload.detail || `Client secret request failed (${response.status})`);
-  }
-  if (
-    typeof payload.value !== "string" ||
-    !payload.value.startsWith("ek_") ||
-    !payload.session ||
-    typeof payload.session.model !== "string"
-  ) {
-    throw new Error("Gateway returned an invalid Realtime client secret");
-  }
-  return payload;
-}
-
 async function startConversation() {
   clearError();
   resetTranscript();
-  resetSdkInterruptionDiagnostics();
+  resetInterruptionDiagnostics();
   stopMessageSent = false;
   teardownCompleteSent = false;
   startButton.disabled = true;
@@ -535,65 +736,142 @@ async function startConversation() {
       },
     });
 
-    setStatus("connecting", "Creating Realtime session");
-    const clientSecret = await fetchClientSecret();
-    const transport = new OpenAIRealtimeWebRTC({
-      audioElement: remoteAudio,
-      mediaStream: localStream,
-    });
-    realtimeTransport = transport;
-
-    transport.on("*", (event) => {
-      if (realtimeTransport === transport) {
-        void handleRealtimeEvent(event);
-      }
-    });
-    transport.on("connection_change", (state) => {
-      if (realtimeTransport !== transport) return;
-      appendEvent({ type: "webrtc.connection_state", state });
-      recordTiming("peer_connection_state", { state });
-      if (state === "connected") {
-        setStatus("connected", "Connected — speak naturally");
-      } else if (state === "disconnected" && !isStopping) {
-        failConversation("Realtime WebRTC transport disconnected");
-      }
-    });
-    transport.on("error", (transportError) => {
-      if (realtimeTransport !== transport) return;
-      const cause = transportError?.error || transportError;
-      if (cause?.type === "error") return;
-      const detail = {
-        type: "transport_error",
-        code: typeof cause?.name === "string" ? cause.name : null,
-        message:
-          typeof cause?.message === "string"
-            ? cause.message
-            : "The Realtime transport returned an error.",
-      };
-      appendEvent({ type: "error", error: detail });
-      recordRealtimeError(detail);
-      showError(detail.message);
-    });
-
-    const connectPromise = transport.connect({
-      apiKey: clientSecret.value,
-      model: clientSecret.session.model,
-      url: localSessionId
-        ? `${window.location.origin}/session?local_session_id=${encodeURIComponent(localSessionId)}`
-        : undefined,
-      initialSessionConfig: {
-        providerData: clientSecret.session,
-      },
-    });
-
-    await connectPromise;
-    if (realtimeTransport !== transport) return;
-
-    if (localSessionId) {
-      sendControlMessage({ type: "page_started" });
+    const pc = new RTCPeerConnection();
+    peerConnection = pc;
+    pc.ontrack = (event) => {
+      if (peerConnection !== pc) return;
+      remoteAudio.srcObject = event.streams[0];
+      remoteAudio.play().catch(() => {});
+    };
+    for (const track of localStream.getTracks()) {
+      pc.addTrack(track, localStream);
     }
-    stopButton.disabled = false;
+
+    const dc = pc.createDataChannel("oai-events");
+    dataChannel = dc;
+
+    function markSessionReady() {
+      if (pageStartedSent || peerConnection !== pc || dataChannel !== dc) return;
+      pageStartedSent = true;
+      if (sessionReadyFallbackTimer !== null) {
+        clearTimeout(sessionReadyFallbackTimer);
+        sessionReadyFallbackTimer = null;
+      }
+      setStatus("connected", "Connected — speak naturally");
+      stopButton.disabled = false;
+      if (localSessionId) {
+        sendControlMessage({ type: "page_started" });
+      }
+    }
+
+    function armSessionReadyFallback() {
+      if (sessionReadyFallbackTimer !== null || pageStartedSent) return;
+      sessionReadyFallbackTimer = window.setTimeout(() => {
+        sessionReadyFallbackTimer = null;
+        if (pageStartedSent || peerConnection !== pc || dataChannel !== dc) return;
+        // The data channel is open and the peer is connected but the provider
+        // never acknowledged session.updated. The session is media-live even
+        // if configuration was not confirmed; accept it so the controller's
+        // browser-startup deadline cannot kill a working call. Bounded by the
+        // same deadline that already guards startup on the controller side.
+        if (pc.connectionState === "connected") {
+          markSessionReady();
+        }
+      }, 5000);
+    }
+
+    activeMarkSessionReady = markSessionReady;
+
+    dc.addEventListener("open", () => {
+      if (peerConnection !== pc || dataChannel !== dc) return;
+      recordTiming("data_channel_state", { state: dc.readyState });
+      setStatus("connecting", "Waiting for Realtime session");
+      armSessionReadyFallback();
+    });
+    dc.addEventListener("message", (message) => {
+      if (peerConnection !== pc || dataChannel !== dc) return;
+      try {
+        const event = JSON.parse(message.data);
+        void handleRealtimeEvent(event, { pc, dc, scope: executionScope });
+      } catch (error) {
+        showError(`Could not parse a Realtime event: ${error.message || String(error)}`);
+      }
+    });
+    dc.addEventListener("error", () => {
+      if (peerConnection === pc && dataChannel === dc && !isStopping) {
+        failConversation("Realtime data channel failed");
+      }
+    });
+    dc.addEventListener("close", () => {
+      if (peerConnection === pc && dataChannel === dc && !isStopping) {
+        failConversation("Realtime data channel closed unexpectedly");
+      }
+    });
+    pc.addEventListener("connectionstatechange", () => {
+      if (peerConnection !== pc) return;
+      appendEvent({ type: "webrtc.connection_state", state: pc.connectionState });
+      recordTiming("peer_connection_state", { state: pc.connectionState });
+      if (pc.connectionState === "failed") {
+        failConversation(`WebRTC ${pc.connectionState}`);
+      } else if (pc.connectionState === "disconnected") {
+        scheduleTransportFailure(pc);
+      } else {
+        clearTransportFailureTimer();
+      }
+    });
+    pc.addEventListener("iceconnectionstatechange", () => {
+      if (peerConnection !== pc) return;
+      recordTiming("ice_connection_state", { state: pc.iceConnectionState });
+    });
+    pc.addEventListener("icegatheringstatechange", () => {
+      if (peerConnection !== pc) return;
+      recordTiming("ice_gathering_state", { state: pc.iceGatheringState });
+    });
+
+    setStatus("connecting", "Creating Realtime session");
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    recordTiming("sdp_offer_created");
+    const headers = {
+      "Content-Type": "application/sdp",
+      "X-Okay-Hermes-Client": "voice-page-v1",
+    };
+    if (localSessionId) {
+      headers["X-Okay-Hermes-Session-ID"] = localSessionId;
+    }
+    const sessionUrl = localSessionId
+      ? `/session?local_session_id=${encodeURIComponent(localSessionId)}`
+      : "/session";
+    const response = await fetch(sessionUrl, {
+      method: "POST",
+      body: offer.sdp,
+      headers,
+    });
+    if (!response.ok) {
+      let detail = await response.text();
+      try {
+        detail = JSON.parse(detail).detail || detail;
+      } catch (_error) {
+        // Keep plain-text provider or gateway errors readable.
+      }
+      throw new Error(detail || `Session gateway returned ${response.status}`);
+    }
+    const answer = { type: "answer", sdp: await response.text() };
+    if (!canApplyRemoteAnswer(peerConnection, pc)) {
+      appendEvent({
+        type: "webrtc.late_sdp_answer_ignored",
+        signaling_state: pc.signalingState,
+      });
+      return;
+    }
+    executionScope = response.headers.get("X-Okay-Hermes-Execution-Scope");
+    if (localSessionId && !executionScope) {
+      throw new Error("Session gateway did not return a local execution scope");
+    }
+    await pc.setRemoteDescription(answer);
+    recordTiming("sdp_answer_applied");
   } catch (error) {
+    reportPageError("error", error.message || String(error));
     showError(error.message || String(error));
     stopConversation({ preserveError: true, reason: "transport_failure" });
   }
@@ -602,6 +880,7 @@ async function startConversation() {
 function stopConversation(options = {}) {
   if (isStopping || teardownCompleteSent) return;
   isStopping = true;
+  clearTransportFailureTimer();
   const shouldSendStopMessage = options.sendStopMessage !== false;
 
   try {
@@ -612,10 +891,13 @@ function stopConversation(options = {}) {
       stopMessageSent = true;
     }
 
-    if (realtimeTransport) {
-      const transport = realtimeTransport;
-      realtimeTransport = null;
-      transport.close();
+    if (dataChannel) {
+      if (dataChannel.readyState !== "closed") dataChannel.close();
+      dataChannel = null;
+    }
+    if (peerConnection) {
+      if (peerConnection.connectionState !== "closed") peerConnection.close();
+      peerConnection = null;
     }
 
     if (localStream) {
@@ -625,8 +907,22 @@ function stopConversation(options = {}) {
       localStream = null;
     }
 
+    executionScope = null;
+    handledCallIds.clear();
+    disconnectAfterResponse = false;
+    farewellResponseId = null;
+    if (farewellFallbackTimer !== null) {
+      clearTimeout(farewellFallbackTimer);
+      farewellFallbackTimer = null;
+    }
+    pageStartedSent = false;
+    if (sessionReadyFallbackTimer !== null) {
+      clearTimeout(sessionReadyFallbackTimer);
+      sessionReadyFallbackTimer = null;
+    }
+    activeMarkSessionReady = null;
     remoteAudio.srcObject = null;
-    resetSdkInterruptionDiagnostics();
+    resetInterruptionDiagnostics();
     startButton.disabled = false;
     stopButton.disabled = true;
     voiceCard.dataset.active = "false";
@@ -655,4 +951,15 @@ stopButton.addEventListener("click", () => stopConversation({ reason: "button" }
 // these frames actually flush before the socket drops.
 window.addEventListener("pagehide", () => stopConversation({ reason: "native_cancel" }));
 window.addEventListener("beforeunload", () => stopConversation({ reason: "native_cancel" }));
+window.addEventListener("pageshow", (event) => {
+  if (!event.persisted) return;
+  // Restored from the bfcache into a fresh activation: the module-level
+  // session latches still reflect the previous session. Re-arm them so
+  // sendControlMessage works and the new control socket can drive a session.
+  isStopping = false;
+  controllerSessionClosed = false;
+  stopMessageSent = false;
+  teardownCompleteSent = false;
+  openControllerSocket();
+});
 openControllerSocket();

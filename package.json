@@ -1,13 +1,11 @@
 {
   "name": "okay-hermes-realtime-web",
   "private": true,
+  "type": "module",
   "scripts": {
     "build:web": "esbuild frontend/voice.js --bundle --format=esm --platform=browser --target=es2022 --outfile=src/realtime_action_spike/web/voice.js && node scripts/strip-bundle-whitespace.mjs",
-    "check:web": "npm run build:web && node --check src/realtime_action_spike/web/voice.js"
-  },
-  "dependencies": {
-    "@openai/agents-realtime": "0.13.5",
-    "zod": "4.4.3"
+    "check:web": "npm run build:web && node --check src/realtime_action_spike/web/voice.js",
+    "test:web": "node --test tests/web/*.test.mjs"
   },
   "devDependencies": {
     "esbuild": "0.28.1"
