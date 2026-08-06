@@ -1,6 +1,6 @@
 # Okay Hermes Realtime — Stage 1 replacement candidate
 
-An OpenAI-specific, independently installable replacement candidate for Okay Hermes Voice (OHV). A native wake listener and tray launch a dedicated Brave app window; OpenAI's maintained `OpenAIRealtimeWebRTC` transport owns microphone, model audio, interruption, and response sequencing while the local controller owns session scope, sideband tools, authorization, traces, and teardown.
+An OpenAI-specific, independently installable replacement candidate for [Okay Hermes Voice (OHV)](https://github.com/H-Ali13381/okay-hermes-voice). A native wake listener and tray launch a dedicated Brave app window; OpenAI's maintained `OpenAIRealtimeWebRTC` transport owns microphone, model audio, interruption, and response sequencing while the local controller owns session scope, sideband tools, authorization, traces, and teardown.
 
 This branch does not modify or reuse the OHV runtime. It has separate units, binaries, config, state, browser profile, and installer paths.
 
