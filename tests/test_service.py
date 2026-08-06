@@ -81,6 +81,17 @@ class ServiceHarness:
     controller: FakeController
 
 
+@pytest.fixture(autouse=True)
+def isolated_service_state_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    """Keep service health markers out of the user's live state directory."""
+    state_home = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    return state_home
+
+
 def _harness(
     *,
     socket: FakeSocket | None = None,
@@ -160,12 +171,10 @@ async def test_shutdown_closes_active_session_before_http_and_activation_socket(
 
 @pytest.mark.asyncio
 async def test_controller_health_marker_tracks_service_readiness_and_shutdown(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    isolated_service_state_home: Path,
 ) -> None:
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     harness = _harness()
-    marker = tmp_path / "okay-hermes-realtime" / "controller-health"
+    marker = isolated_service_state_home / "okay-hermes-realtime" / "controller-health"
     run_task = asyncio.create_task(harness.service.run())
 
     await asyncio.wait_for(harness.http.serve_entered.wait(), timeout=1.0)
