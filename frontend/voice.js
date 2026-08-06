@@ -34,6 +34,8 @@ let dataChannel = null;
 let localStream = null;
 let executionScope = null;
 let disconnectAfterResponse = false;
+let farewellResponseId = null;
+let farewellFallbackTimer = null;
 let transportFailureTimer = null;
 const handledCallIds = new Set();
 let receivedExecutionCount = 0;
@@ -42,6 +44,9 @@ let controllerSocket = null;
 let controllerSessionClosed = false;
 let stopMessageSent = false;
 let teardownCompleteSent = false;
+let pageStartedSent = false;
+let sessionReadyFallbackTimer = null;
+let activeMarkSessionReady = null;
 let interruptionStartedMs = null;
 let waitingForNextAudio = false;
 const transcriptTurns = new Map();
@@ -62,6 +67,18 @@ function sendControlMessage(message) {
 function controlTimingData(name, data) {
   if (name === "peer_connection_state") {
     return { state: data.state };
+  }
+  if (name === "ice_connection_state") {
+    return { state: data.state };
+  }
+  if (name === "ice_gathering_state") {
+    return { state: data.state };
+  }
+  if (name === "data_channel_state") {
+    return { state: data.state };
+  }
+  if (name === "page_error") {
+    return { kind: data.kind, message: String(data.message || "").slice(0, 512) };
   }
   if (name === "realtime_response_done") {
     return {
@@ -126,6 +143,29 @@ function recordTiming(name, data = {}) {
   });
 }
 
+function reportPageError(kind, message) {
+  const bounded = String(message || "unknown").slice(0, 512);
+  appendEvent({ type: "page_error", kind, message: bounded });
+  sendControlMessage({
+    type: "timing",
+    name: "page_error",
+    monotonic_ms: Number(performance.now().toFixed(2)),
+    data: { kind, message: bounded },
+  });
+}
+
+window.addEventListener("error", (event) => {
+  reportPageError("error", event.message || "window error");
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+  const reason = event.reason;
+  reportPageError(
+    "unhandledrejection",
+    reason && reason.message ? reason.message : String(reason),
+  );
+});
+
 function hasLiveMedia() {
   return (
     peerConnection?.connectionState === "connected" && dataChannel?.readyState === "open"
@@ -189,11 +229,19 @@ function openControllerSocket() {
       handleControllerSocketLoss("Could not connect to the local voice controller");
     }
   });
-  socket.addEventListener("close", () => {
+  socket.addEventListener("close", (event) => {
     if (controllerSocket === socket) {
       controllerSocket = null;
+      appendEvent({
+        type: "control.socket_closed",
+        code: event.code,
+        reason: event.reason || "",
+        was_clean: event.wasClean,
+      });
       if (!controllerSessionClosed) {
-        handleControllerSocketLoss("Local voice controller disconnected");
+        handleControllerSocketLoss(
+          `Local voice controller disconnected (code ${event.code})`,
+        );
       }
     }
   });
@@ -535,16 +583,54 @@ async function executeFunctionCall(item, sessionContext) {
     },
     sessionContext.dc
   );
-  sendRealtimeEvent({ type: "response.create" }, sessionContext.dc);
   if (output.ok && output.result?.end_session) {
+    // Lock VAD before the farewell so user speech cannot cancel it, and so the
+    // provider does not auto-create responses from ambient audio while we are
+    // closing. Then request the farewell explicitly.
+    sendRealtimeEvent(
+      {
+        type: "session.update",
+        session: {
+          audio: {
+            input: {
+              turn_detection: {
+                type: "semantic_vad",
+                create_response: false,
+                interrupt_response: false,
+              },
+            },
+          },
+        },
+      },
+      sessionContext.dc
+    );
+    sendRealtimeEvent({ type: "response.create" }, sessionContext.dc);
     disconnectAfterResponse = true;
+    // Bounded fallback: if output_audio_buffer.stopped never arrives (cancel,
+    // provider error, transport stall), still close so wakeword re-arms.
+    if (farewellFallbackTimer !== null) {
+      clearTimeout(farewellFallbackTimer);
+    }
+    farewellFallbackTimer = window.setTimeout(() => {
+      farewellFallbackTimer = null;
+      if (disconnectAfterResponse) {
+        disconnectAfterResponse = false;
+        farewellResponseId = null;
+        stopConversation({ reason: "model_request" });
+      }
+    }, 15000);
+    return;
   }
+  sendRealtimeEvent({ type: "response.create" }, sessionContext.dc);
 }
 
 async function handleRealtimeEvent(event, sessionContext) {
   appendEvent(event);
-
-  if (event.type === "conversation.item.input_audio_transcription.delta") {
+  if (event.type === "session.updated") {
+    if (typeof activeMarkSessionReady === "function") {
+      activeMarkSessionReady();
+    }
+  } else if (event.type === "conversation.item.input_audio_transcription.delta") {
     updateTranscriptTurn("user", event.item_id, event.delta, { append: true });
   } else if (event.type === "conversation.item.input_audio_transcription.completed") {
     updateTranscriptTurn("user", event.item_id, event.transcript);
@@ -579,13 +665,23 @@ async function handleRealtimeEvent(event, sessionContext) {
       },
       sessionContext
     );
-  } else if (
-    event.type === "response.output_audio.delta" ||
-    event.type === "response.output_audio.started"
-  ) {
+  } else if (event.type === "response.output_audio.delta" || event.type === "response.output_audio.started") {
     observeResponseFirstAudio();
   } else if (event.type === "output_audio_buffer.cleared") {
     observeOutputBufferCleared();
+  } else if (event.type === "output_audio_buffer.stopped") {
+    if (
+      disconnectAfterResponse &&
+      (farewellResponseId === null || event.response_id === farewellResponseId)
+    ) {
+      disconnectAfterResponse = false;
+      farewellResponseId = null;
+      if (farewellFallbackTimer !== null) {
+        clearTimeout(farewellFallbackTimer);
+        farewellFallbackTimer = null;
+      }
+      stopConversation({ reason: "model_request" });
+    }
   } else if (event.type === "response.done") {
     recordRealtimeResponseDone(event);
     observeResponseCancellation(event);
@@ -597,8 +693,22 @@ async function handleRealtimeEvent(event, sessionContext) {
         await executeFunctionCall(item, sessionContext);
       }
     } else if (disconnectAfterResponse) {
-      disconnectAfterResponse = false;
-      window.setTimeout(() => stopConversation({ reason: "model_request" }), 500);
+      const status = event.response?.status;
+      if (status === "completed") {
+        // Farewell finished generating; playback completion is signaled by
+        // output_audio_buffer.stopped, matched by response id when available.
+        farewellResponseId = event.response?.id ?? null;
+      } else {
+        // status is "cancelled", "failed", or "incomplete": unlatch and close
+        // so the wakeword listener re-arms instead of leaving the window open.
+        disconnectAfterResponse = false;
+        farewellResponseId = null;
+        if (farewellFallbackTimer !== null) {
+          clearTimeout(farewellFallbackTimer);
+          farewellFallbackTimer = null;
+        }
+        stopConversation({ reason: "model_request" });
+      }
     } else {
       setStatus("connected", "Connected — speak naturally");
     }
@@ -639,13 +749,44 @@ async function startConversation() {
 
     const dc = pc.createDataChannel("oai-events");
     dataChannel = dc;
-    dc.addEventListener("open", () => {
-      if (peerConnection !== pc || dataChannel !== dc) return;
+
+    function markSessionReady() {
+      if (pageStartedSent || peerConnection !== pc || dataChannel !== dc) return;
+      pageStartedSent = true;
+      if (sessionReadyFallbackTimer !== null) {
+        clearTimeout(sessionReadyFallbackTimer);
+        sessionReadyFallbackTimer = null;
+      }
       setStatus("connected", "Connected — speak naturally");
       stopButton.disabled = false;
       if (localSessionId) {
         sendControlMessage({ type: "page_started" });
       }
+    }
+
+    function armSessionReadyFallback() {
+      if (sessionReadyFallbackTimer !== null || pageStartedSent) return;
+      sessionReadyFallbackTimer = window.setTimeout(() => {
+        sessionReadyFallbackTimer = null;
+        if (pageStartedSent || peerConnection !== pc || dataChannel !== dc) return;
+        // The data channel is open and the peer is connected but the provider
+        // never acknowledged session.updated. The session is media-live even
+        // if configuration was not confirmed; accept it so the controller's
+        // browser-startup deadline cannot kill a working call. Bounded by the
+        // same deadline that already guards startup on the controller side.
+        if (pc.connectionState === "connected") {
+          markSessionReady();
+        }
+      }, 5000);
+    }
+
+    activeMarkSessionReady = markSessionReady;
+
+    dc.addEventListener("open", () => {
+      if (peerConnection !== pc || dataChannel !== dc) return;
+      recordTiming("data_channel_state", { state: dc.readyState });
+      setStatus("connecting", "Waiting for Realtime session");
+      armSessionReadyFallback();
     });
     dc.addEventListener("message", (message) => {
       if (peerConnection !== pc || dataChannel !== dc) return;
@@ -677,6 +818,14 @@ async function startConversation() {
       } else {
         clearTransportFailureTimer();
       }
+    });
+    pc.addEventListener("iceconnectionstatechange", () => {
+      if (peerConnection !== pc) return;
+      recordTiming("ice_connection_state", { state: pc.iceConnectionState });
+    });
+    pc.addEventListener("icegatheringstatechange", () => {
+      if (peerConnection !== pc) return;
+      recordTiming("ice_gathering_state", { state: pc.iceGatheringState });
     });
 
     setStatus("connecting", "Creating Realtime session");
@@ -722,6 +871,7 @@ async function startConversation() {
     await pc.setRemoteDescription(answer);
     recordTiming("sdp_answer_applied");
   } catch (error) {
+    reportPageError("error", error.message || String(error));
     showError(error.message || String(error));
     stopConversation({ preserveError: true, reason: "transport_failure" });
   }
@@ -760,6 +910,17 @@ function stopConversation(options = {}) {
     executionScope = null;
     handledCallIds.clear();
     disconnectAfterResponse = false;
+    farewellResponseId = null;
+    if (farewellFallbackTimer !== null) {
+      clearTimeout(farewellFallbackTimer);
+      farewellFallbackTimer = null;
+    }
+    pageStartedSent = false;
+    if (sessionReadyFallbackTimer !== null) {
+      clearTimeout(sessionReadyFallbackTimer);
+      sessionReadyFallbackTimer = null;
+    }
+    activeMarkSessionReady = null;
     remoteAudio.srcObject = null;
     resetInterruptionDiagnostics();
     startButton.disabled = false;
@@ -790,4 +951,15 @@ stopButton.addEventListener("click", () => stopConversation({ reason: "button" }
 // these frames actually flush before the socket drops.
 window.addEventListener("pagehide", () => stopConversation({ reason: "native_cancel" }));
 window.addEventListener("beforeunload", () => stopConversation({ reason: "native_cancel" }));
+window.addEventListener("pageshow", (event) => {
+  if (!event.persisted) return;
+  // Restored from the bfcache into a fresh activation: the module-level
+  // session latches still reflect the previous session. Re-arm them so
+  // sendControlMessage works and the new control socket can drive a session.
+  isStopping = false;
+  controllerSessionClosed = false;
+  stopMessageSent = false;
+  teardownCompleteSent = false;
+  openControllerSocket();
+});
 openControllerSocket();

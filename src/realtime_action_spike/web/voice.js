@@ -34,6 +34,8 @@ var dataChannel = null;
 var localStream = null;
 var executionScope = null;
 var disconnectAfterResponse = false;
+var farewellResponseId = null;
+var farewellFallbackTimer = null;
 var transportFailureTimer = null;
 var handledCallIds = /* @__PURE__ */ new Set();
 var receivedExecutionCount = 0;
@@ -42,6 +44,9 @@ var controllerSocket = null;
 var controllerSessionClosed = false;
 var stopMessageSent = false;
 var teardownCompleteSent = false;
+var pageStartedSent = false;
+var sessionReadyFallbackTimer = null;
+var activeMarkSessionReady = null;
 var interruptionStartedMs = null;
 var waitingForNextAudio = false;
 var transcriptTurns = /* @__PURE__ */ new Map();
@@ -55,6 +60,18 @@ function sendControlMessage(message) {
 function controlTimingData(name, data) {
   if (name === "peer_connection_state") {
     return { state: data.state };
+  }
+  if (name === "ice_connection_state") {
+    return { state: data.state };
+  }
+  if (name === "ice_gathering_state") {
+    return { state: data.state };
+  }
+  if (name === "data_channel_state") {
+    return { state: data.state };
+  }
+  if (name === "page_error") {
+    return { kind: data.kind, message: String(data.message || "").slice(0, 512) };
   }
   if (name === "realtime_response_done") {
     return {
@@ -111,6 +128,26 @@ function recordTiming(name, data = {}) {
     data: controlTimingData(name, data)
   });
 }
+function reportPageError(kind, message) {
+  const bounded = String(message || "unknown").slice(0, 512);
+  appendEvent({ type: "page_error", kind, message: bounded });
+  sendControlMessage({
+    type: "timing",
+    name: "page_error",
+    monotonic_ms: Number(performance.now().toFixed(2)),
+    data: { kind, message: bounded }
+  });
+}
+window.addEventListener("error", (event) => {
+  reportPageError("error", event.message || "window error");
+});
+window.addEventListener("unhandledrejection", (event) => {
+  const reason = event.reason;
+  reportPageError(
+    "unhandledrejection",
+    reason && reason.message ? reason.message : String(reason)
+  );
+});
 function hasLiveMedia() {
   return peerConnection?.connectionState === "connected" && dataChannel?.readyState === "open";
 }
@@ -166,11 +203,19 @@ function openControllerSocket() {
       handleControllerSocketLoss("Could not connect to the local voice controller");
     }
   });
-  socket.addEventListener("close", () => {
+  socket.addEventListener("close", (event) => {
     if (controllerSocket === socket) {
       controllerSocket = null;
+      appendEvent({
+        type: "control.socket_closed",
+        code: event.code,
+        reason: event.reason || "",
+        was_clean: event.wasClean
+      });
       if (!controllerSessionClosed) {
-        handleControllerSocketLoss("Local voice controller disconnected");
+        handleControllerSocketLoss(
+          `Local voice controller disconnected (code ${event.code})`
+        );
       }
     }
   });
@@ -463,14 +508,48 @@ async function executeFunctionCall(item, sessionContext) {
     },
     sessionContext.dc
   );
-  sendRealtimeEvent({ type: "response.create" }, sessionContext.dc);
   if (output.ok && output.result?.end_session) {
+    sendRealtimeEvent(
+      {
+        type: "session.update",
+        session: {
+          audio: {
+            input: {
+              turn_detection: {
+                type: "semantic_vad",
+                create_response: false,
+                interrupt_response: false
+              }
+            }
+          }
+        }
+      },
+      sessionContext.dc
+    );
+    sendRealtimeEvent({ type: "response.create" }, sessionContext.dc);
     disconnectAfterResponse = true;
+    if (farewellFallbackTimer !== null) {
+      clearTimeout(farewellFallbackTimer);
+    }
+    farewellFallbackTimer = window.setTimeout(() => {
+      farewellFallbackTimer = null;
+      if (disconnectAfterResponse) {
+        disconnectAfterResponse = false;
+        farewellResponseId = null;
+        stopConversation({ reason: "model_request" });
+      }
+    }, 15e3);
+    return;
   }
+  sendRealtimeEvent({ type: "response.create" }, sessionContext.dc);
 }
 async function handleRealtimeEvent(event, sessionContext) {
   appendEvent(event);
-  if (event.type === "conversation.item.input_audio_transcription.delta") {
+  if (event.type === "session.updated") {
+    if (typeof activeMarkSessionReady === "function") {
+      activeMarkSessionReady();
+    }
+  } else if (event.type === "conversation.item.input_audio_transcription.delta") {
     updateTranscriptTurn("user", event.item_id, event.delta, { append: true });
   } else if (event.type === "conversation.item.input_audio_transcription.completed") {
     updateTranscriptTurn("user", event.item_id, event.transcript);
@@ -509,6 +588,16 @@ async function handleRealtimeEvent(event, sessionContext) {
     observeResponseFirstAudio();
   } else if (event.type === "output_audio_buffer.cleared") {
     observeOutputBufferCleared();
+  } else if (event.type === "output_audio_buffer.stopped") {
+    if (disconnectAfterResponse && (farewellResponseId === null || event.response_id === farewellResponseId)) {
+      disconnectAfterResponse = false;
+      farewellResponseId = null;
+      if (farewellFallbackTimer !== null) {
+        clearTimeout(farewellFallbackTimer);
+        farewellFallbackTimer = null;
+      }
+      stopConversation({ reason: "model_request" });
+    }
   } else if (event.type === "response.done") {
     recordRealtimeResponseDone(event);
     observeResponseCancellation(event);
@@ -520,8 +609,18 @@ async function handleRealtimeEvent(event, sessionContext) {
         await executeFunctionCall(item, sessionContext);
       }
     } else if (disconnectAfterResponse) {
-      disconnectAfterResponse = false;
-      window.setTimeout(() => stopConversation({ reason: "model_request" }), 500);
+      const status = event.response?.status;
+      if (status === "completed") {
+        farewellResponseId = event.response?.id ?? null;
+      } else {
+        disconnectAfterResponse = false;
+        farewellResponseId = null;
+        if (farewellFallbackTimer !== null) {
+          clearTimeout(farewellFallbackTimer);
+          farewellFallbackTimer = null;
+        }
+        stopConversation({ reason: "model_request" });
+      }
     } else {
       setStatus("connected", "Connected \u2014 speak naturally");
     }
@@ -539,6 +638,28 @@ async function startConversation() {
   startButton.disabled = true;
   setStatus("connecting", "Requesting microphone");
   try {
+    let markSessionReady = function() {
+      if (pageStartedSent || peerConnection !== pc || dataChannel !== dc) return;
+      pageStartedSent = true;
+      if (sessionReadyFallbackTimer !== null) {
+        clearTimeout(sessionReadyFallbackTimer);
+        sessionReadyFallbackTimer = null;
+      }
+      setStatus("connected", "Connected \u2014 speak naturally");
+      stopButton.disabled = false;
+      if (localSessionId) {
+        sendControlMessage({ type: "page_started" });
+      }
+    }, armSessionReadyFallback = function() {
+      if (sessionReadyFallbackTimer !== null || pageStartedSent) return;
+      sessionReadyFallbackTimer = window.setTimeout(() => {
+        sessionReadyFallbackTimer = null;
+        if (pageStartedSent || peerConnection !== pc || dataChannel !== dc) return;
+        if (pc.connectionState === "connected") {
+          markSessionReady();
+        }
+      }, 5e3);
+    };
     localStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
@@ -559,13 +680,12 @@ async function startConversation() {
     }
     const dc = pc.createDataChannel("oai-events");
     dataChannel = dc;
+    activeMarkSessionReady = markSessionReady;
     dc.addEventListener("open", () => {
       if (peerConnection !== pc || dataChannel !== dc) return;
-      setStatus("connected", "Connected \u2014 speak naturally");
-      stopButton.disabled = false;
-      if (localSessionId) {
-        sendControlMessage({ type: "page_started" });
-      }
+      recordTiming("data_channel_state", { state: dc.readyState });
+      setStatus("connecting", "Waiting for Realtime session");
+      armSessionReadyFallback();
     });
     dc.addEventListener("message", (message) => {
       if (peerConnection !== pc || dataChannel !== dc) return;
@@ -597,6 +717,14 @@ async function startConversation() {
       } else {
         clearTransportFailureTimer();
       }
+    });
+    pc.addEventListener("iceconnectionstatechange", () => {
+      if (peerConnection !== pc) return;
+      recordTiming("ice_connection_state", { state: pc.iceConnectionState });
+    });
+    pc.addEventListener("icegatheringstatechange", () => {
+      if (peerConnection !== pc) return;
+      recordTiming("ice_gathering_state", { state: pc.iceGatheringState });
     });
     setStatus("connecting", "Creating Realtime session");
     const offer = await pc.createOffer();
@@ -638,6 +766,7 @@ async function startConversation() {
     await pc.setRemoteDescription(answer);
     recordTiming("sdp_answer_applied");
   } catch (error) {
+    reportPageError("error", error.message || String(error));
     showError(error.message || String(error));
     stopConversation({ preserveError: true, reason: "transport_failure" });
   }
@@ -671,6 +800,17 @@ function stopConversation(options = {}) {
     executionScope = null;
     handledCallIds.clear();
     disconnectAfterResponse = false;
+    farewellResponseId = null;
+    if (farewellFallbackTimer !== null) {
+      clearTimeout(farewellFallbackTimer);
+      farewellFallbackTimer = null;
+    }
+    pageStartedSent = false;
+    if (sessionReadyFallbackTimer !== null) {
+      clearTimeout(sessionReadyFallbackTimer);
+      sessionReadyFallbackTimer = null;
+    }
+    activeMarkSessionReady = null;
     remoteAudio.srcObject = null;
     resetInterruptionDiagnostics();
     startButton.disabled = false;
@@ -692,4 +832,12 @@ startButton.addEventListener("click", startConversation);
 stopButton.addEventListener("click", () => stopConversation({ reason: "button" }));
 window.addEventListener("pagehide", () => stopConversation({ reason: "native_cancel" }));
 window.addEventListener("beforeunload", () => stopConversation({ reason: "native_cancel" }));
+window.addEventListener("pageshow", (event) => {
+  if (!event.persisted) return;
+  isStopping = false;
+  controllerSessionClosed = false;
+  stopMessageSent = false;
+  teardownCompleteSent = false;
+  openControllerSocket();
+});
 openControllerSocket();

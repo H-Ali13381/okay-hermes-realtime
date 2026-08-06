@@ -137,7 +137,20 @@ async def _relay_control_websocket(
 
                 try:
                     closed = await controller.process_control_message(session_id, raw_message)
-                except (StaleControlMessage, ValueError):
+                except (StaleControlMessage, ValueError) as exc:
+                    logger.warning(
+                        "control_message_rejected %s",
+                        json.dumps(
+                            {
+                                "session_id": session_id,
+                                "error_type": type(exc).__name__,
+                                "error": str(exc),
+                                "message_prefix": raw_message[:200],
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
                     with contextlib.suppress(RuntimeError, WebSocketDisconnect):
                         await websocket.close(code=4403)
                     return
