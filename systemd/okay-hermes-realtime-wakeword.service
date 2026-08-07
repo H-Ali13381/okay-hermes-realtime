@@ -1,6 +1,7 @@
 [Unit]
 Description=Okay Hermes Realtime Wakeword Listener
 Requires=okay-hermes-realtime-controller.service pipewire.service wireplumber.service
+PartOf=okay-hermes-realtime-controller.service
 After=okay-hermes-realtime-controller.service pipewire.service wireplumber.service
 
 [Service]

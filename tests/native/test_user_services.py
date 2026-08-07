@@ -88,6 +88,7 @@ def test_wakeword_unit_contract_and_args():
     assert "okay-hermes-realtime-controller.service" in requires_line
     assert "pipewire.service" in requires_line
     assert "wireplumber.service" in requires_line
+    assert "PartOf=okay-hermes-realtime-controller.service" in lines
 
     after_line = next((line for line in lines if line.startswith("After=")), None)
     assert after_line is not None
