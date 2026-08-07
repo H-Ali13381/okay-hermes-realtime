@@ -4,7 +4,7 @@
 
 Let a user say a natural request such as “play the latest Technology Connections video” and have Okay Hermes Realtime open the selected YouTube video in a temporary `mpv` popup.
 
-The initial version prioritizes predictable audio ownership over voice media control. It closes the Realtime microphone before playback begins and inhibits native wake-word inference until the player exits. Playback is controlled with `mpv` keyboard controls; voice pause, stop, and volume are deferred until speaker-output cancellation is designed and verified.
+The initial version prioritizes a small lifecycle over voice media control. It closes the Realtime/WebRTC microphone before playback begins but leaves the native `okay-hermes` detector running normally. Playback is controlled with `mpv` keyboard controls; voice pause, stop, and volume are deferred until speaker-output cancellation is designed and verified.
 
 ## Decision at a glance
 
@@ -15,7 +15,7 @@ The initial version prioritizes predictable audio ownership over voice media con
 | Search selection | Resolve the first YouTube video with `yt-dlp` |
 | Player | `mpv`, opened as a small always-on-top temporary window |
 | Start timing | Prepare the player paused; begin audio only after the Realtime microphone and browser session close |
-| Wake-word behavior | Inhibit native wake-word inference while `mpv` is alive |
+| Wake-word behavior | Leave the native detector active; do not add a media-specific pause or inhibition state |
 | Playback controls | `mpv` keyboard controls only (`space`, seek keys, `q`) |
 | Concurrent playback | One owned player; a new play request replaces the previous one |
 | Deferred work | Voice pause/stop/volume and PipeWire/acoustic echo cancellation |
@@ -28,10 +28,10 @@ The initial version prioritizes predictable audio ownership over voice media con
 4. Hermes says one short confirmation containing the resolved title, such as “Opening ‘The Framework Desktop’.”
 5. The existing farewell/close path drains that spoken response and tears down the Realtime microphone and browser session.
 6. Only after teardown completes does the controller unpause `mpv`.
-7. Native wake-word inference remains inhibited for the lifetime of that `mpv` process.
-8. The user controls playback with the popup. Pressing `q`, closing the window, or reaching end-of-file exits `mpv` and re-arms wake-word detection.
+7. The native `okay-hermes` detector continues running normally while `mpv` plays.
+8. The user controls playback with the popup. Pressing `q`, closing the window, or reaching end-of-file exits `mpv` without requiring any listener re-arm transition.
 
-Hermes cannot be voice-activated while the popup is playing in this version. This is intentional: without headphones or acoustic echo cancellation, speaker audio could false-trigger the wake word or enter a new Realtime microphone session.
+Speaker audio may false-trigger the wake detector. This is an accepted model-quality failure rather than a reason to add a second listener lifecycle. A trigger follows the normal activation path even while `mpv` is playing. False activations should remain observable as potential hard-negative training examples through the existing wakeword data/evaluation workflow; this feature does not silently retain new audio or create a separate recording pipeline.
 
 ## Why `mpv` plus `yt-dlp`
 
@@ -55,7 +55,7 @@ References:
 - One controller-owned `mpv` subprocess and IPC socket.
 - Fixed popup geometry and fixed safe player arguments.
 - Paused preparation followed by playback only after voice teardown.
-- Native wake-word inhibition for the player lifetime.
+- An unchanged, continuously active native wake-word detector during playback.
 - Deterministic replacement, shutdown, and stale-state cleanup.
 - Installer/preflight, documentation, unit/contract tests, and a live voice smoke test.
 
@@ -63,6 +63,7 @@ References:
 
 - Voice pause, resume, stop, seek, volume, or playlist controls.
 - Keeping a Realtime microphone session open while video audio plays.
+- A media-specific listener pause/inhibition marker, tray state, or re-arm path.
 - PipeWire routing, echo-reference capture, WebRTC acoustic echo cancellation, or source separation.
 - Playlists, autoplay, queues, recommendations, or background audio mode.
 - Arbitrary websites, local files, model-selected executables, shell fragments, or model-selected `mpv`/`yt-dlp` flags.
@@ -121,7 +122,6 @@ MediaPlaybackManager.prepare(session_id, source)
       |
       +-- resolve first result with yt-dlp
       +-- validate canonical YouTube URL + bounded metadata
-      +-- create wake-inhibit lease
       +-- spawn controller-owned mpv paused
       +-- establish private IPC socket / confirm process alive
       v
@@ -136,7 +136,7 @@ MediaPlaybackManager.commit(playback_id)
       +-- unpause mpv through private IPC
       +-- monitor exact PID/process handle
       v
-mpv exit -> remove IPC + inhibit lease -> fresh-window wake re-arm
+mpv exit -> remove IPC + reap exact owned process
 ```
 
 ## Components
@@ -169,36 +169,20 @@ Responsibilities:
 - Verify that `mpv` and `yt-dlp` are available before advertising successful preparation.
 - Replace an existing owned player through bounded terminate-then-kill teardown.
 - Create an opaque playback ID and private runtime directory under `$XDG_RUNTIME_DIR/okay-hermes-realtime/media/` with mode `0700`.
-- Acquire the wake-inhibit lease before any player audio can begin.
 - Spawn `mpv` with a fixed argv, no shell, a private IPC socket, and paused playback.
 - Confirm the exact process remains alive and that its IPC endpoint becomes ready before returning `prepared`.
 - Bind the prepared playback to the exact active voice session.
 - Unpause only when that session finishes through the expected completed/model-request teardown path.
 - Abort a prepared player if the owning voice session fails, is cancelled, becomes stale, or the service shuts down before commit.
-- Monitor and reap the process, remove only its own runtime files/lease, and expose bounded status for `/health` and diagnostics.
+- Monitor and reap the process, remove only its own runtime files, and expose bounded status for `/health` and diagnostics.
 
 The model cannot supply player flags, geometry, paths, environment variables, IPC commands, or process identifiers.
 
-### 4. Native wake-word inhibition lease
+### 4. Native listener remains independent
 
-The controller and native listener share one mode-protected runtime marker owned by Okay Hermes Realtime. The marker contains an opaque playback generation and owning controller/player identity for diagnostics; its contents are never model-controlled.
+Media playback does not add a control channel, marker, pause state, status value, or re-arm transition to the native wake listener. PipeWire capture, health reporting, model-window handling, and activation behavior continue exactly as they do when no player exists.
 
-Listener behavior:
-
-- Check inhibition state before every inference interval.
-- Continue servicing PipeWire buffers and health reporting, but do not run wake-word inference while inhibited.
-- Reset consecutive-hit state while inhibited.
-- Report `inhibited` as an intentional healthy state rather than a capture failure.
-- When inhibition clears, discard buffered media-era samples and wait for one complete fresh model window before inference resumes.
-
-Controller behavior:
-
-- Create the marker atomically before the paused player is committed.
-- Remove it only when the matching owned player exits or is torn down.
-- Clean stale runtime state on startup after confirming no controller-owned player survives.
-- Remove the marker and kill/reap the player during ordered service shutdown.
-
-The tray/status surface should distinguish “wake word paused for video playback” from microphone failure.
+If playback audio produces a false wake, the ordinary activation path runs. The event is useful evidence for wakeword evaluation and potential hard-negative training, but collection and labeling remain responsibilities of the existing wakeword workflow rather than this media feature. The media implementation must not silently begin retaining microphone audio.
 
 ### 5. Session-bound commit
 
@@ -206,7 +190,7 @@ Prepared playback is not audible until the voice session is gone. The controller
 
 - `prepared` result requests the existing drained close path.
 - On successful matching session finalization, commit sends an unpause command over the private `mpv` IPC socket.
-- On any mismatched, stale, failed, or cancelled session finalization, abort terminates the paused player and releases inhibition.
+- On any mismatched, stale, failed, or cancelled session finalization, abort terminates the paused player.
 - A stale teardown from an older session can never commit or terminate a newer playback generation.
 
 This avoids timer-based audio races. There is no fixed “sleep two seconds and hope the microphone closed” delay.
@@ -235,7 +219,7 @@ The first version should use `mpv`’s normal keyboard controls. `q` exits; clos
 - Replaying an identical tool call returns the cached preparation result and does not launch another player.
 - Conflicting reuse of a `call_id` remains rejected.
 - A new non-replayed play request replaces the previous owned player only after the new request has passed validation and resolution.
-- Playback IDs and wake-inhibit generations prevent late watcher callbacks from clearing a newer player’s state.
+- Playback IDs prevent late watcher callbacks from clearing or terminating a newer player’s state.
 - Only one playback manager instance belongs to the controller process.
 
 ## Error handling
@@ -248,11 +232,11 @@ The first version should use `mpv`’s normal keyboard controls. `q` exits; clos
 | Non-YouTube URL | Reject; do not reinterpret as a search query |
 | Invalid/malformed resolver output | Controlled failure with bounded diagnostics |
 | Existing player will not terminate | Fail closed; do not launch a second unmanaged player |
-| Player exits before preparation completes | Controlled tool failure; release inhibition |
-| IPC readiness timeout | Terminate/reap player, release inhibition, return failure |
-| Voice teardown fails/cancels | Abort paused player and release inhibition |
-| Player exits during playback | Reap it, remove matching lease/runtime files, wait for fresh wake window, re-arm |
-| Controller shutdown/restart | Kill/reap owned player, remove matching lease, recover cleanly |
+| Player exits before preparation completes | Controlled tool failure; reap the owned process |
+| IPC readiness timeout | Terminate/reap player, remove its runtime files, return failure |
+| Voice teardown fails/cancels | Abort and reap the paused player |
+| Player exits during playback | Reap it and remove matching runtime files; listener state is unchanged |
+| Controller shutdown/restart | Kill/reap the owned player and recover stale player runtime state cleanly |
 | Stale player watcher or stale session teardown | Ignore; it cannot mutate the current playback generation |
 
 Errors returned to the model are concise and do not expose cookies, signed stream URLs, arbitrary stderr, runtime tokens, IPC paths, or local process details.
@@ -307,20 +291,18 @@ The Realtime instructions and tool description should enforce:
 
 - Fixed `mpv` argv contains paused startup, popup policy, canonical URL, and private IPC path.
 - Model input never reaches argv as flags or paths.
-- Preparation acquires inhibition before spawn/commit and returns only after process/IPC readiness.
+- Preparation returns only after process/IPC readiness.
 - Commit unpauses only the exact prepared generation.
 - Failed/cancelled/stale session finalization aborts instead of committing.
 - A new request replaces and reaps the old player.
 - Normal exit, window close, EOF, crash, timeout, and shutdown all release only the matching generation.
 - Identical replay never launches twice; call-ID conflict remains rejected.
 
-### Native listener tests
+### Native listener regression tests
 
-- Inhibited state skips inference while capture health remains intentional/healthy.
-- Consecutive-hit state resets during inhibition.
-- Re-arm requires a complete fresh post-media model window.
-- Stale lease recovery is deterministic.
-- The tray/status parser distinguishes inhibited capture from unhealthy capture.
+- Media preparation, commit, player exit, and controller restart do not create listener markers or mutate listener state.
+- Capture health and the normal inference loop remain active while playback exists.
+- The tray continues using its existing controller/capture states; no media-specific listener state is added.
 
 ### Gateway and browser contract tests
 
@@ -329,19 +311,19 @@ The Realtime instructions and tool description should enforce:
 - The browser locks VAD and drains the one short confirmation before teardown, using the existing exact response-ID close behavior.
 - No `mpv` unpause occurs before matching controller finalization.
 - Stale teardown cannot commit newer playback.
-- `/health` reports bounded media state and wake inhibition without local paths or tokens.
+- `/health` reports bounded media state without local paths or tokens.
 
 ### End-to-end smoke test
 
-1. Confirm no player or inhibit marker exists.
+1. Confirm no owned player or stale media runtime state exists.
 2. Activate by native wake word without headphones.
 3. Say a distinctive search request.
 4. Verify the expected resolved title is spoken.
 5. Verify the Realtime microphone/browser close before `mpv` audio starts.
 6. Verify one small always-on-top `mpv` window appears and plays the selected video.
-7. While it plays, verify native listener status is `inhibited` and no wake inference/activation occurs from speaker audio.
+7. While it plays, verify native listener capture and inference remain active and no media-specific listener state appears.
 8. Press `q`.
-9. Verify the exact player is reaped, runtime IPC/lease files are removed, one fresh model window is accumulated, and native wake activation works again.
+9. Verify the exact player is reaped and its runtime IPC files are removed; the listener requires no re-arm transition.
 10. Repeat with a second request, no-result query, missing-player simulation, and controller restart.
 
 Final repository gates remain the project’s normal Python, web, native, packaging, systemd, and live-runtime checks.
@@ -350,9 +332,9 @@ Final repository gates remain the project’s normal Python, web, native, packag
 
 Voice pause, stop, resume, seek, and volume are deliberately excluded from this version. They require Hermes to listen while media is audible, which is unsafe without removing speaker playback from the microphone path.
 
-A future design must evaluate and verify a real audio-reference path, such as PipeWire/WebRTC acoustic echo cancellation using the player sink monitor as the far-end reference. It must measure residual playback leakage, wake-word false activations, speech recognition accuracy, latency, and behavior across speakers, headphones, Bluetooth, device changes, and high volume. Simple noise suppression, prompt instructions, or subtracting arbitrary PCM without clock/drift handling are not acceptable substitutes.
+A future design must evaluate and verify a real audio-reference path, such as PipeWire/WebRTC acoustic echo cancellation using the player sink monitor as the far-end reference. It must measure residual playback leakage, speech recognition accuracy, latency, and behavior across speakers, headphones, Bluetooth, device changes, and high volume. Wake-word false activations during ordinary playback remain useful independent wake-model evidence. Simple noise suppression, prompt instructions, or subtracting arbitrary PCM without clock/drift handling are not acceptable substitutes.
 
-Only after that audio path passes should `media_control` expose IPC-backed pause/stop/volume operations and allow wake-word detection during playback.
+Only after that audio path passes should `media_control` expose IPC-backed pause/stop/volume operations while a Realtime conversational microphone remains open.
 
 ## Approved decisions
 
@@ -360,6 +342,6 @@ Only after that audio path passes should `media_control` expose IPC-backed pause
 - Resolve one result before playback and confirm the selected title.
 - Use `mpv`, not VLC, Celluloid, or a browser popup.
 - Prepare playback paused and start it only after the Realtime microphone closes.
-- Inhibit native wake-word inference until the `mpv` process exits.
-- Hermes is unavailable by voice during playback in the initial version.
+- Leave the native `okay-hermes` detector active during playback; add no media-specific inhibition or re-arm lifecycle.
+- Accept and observe speaker-induced false wakes as potential hard-negative training evidence rather than suppressing them in the media feature.
 - Keep pause, stop, volume, and acoustic echo cancellation as explicit follow-up work.
