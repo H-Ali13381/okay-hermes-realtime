@@ -101,7 +101,7 @@ def _boards_payload() -> str:
     )
 
 
-def test_handoff_creates_kanban_card_with_request_body_and_defaults(
+def test_handoff_creates_kanban_card_with_direct_task_and_defaults(
     isolated_env: pytest.MonkeyPatch,
 ) -> None:
     runner = _RecordingRun()
@@ -110,7 +110,7 @@ def test_handoff_creates_kanban_card_with_request_body_and_defaults(
 
     output = CapabilityBroker().execute(
         "handoff_to_heavy_agent",
-        {"request": "Summarize the   weather for tomorrow"},
+        {"task": "Summarize the   weather for tomorrow"},
     )
 
     assert output["ok"] is True
@@ -125,10 +125,11 @@ def test_handoff_creates_kanban_card_with_request_body_and_defaults(
         "/usr/local/bin/fake-hermes",
         "kanban",
         "create",
-        "Voice handoff: Summarize the weather for tomorrow",
+        "Summarize the weather for tomorrow",
     ]
     body = create_cmd[create_cmd.index("--body") + 1]
-    assert "Request:\nSummarize the   weather for tomorrow" in body
+    assert "Task:\nSummarize the   weather for tomorrow" in body
+    assert "Voice handoff from Okay Hermes Realtime." in body
     assert "Acceptance criteria:" in body
     assert create_cmd[create_cmd.index("--assignee") + 1] == "default"
     assert create_cmd[create_cmd.index("--created-by") + 1] == "okay-hermes-realtime"
@@ -147,7 +148,7 @@ def test_handoff_dispatches_once_after_create(
 
     output = CapabilityBroker().execute(
         "handoff_to_heavy_agent",
-        {"request": "probe dispatch"},
+        {"task": "probe dispatch"},
     )
 
     assert output["ok"] is True
@@ -171,7 +172,7 @@ def test_handoff_skips_dispatch_when_disabled(
 
     output = CapabilityBroker().execute(
         "handoff_to_heavy_agent",
-        {"request": "probe no dispatch"},
+        {"task": "probe no dispatch"},
     )
 
     assert output["ok"] is True
@@ -186,7 +187,7 @@ def test_handoff_failure_from_kanban_is_controlled(
     _patch_run(isolated_env, runner)
 
     with pytest.raises(ExecutionContractError, match="board not initialized"):
-        CapabilityBroker().execute("handoff_to_heavy_agent", {"request": "probe failure"})
+        CapabilityBroker().execute("handoff_to_heavy_agent", {"task": "probe failure"})
 
 
 def test_handoff_create_timeout_is_controlled(
@@ -198,7 +199,7 @@ def test_handoff_create_timeout_is_controlled(
     isolated_env.setattr(capabilities.subprocess, "run", slow_run)
 
     with pytest.raises(ExecutionContractError, match="timed out"):
-        CapabilityBroker().execute("handoff_to_heavy_agent", {"request": "probe timeout"})
+        CapabilityBroker().execute("handoff_to_heavy_agent", {"task": "probe timeout"})
 
 
 def test_handoff_missing_hermes_binary_is_controlled_without_path(
@@ -217,7 +218,7 @@ def test_handoff_missing_hermes_binary_is_controlled_without_path(
     isolated_env.setattr(capabilities.subprocess, "run", missing_run)
 
     with pytest.raises(ExecutionContractError, match="Hermes executable not found"):
-        CapabilityBroker().execute("handoff_to_heavy_agent", {"request": "probe binary"})
+        CapabilityBroker().execute("handoff_to_heavy_agent", {"task": "probe binary"})
 
 
 def test_handoff_records_ledger_and_status_reports_most_recent(
@@ -229,7 +230,7 @@ def test_handoff_records_ledger_and_status_reports_most_recent(
     runner.add("show", _FakeRun(0, stdout=_show_payload("t_recent42", "done", "It worked.")))
     _patch_run(isolated_env, runner)
 
-    CapabilityBroker().execute("handoff_to_heavy_agent", {"request": "first task"})
+    CapabilityBroker().execute("handoff_to_heavy_agent", {"task": "first task"})
     output = CapabilityBroker().execute("check_heavy_agent_task", {})
 
     show_cmd = runner.calls[-1]

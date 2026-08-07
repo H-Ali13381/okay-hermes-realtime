@@ -637,7 +637,7 @@ def test_execute_handoff_failure_returns_controlled_error_not_500(
             "scope": scope,
             "call_id": "call_handoff_01",
             "name": "handoff_to_heavy_agent",
-            "arguments": {"request": "probe controlled failure"},
+            "arguments": {"task": "probe controlled failure"},
         },
         headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
     )

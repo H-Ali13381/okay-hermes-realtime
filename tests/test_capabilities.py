@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import datetime
 
 import pytest
+from pydantic import ValidationError
 
 from realtime_action_spike.capabilities import (
     CapabilityBroker,
     ExecutionContractError,
+    HermesAgentArguments,
     UnknownCapabilityError,
     build_openai_tools,
 )
@@ -33,6 +35,49 @@ def test_tool_catalog_exposes_all_capabilities() -> None:
     assert all(tool["description"].strip() for tool in tools)
     assert all(tool["parameters"]["type"] == "object" for tool in tools)
     assert all(tool["parameters"]["additionalProperties"] is False for tool in tools)
+
+
+def test_handoff_tool_contract_requires_direct_task_not_request() -> None:
+    tool = next(tool for tool in build_openai_tools() if tool["name"] == "handoff_to_heavy_agent")
+    parameters = tool["parameters"]
+
+    assert parameters["required"] == ["task"]
+    assert "task" in parameters["properties"]
+    assert "request" not in parameters["properties"]
+
+    with pytest.raises(ExecutionContractError, match="unexpected argument: request"):
+        CapabilityBroker().execute(
+            "handoff_to_heavy_agent",
+            {"request": "Change the wallpaper."},
+        )
+
+
+@pytest.mark.parametrize(
+    "wrapped_task",
+    [
+        "Have Hermes audit the configuration.",
+        "Ask Hermes to audit the configuration.",
+        "Add a Kanban task to audit the configuration.",
+        "Put this request on Kanban: audit the configuration.",
+        "Send this to Hermes: audit the configuration.",
+    ],
+)
+def test_handoff_contract_rejects_routing_wrappers(wrapped_task: str) -> None:
+    with pytest.raises(ValidationError, match="direct task"):
+        HermesAgentArguments.model_validate({"task": wrapped_task})
+
+
+@pytest.mark.parametrize(
+    "direct_task",
+    [
+        "Build a Kanban dashboard for this project.",
+        "Audit Hermes Agent configuration for stale provider settings.",
+    ],
+)
+def test_handoff_contract_preserves_literal_kanban_and_hermes_subjects(
+    direct_task: str,
+) -> None:
+    assert HermesAgentArguments.model_validate({"task": direct_task}).task == direct_task
 
 
 def test_current_time_executes_locally_with_explicit_timezone() -> None:

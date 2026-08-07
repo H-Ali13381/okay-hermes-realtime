@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from collections.abc import Callable, Mapping
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 JsonObject = dict[str, Any]
 NowProvider = Callable[[ZoneInfo | None], datetime]
@@ -45,12 +46,39 @@ class EndSessionArguments(StrictArguments):
     reason: str | None = Field(default=None, max_length=120)
 
 
+_ROUTING_WRAPPER_PREFIX = re.compile(
+    r"""(?ix)^\s*(?:
+        (?:have|ask|tell|let)\s+hermes(?:\s+agent)?\b
+        |(?:send|hand|give)\s+(?:this|that|it|the\s+(?:request|task|job))
+            \s+to\s+hermes(?:\s+agent)?\b
+        |(?:add|create)\s+(?:a\s+)?(?:new\s+)?kanban\s+task\b
+        |(?:add|create)\s+(?:a\s+)?(?:new\s+)?task\s+(?:to|on|in)
+            \s+(?:the\s+)?kanban\b
+        |put\s+(?:(?:this|that|the)\s+)?(?:request|task|job)?\s*
+            (?:on|onto|in|into)\s+(?:the\s+)?kanban\b
+    )"""
+)
+
+
 class HermesAgentArguments(StrictArguments):
-    request: str = Field(
+    task: str = Field(
         min_length=1,
         max_length=4_000,
-        description="Complete, self-contained request to hand to the full Hermes Agent.",
+        description=(
+            "Direct, complete, self-contained task for the full Hermes Agent. State the work "
+            "itself, preserve every user constraint, and omit routing language such as "
+            "'Have Hermes', 'add a Kanban task', or 'put this on Kanban'."
+        ),
     )
+
+    @field_validator("task")
+    @classmethod
+    def _task_is_transport_neutral(cls, value: str) -> str:
+        if _ROUTING_WRAPPER_PREFIX.search(value):
+            raise ValueError(
+                "state the direct task itself without Hermes or Kanban routing language"
+            )
+        return value
 
 
 class TaskStatusArguments(StrictArguments):
@@ -197,27 +225,27 @@ def _run_hermes(cmd: list[str], timeout: float, failure: str) -> str:
     return output
 
 
-def _kanban_title(request: str) -> str:
-    compact = " ".join(request.split())
-    return f"Voice handoff: {compact[:80]}" if compact else "Voice handoff"
+def _kanban_title(task: str) -> str:
+    compact = " ".join(task.split())
+    return compact[:80]
 
 
 def _create_kanban_handoff(
-    request: str,
+    task: str,
     *,
     hermes_bin: str | None = None,
     board: tuple[str, str] | None = None,
 ) -> JsonObject:
     hermes_bin = hermes_bin or _resolve_hermes_bin()
     timeout = float(os.getenv("HERMES_KANBAN_CREATE_TIMEOUT_SECONDS", "30"))
-    title = _kanban_title(request)
+    title = _kanban_title(task)
     body = (
         "Voice handoff from Okay Hermes Realtime.\n\n"
         "Acceptance criteria:\n"
         "- Handle the user's request with full Hermes Agent tools, memory, and skills.\n"
         "- Verify any concrete claims or file/system changes before completion.\n"
         "- Keep the final summary concise enough to read or speak back to the user.\n\n"
-        f"Request:\n{request}"
+        f"Task:\n{task}"
     )
     cmd = [hermes_bin, "kanban"]
     if board is not None:
@@ -243,10 +271,10 @@ def _create_kanban_handoff(
         if provider:
             cmd.extend(["--provider", provider])
     output = _run_hermes(cmd, timeout, "Kanban create")
-    task = _parse_kanban_create_output(output)
+    created_task = _parse_kanban_create_output(output)
     if os.getenv("HERMES_KANBAN_DISPATCH_AFTER_CREATE", "1") not in {"0", "false", "False"}:
         _dispatch_kanban_once(hermes_bin, board[0] if board else None)
-    return task
+    return created_task
 
 
 def _parse_kanban_create_output(output: str) -> JsonObject:
@@ -318,7 +346,7 @@ def _handoff_to_hermes_agent(arguments: StrictArguments, _now_provider: NowProvi
     hermes_bin = _resolve_hermes_bin()
     board = _resolve_current_kanban_board(hermes_bin)
     task = _create_kanban_handoff(
-        arguments.request,
+        arguments.task,
         hermes_bin=hermes_bin,
         board=board,
     )
