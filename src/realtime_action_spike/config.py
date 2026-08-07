@@ -10,6 +10,8 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, m
 
 from .capabilities import build_openai_tools
 
+DEFAULT_BRAVE_BIN = "brave-origin"
+
 DEFAULT_INSTRUCTIONS = """# Role and objective
 You are a concise, natural realtime voice assistant in a local function-calling test.
 Hold an ordinary conversation and use the supplied tools for supported assistant actions.
@@ -65,7 +67,7 @@ class Settings(BaseModel):
 
     activation_socket_path: str = ""
 
-    brave_bin: str = "/opt/brave.com/brave-origin-nightly/brave"
+    brave_bin: str = DEFAULT_BRAVE_BIN
     voice_browser_profile: str = "~/.local/share/okay-hermes-realtime/brave-profile"
     voice_page_url: str = "http://127.0.0.1:8765/voice"
     voice_browser_start_timeout_seconds: float = 20.0
@@ -127,9 +129,7 @@ class Settings(BaseModel):
                 "gateway_host": os.getenv("GATEWAY_HOST", "127.0.0.1"),
                 "gateway_port": os.getenv("GATEWAY_PORT", "8765"),
                 "activation_socket_path": activation_socket_path,
-                "brave_bin": os.getenv(
-                    "BRAVE_BIN", "/opt/brave.com/brave-origin-nightly/brave"
-                ),
+                "brave_bin": os.getenv("BRAVE_BIN", DEFAULT_BRAVE_BIN),
                 "voice_browser_profile": os.getenv(
                     "VOICE_BROWSER_PROFILE",
                     "~/.local/share/okay-hermes-realtime/brave-profile",

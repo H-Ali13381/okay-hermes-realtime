@@ -31,7 +31,7 @@ def test_settings_defaults_for_browser_automation(monkeypatch: pytest.MonkeyPatc
 
     settings = Settings.from_env()
 
-    assert settings.brave_bin == "/opt/brave.com/brave-origin-nightly/brave"
+    assert settings.brave_bin == "brave-origin"
     assert settings.voice_browser_profile == "~/.local/share/okay-hermes-realtime/brave-profile"
     assert settings.voice_page_url == "http://127.0.0.1:8765/voice"
     assert settings.voice_browser_start_timeout_seconds == 20.0

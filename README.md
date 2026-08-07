@@ -27,7 +27,7 @@ The controller launches a dedicated Brave app window in its own process group an
 
 ## Install
 
-Runtime prerequisites: a Linux user systemd session, PipeWire/WirePlumber, Brave (configurable via `BRAVE_BIN`; the default targets Brave Origin Nightly), Qt 6 development packages with CMake/Ninja for the tray, a wake-word ONNX model, ONNX Runtime, `uv`, and an OpenAI API key with Realtime access. Rebuilding the committed browser bundle additionally requires Node.js and npm.
+Runtime prerequisites: a Linux user systemd session, PipeWire/WirePlumber, Brave (configurable via `BRAVE_BIN`; the default resolves the packaged `brave-origin` command rather than a version-specific `/opt` path), Qt 6 development packages with CMake/Ninja for the tray, a wake-word ONNX model, ONNX Runtime, `uv`, and an OpenAI API key with Realtime access. Rebuilding the committed browser bundle additionally requires Node.js and npm.
 
 ```bash
 git clone https://github.com/H-Ali13381/okay-hermes-realtime.git
