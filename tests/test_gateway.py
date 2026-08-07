@@ -13,6 +13,8 @@ from realtime_action_spike.config import Settings, build_realtime_session
 from realtime_action_spike.gateway import (
     LOCAL_CLIENT_HEADER,
     LOCAL_CLIENT_HEADER_VALUE,
+    LOCAL_CONTROLLER_SESSION_HEADER,
+    LOCAL_EXECUTION_SCOPE_HEADER,
     OPENAI_REALTIME_CALLS_URL,
     _relay_control_websocket,
     create_app,
@@ -357,6 +359,38 @@ def test_session_endpoint_rejects_stale_query_binding_before_upstream() -> None:
     )
 
     assert response.status_code == 409
+    assert upstream.calls == []
+
+
+def test_session_endpoint_rejects_header_binding_without_local_client_gate() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_unused"},
+        )
+    )
+    controller = ActiveSessionController(active_session_id="active-session-5678")
+    client = TestClient(
+        create_app(
+            settings(),
+            upstream_client=upstream,
+            controller=controller,  # type: ignore[arg-type]
+        )
+    )
+
+    response = client.post(
+        "/session",
+        content="v=0\r\nmock-offer",
+        headers={
+            "Content-Type": "application/sdp",
+            LOCAL_CONTROLLER_SESSION_HEADER: "active-session-5678",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Invalid local voice client"}
+    assert LOCAL_EXECUTION_SCOPE_HEADER not in response.headers
     assert upstream.calls == []
 
 

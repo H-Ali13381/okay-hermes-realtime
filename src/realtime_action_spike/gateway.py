@@ -438,23 +438,17 @@ def create_app(
         ):
             raise HTTPException(status_code=400, detail="Conflicting local session bindings")
 
-        if query_session_id is not None:
+        local_session_id = query_session_id or header_session_id
+        if local_session_id is not None:
             if request.headers.get(LOCAL_CLIENT_HEADER) != LOCAL_CLIENT_HEADER_VALUE:
                 raise HTTPException(status_code=403, detail="Invalid local voice client")
-            if _LOCAL_SESSION_ID_RE.fullmatch(query_session_id) is None:
+            if _LOCAL_SESSION_ID_RE.fullmatch(local_session_id) is None:
                 raise HTTPException(status_code=400, detail="Invalid local session binding")
-            if _controller.active_session_id != query_session_id:
+            if _controller.active_session_id != local_session_id:
                 raise HTTPException(
                     status_code=409,
                     detail="Local voice session is no longer active",
                 )
-
-        local_session_id = query_session_id or header_session_id
-        if (
-            local_session_id is not None
-            and _LOCAL_SESSION_ID_RE.fullmatch(local_session_id) is None
-        ):
-            raise HTTPException(status_code=400, detail="Invalid local session binding")
 
         try:
             sdp = (await request.body()).decode("utf-8")
