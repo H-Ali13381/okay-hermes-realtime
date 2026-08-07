@@ -191,6 +191,12 @@ def test_pure_state_helpers_compile_and_match_health_contract(tmp_path: Path) ->
                     DaemonState::Error);
                 assert(okay_hermes_realtime_tray::stateFromInputs(
                     true, CaptureHealth::Healthy, true, false, ControllerHealth::Ready) ==
+                    DaemonState::NoMicrophone);
+                assert(okay_hermes_realtime_tray::stateFromInputs(
+                    true, CaptureHealth::Unknown, true, true, ControllerHealth::Ready) ==
+                    DaemonState::Starting);
+                assert(okay_hermes_realtime_tray::stateFromInputs(
+                    true, CaptureHealth::Unknown, false, true, ControllerHealth::Ready) ==
                     DaemonState::Starting);
                 return 0;
             }}

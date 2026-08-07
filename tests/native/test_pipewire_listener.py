@@ -110,6 +110,22 @@ def test_no_forbidden_task14_tokens_in_source() -> None:
         assert token not in source, f"found forbidden token: {token}"
 
 
+def test_stream_failure_marks_run_failed_for_nonzero_exit() -> None:
+    source = read_source()
+
+    on_state = function_source(source, "on_state_changed")
+    assert "PW_STREAM_STATE_ERROR" in on_state
+    assert "atomic_store(&data->failed, true)" in on_state
+    # A graceful stop clears `running` first (signal handler), so the
+    # UNCONNECTED callback fired during teardown must not mark the run
+    # as failed or systemd would restart a deliberately stopped service.
+    assert "atomic_compare_exchange_strong(&data->running" in on_state
+
+    main_body = function_source(source, "main")
+    assert "atomic_load(&data.failed)" in main_body
+    assert "status = 1" in main_body
+
+
 def test_rt_callback_is_dedicated_audio_ingest() -> None:
     source = read_source()
     on_process = function_source(source, "on_process")

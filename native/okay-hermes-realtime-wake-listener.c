@@ -93,6 +93,7 @@ struct listener_data
 
     pthread_t worker_thread;
     _Atomic bool running;
+    _Atomic bool failed;
 
     char capture_health_path[4096];
 };
@@ -797,6 +798,7 @@ static void *listener_worker(void *arg)
 
     model_window = malloc((size_t)MODEL_SAMPLES * sizeof(float));
     if (model_window == NULL) {
+        atomic_store(&data->failed, true);
         atomic_store(&data->running, false);
         if (data->loop != NULL)
             pw_main_loop_quit(data->loop);
@@ -804,7 +806,7 @@ static void *listener_worker(void *arg)
     }
 
     if (wake_model_init(&data->model, data->options.model_path) < 0) {
-        write_capture_status(data, "handler_failed");
+        atomic_store(&data->failed, true);
         free(model_window);
         atomic_store(&data->running, false);
         if (data->loop != NULL)
@@ -969,8 +971,15 @@ static void on_state_changed(void *userdata, enum pw_stream_state old, enum pw_s
     (void)error;
 
     if (state == PW_STREAM_STATE_ERROR || state == PW_STREAM_STATE_UNCONNECTED) {
-        atomic_store(&data->running, false);
-        pw_main_loop_quit(data->loop);
+        // Only the first failure flips the exit code. During a graceful stop
+        // the signal handler has already cleared `running` before the stream
+        // is torn down, so the UNCONNECTED callback on shutdown must not
+        // mark the run as failed (systemd would restart a stopped service).
+        bool expected_running = true;
+        if (atomic_compare_exchange_strong(&data->running, &expected_running, false)) {
+            atomic_store(&data->failed, true);
+            pw_main_loop_quit(data->loop);
+        }
     }
 }
 
@@ -1388,6 +1397,9 @@ int main(int argc, char *argv[])
 
     atomic_store(&data.running, false);
     pthread_join(data.worker_thread, NULL);
+
+    if (atomic_load(&data.failed))
+        status = 1;
 
 cleanup_stream:
     if (data.stream != NULL)

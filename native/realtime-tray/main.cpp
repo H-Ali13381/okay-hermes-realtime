@@ -170,7 +170,9 @@ private Q_SLOTS:
             turnOnAction->setEnabled(false);
             turnOffAction->setEnabled(anyControlledUnitActive());
             openVoicePageAction->setEnabled(controllerActive);
-            tray->setToolTip("Okay Hermes Realtime: no microphone available");
+            tray->setToolTip(microphoneAvailable()
+                                 ? "Okay Hermes Realtime: microphone not capturing yet"
+                                 : "Okay Hermes Realtime: no microphone available");
             tray->setIcon(stateIcon(QColor(107, 114, 128)));
             return;
         case DaemonState::Error:

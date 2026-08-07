@@ -99,6 +99,11 @@ def test_wakeword_unit_contract_and_args():
     ):
         assert item in after_line
 
+    # The listener must keep retrying forever (e.g. a USB mic that is absent
+    # or unresponsive at boot) so it can recover without manual intervention.
+    assert "StartLimitIntervalSec=0" in lines
+    assert "Restart=on-failure" in lines
+
     exec_cmd = _find_execstart(lines)
     assert WAKEWORD_EXEC in exec_cmd
     assert WAKEWORD_MODEL in exec_cmd

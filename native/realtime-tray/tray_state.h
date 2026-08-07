@@ -76,6 +76,13 @@ inline DaemonState stateFromInputs(
     if (!controllerActive && !wakewordActive) {
         return DaemonState::Off;
     }
+    if (controllerActive && !wakewordActive) {
+        // The controller is up but the capture listener is not, so no audio
+        // is being captured regardless of what a stale health file claims.
+        // Report the microphone as unavailable (gray) instead of spinning
+        // forever while systemd retries the listener.
+        return DaemonState::NoMicrophone;
+    }
     return DaemonState::Starting;
 }
 
