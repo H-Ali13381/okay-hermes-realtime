@@ -22,9 +22,13 @@ class FakeLauncher:
 class FakeController:
     def __init__(self) -> None:
         self.close_calls = 0
+        self.task_event_shutdown_calls = 0
 
     async def close_active_session(self) -> None:
         self.close_calls += 1
+
+    async def shutdown_task_events(self) -> None:
+        self.task_event_shutdown_calls += 1
 
 
 class FakeSocket:
@@ -132,6 +136,7 @@ async def test_readiness_waits_for_socket_and_http_then_shutdown_is_coordinated(
     assert harness.http.shutdown_calls == 1
     assert harness.socket.stop_calls == 1
     assert harness.controller.close_calls == 1
+    assert harness.controller.task_event_shutdown_calls == 1
 
 
 @pytest.mark.asyncio

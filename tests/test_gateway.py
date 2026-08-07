@@ -76,6 +76,22 @@ class CapturingLauncher:
 class ActiveSessionController:
     def __init__(self, active_session_id: str | None = None) -> None:
         self.active_session_id = active_session_id
+        self.registrations: list[tuple[str, object]] = []
+        self.permission_resolutions: list[dict[str, object]] = []
+
+    def register_handoff(self, session_id: str, record: object) -> bool:
+        self.registrations.append((session_id, record))
+        return True
+
+    async def resolve_task_permission(self, **kwargs: object) -> dict[str, object]:
+        self.permission_resolutions.append(kwargs)
+        return {
+            "action": "hermes.agent.permission_resolution",
+            "status": "unblocked",
+            "task_id": kwargs["task_id"],
+            "block_event_id": kwargs["block_event_id"],
+            "decision": kwargs["decision"],
+        }
 
 
 class OutboundController:
@@ -223,13 +239,15 @@ def test_session_configuration_uses_fast_natural_voice_defaults() -> None:
     assert session["audio"]["input"]["turn_detection"] == {
         "type": "semantic_vad",
         "eagerness": "high",
-        "create_response": True,
+        "create_response": False,
         "interrupt_response": True,
     }
     assert session["audio"]["input"]["transcription"] == {"model": "gpt-4o-mini-transcribe"}
     assert session["tool_choice"] == "auto"
-    assert len(session["tools"]) == 4
+    assert len(session["tools"]) == 5
     assert "Do not claim an action succeeded before its tool result" in session["instructions"]
+    assert "resolve_heavy_agent_block" in session["instructions"]
+    assert "Never infer approval" in session["instructions"]
 
 
 def test_health_reports_model_and_missing_key_without_secret_material() -> None:
@@ -247,6 +265,7 @@ def test_health_reports_model_and_missing_key_without_secret_material() -> None:
             "voice_end_session",
             "handoff_to_heavy_agent",
             "check_heavy_agent_task",
+            "resolve_heavy_agent_block",
         ],
         "controller_status": "idle",
     }
@@ -446,6 +465,72 @@ def test_bound_session_issues_scope_and_execute_replays_identical_call() -> None
     assert replay.content == first.content
     assert conflict.status_code == 409
     assert conflict.json()["error"]["type"] == "call_id_conflict"
+
+
+def test_permission_resolution_is_bound_to_live_scope_and_exact_block_event() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_permission"},
+        )
+    )
+    controller = ActiveSessionController(active_session_id="local-session-1234")
+    client = TestClient(
+        create_app(
+            settings(),
+            upstream_client=upstream,
+            controller=controller,  # type: ignore[arg-type]
+        )
+    )
+    session = client.post(
+        "/session?local_session_id=local-session-1234",
+        content="v=0\r\nmock-offer",
+        headers={
+            LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE,
+            "Content-Type": "application/sdp",
+        },
+    )
+    scope = session.headers["x-okay-hermes-execution-scope"]
+    request = {
+        "scope": scope,
+        "call_id": "call_permission_01",
+        "name": "resolve_heavy_agent_block",
+        "arguments": {
+            "task_id": "t_voice01",
+            "block_event_id": 17,
+            "decision": "approve_once",
+            "response": "Yes, overwrite that one file.",
+        },
+    }
+    headers = {LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE}
+
+    first = client.post("/execute", json=request, headers=headers)
+    replay = client.post("/execute", json=request, headers=headers)
+    invalid = client.post(
+        "/execute",
+        json={
+            **request,
+            "call_id": "call_permission_02",
+            "arguments": {**request["arguments"], "decision": "allow_always"},
+        },
+        headers=headers,
+    )
+
+    assert first.status_code == 200
+    assert first.json()["result"]["status"] == "unblocked"
+    assert replay.content == first.content
+    assert controller.permission_resolutions == [
+        {
+            "session_id": "local-session-1234",
+            "task_id": "t_voice01",
+            "block_event_id": 17,
+            "decision": "approve_once",
+            "response": "Yes, overwrite that one file.",
+        }
+    ]
+    assert invalid.status_code == 400
+    assert invalid.json()["error"]["type"] == "invalid_arguments"
 
 
 def test_execute_rejects_missing_or_stale_scope() -> None:

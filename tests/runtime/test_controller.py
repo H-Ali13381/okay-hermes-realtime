@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from realtime_action_spike.capabilities import HandoffRecord
 from realtime_action_spike.openai.interruption import (
     InterruptionEvent,
     InterruptionEventKind,
@@ -22,6 +23,8 @@ from realtime_action_spike.runtime.protocol import (
     SessionClosedMessage,
     StopMessage,
     StopReason,
+    TaskEventKind,
+    TaskEventMessage,
     TeardownCompleteMessage,
     TimingMessage,
     TimingName,
@@ -92,6 +95,24 @@ class SequenceFactory:
         return value
 
 
+class RecordingTaskEvents:
+    def __init__(self) -> None:
+        self.registrations: list[dict[str, object]] = []
+        self.resolutions: list[dict[str, object]] = []
+        self.shutdown_calls = 0
+
+    def register_task(self, **kwargs: object) -> bool:
+        self.registrations.append(kwargs)
+        return True
+
+    async def resolve_permission(self, **kwargs: object) -> dict[str, object]:
+        self.resolutions.append(kwargs)
+        return {"status": "unblocked", **kwargs}
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
 def interruption_controller() -> VoiceSessionController:
     return VoiceSessionController(
         DeterministicLauncher(),
@@ -138,6 +159,66 @@ async def test_busy_activation_is_reported_and_launcher_not_called_for_second_re
     assert first.session_id == "local-session-01"
     assert second.status == "busy"
     assert len(launcher.handles) == 1
+
+
+@pytest.mark.asyncio
+async def test_task_events_are_session_bound_and_permission_resolution_delegates() -> None:
+    task_events = RecordingTaskEvents()
+    controller = VoiceSessionController(
+        DeterministicLauncher(),
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-task-event"])),
+        session_id_factory=SequenceFactory(["local-task-event-01"]),
+        task_event_coordinator=task_events,  # type: ignore[arg-type]
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id == "local-task-event-01"
+    message = TaskEventMessage(
+        session_id=session_id,
+        event_id=11,
+        task_id="t_voice01",
+        kind=TaskEventKind.BLOCKED,
+        title="Voice handoff: probe",
+        detail="May I overwrite config.toml?",
+        requires_user_input=True,
+        block_kind="needs_input",
+    )
+
+    assert await controller.publish_task_event(session_id, message) is True
+    assert await controller.wait_for_outbound_message(session_id) == message
+    assert await controller.publish_task_event("other-session-01", message) is False
+
+    assert controller.register_handoff(
+        session_id,
+        HandoffRecord(
+            task_id="t_voice01",
+            title="Voice handoff: probe",
+            board_slug="default",
+            db_path="/tmp/kanban.db",
+        ),
+    ) is True
+    assert task_events.registrations == [
+        {
+            "session_id": session_id,
+            "task_id": "t_voice01",
+            "title": "Voice handoff: probe",
+            "board_slug": "default",
+            "db_path": "/tmp/kanban.db",
+        }
+    ]
+
+    result = await controller.resolve_task_permission(
+        session_id=session_id,
+        task_id="t_voice01",
+        block_event_id=11,
+        decision="approve_once",
+        response="Yes, that one file.",
+    )
+    assert result["status"] == "unblocked"
+    assert task_events.resolutions[0]["block_event_id"] == 11
+
+    await controller.shutdown_task_events()
+    assert task_events.shutdown_calls == 1
 
 
 @pytest.mark.asyncio

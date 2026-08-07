@@ -41,6 +41,15 @@ class SessionOutcome(StrEnum):
     TIMED_OUT = "timed_out"
 
 
+class TaskEventKind(StrEnum):
+    COMPLETED = "completed"
+    BLOCKED = "blocked"
+    GAVE_UP = "gave_up"
+    CRASHED = "crashed"
+    TIMED_OUT = "timed_out"
+    BLOCK_LOOP_DETECTED = "block_loop_detected"
+
+
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,128}$")
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -186,6 +195,45 @@ class SessionClosedMessage(_StrictBaseModel):
         return _validate_session_id(value)
 
 
+class TaskEventMessage(_StrictBaseModel):
+    """Controller-to-browser relay for an exact tracked Kanban event."""
+
+    type: Literal["task_event"] = "task_event"
+    session_id: str
+    event_id: int = Field(ge=1)
+    task_id: str = Field(min_length=3, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    kind: TaskEventKind
+    title: str = Field(min_length=1, max_length=160)
+    detail: str | None = Field(default=None, max_length=400)
+    requires_user_input: bool = False
+    block_kind: Literal["dependency", "needs_input", "transient", "capability"] | None = None
+
+    @field_validator("session_id")
+    @classmethod
+    def _validate_session_id(cls, value: str) -> str:
+        return _validate_session_id(value)
+
+    @field_validator("title", "detail")
+    @classmethod
+    def _validate_bounded_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if any(ord(character) < 32 and character not in {"\t", "\n"} for character in value):
+            raise ValueError("task event text contains control characters")
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("task event text must not be blank")
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_block_shape(self) -> TaskEventMessage:
+        if self.kind is not TaskEventKind.BLOCKED and (
+            self.requires_user_input or self.block_kind is not None
+        ):
+            raise ValueError("only blocked task events may request user input")
+        return self
+
+
 LoopbackMessage = Annotated[
     ActivationMessage
     | PageReadyMessage
@@ -195,6 +243,7 @@ LoopbackMessage = Annotated[
     | StopMessage
     | TeardownCompleteMessage
     | SessionClosedMessage
+    | TaskEventMessage
     ,
     Field(discriminator="type"),
 ]

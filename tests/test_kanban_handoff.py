@@ -14,6 +14,8 @@ from realtime_action_spike.capabilities import (
     CapabilityBroker,
     ExecutionContractError,
     clear_handoff_ledger,
+    latest_handoff,
+    parse_permission_resolution_arguments,
 )
 
 
@@ -51,6 +53,7 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[pytest.MonkeyPatch
         "HERMES_KANBAN_CREATE_TIMEOUT_SECONDS",
         "HERMES_KANBAN_DISPATCH_TIMEOUT_SECONDS",
         "HERMES_KANBAN_SHOW_TIMEOUT_SECONDS",
+        "HERMES_KANBAN_BOARDS_TIMEOUT_SECONDS",
         "HERMES_KANBAN_DISPATCH_AFTER_CREATE",
         "HERMES_KANBAN_HEAVY_ASSIGNEE",
         "HERMES_KANBAN_HEAVY_MAX_RUNTIME",
@@ -86,6 +89,18 @@ def _show_payload(
     )
 
 
+def _boards_payload() -> str:
+    return json.dumps(
+        [
+            {
+                "slug": "default",
+                "db_path": "/tmp/hermes-test-kanban.db",
+                "is_current": True,
+            }
+        ]
+    )
+
+
 def test_handoff_creates_kanban_card_with_request_body_and_defaults(
     isolated_env: pytest.MonkeyPatch,
 ) -> None:
@@ -105,7 +120,7 @@ def test_handoff_creates_kanban_card_with_request_body_and_defaults(
     assert result["task"]["id"] == "t_handoff01"
     assert result["spoken_summary"]
 
-    create_cmd = runner.calls[0]
+    create_cmd = next(call for call in runner.calls if "create" in call)
     assert create_cmd[:4] == [
         "/usr/local/bin/fake-hermes",
         "kanban",
@@ -136,7 +151,8 @@ def test_handoff_dispatches_once_after_create(
     )
 
     assert output["ok"] is True
-    assert runner.calls[1] == [
+    dispatch_cmd = next(call for call in runner.calls if "dispatch" in call)
+    assert dispatch_cmd == [
         "/usr/local/bin/fake-hermes",
         "kanban",
         "dispatch",
@@ -159,7 +175,7 @@ def test_handoff_skips_dispatch_when_disabled(
     )
 
     assert output["ok"] is True
-    assert len(runner.calls) == 1
+    assert all("dispatch" not in call for call in runner.calls)
 
 
 def test_handoff_failure_from_kanban_is_controlled(
@@ -209,6 +225,7 @@ def test_handoff_records_ledger_and_status_reports_most_recent(
 ) -> None:
     runner = _RecordingRun()
     runner.add("create", _FakeRun(0, stdout=_create_payload("t_recent42")))
+    runner.add("boards", _FakeRun(0, stdout=_boards_payload()))
     runner.add("show", _FakeRun(0, stdout=_show_payload("t_recent42", "done", "It worked.")))
     _patch_run(isolated_env, runner)
 
@@ -224,6 +241,39 @@ def test_handoff_records_ledger_and_status_reports_most_recent(
     assert result["status"] == "done"
     assert result["summary"] == "It worked."
     assert result["spoken_summary"] == "Your task is finished. It says: It worked."
+    handoff = latest_handoff()
+    assert handoff is not None
+    assert handoff.board_slug == "default"
+    assert handoff.db_path == "/tmp/hermes-test-kanban.db"
+    create_cmd = next(call for call in runner.calls if "create" in call)
+    assert create_cmd[2:5] == ["--board", "default", "create"]
+    dispatch_cmd = next(call for call in runner.calls if "dispatch" in call)
+    assert dispatch_cmd[2:5] == ["--board", "default", "dispatch"]
+
+
+def test_permission_resolution_arguments_are_exact_and_one_shot() -> None:
+    parsed = parse_permission_resolution_arguments(
+        {
+            "task_id": "t_recent42",
+            "block_event_id": 17,
+            "decision": "approve_once",
+            "response": "Yes, overwrite that one file.",
+        }
+    )
+
+    assert parsed.task_id == "t_recent42"
+    assert parsed.block_event_id == 17
+    assert parsed.decision == "approve_once"
+
+    with pytest.raises(ExecutionContractError, match="decision"):
+        parse_permission_resolution_arguments(
+            {
+                "task_id": "t_recent42",
+                "block_event_id": 17,
+                "decision": "allow_always",
+                "response": "yes",
+            }
+        )
 
 
 def test_status_accepts_explicit_task_id(isolated_env: pytest.MonkeyPatch) -> None:

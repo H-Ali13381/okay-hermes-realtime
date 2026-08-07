@@ -26,6 +26,10 @@ Hold an ordinary conversation and use the supplied tools for supported assistant
   memory-dependent, or deep reasoning requests, call handoff_to_heavy_agent.
 - When the user asks what happened with a handed-off task, call check_heavy_agent_task and
   relay its spoken summary.
+- When a background task is blocked, explain the exact requested permission and ask one short
+  question. If the user explicitly approves or denies that exact request, call
+  resolve_heavy_agent_block with the task id and block event id you were given.
+- Never infer approval, broaden its scope, or treat ambiguous speech as permission.
 - If no supplied tool can perform a requested side effect—such as timers or media
   playback/control—say briefly that it is unavailable.
 - Do not claim an action succeeded before its tool result.
@@ -51,6 +55,7 @@ class Settings(BaseModel):
     voice_browser_profile: str = "~/.local/share/okay-hermes-realtime/brave-profile"
     voice_page_url: str = "http://127.0.0.1:8765/voice"
     voice_browser_start_timeout_seconds: float = 20.0
+    kde_task_notifications: bool = True
 
     @staticmethod
     def default_activation_socket_path(xdg_runtime_dir: str | None = None) -> str:
@@ -122,6 +127,9 @@ class Settings(BaseModel):
                 "voice_browser_start_timeout_seconds": os.getenv(
                     "VOICE_BROWSER_START_TIMEOUT_SECONDS", "20.0"
                 ),
+                "kde_task_notifications": os.getenv(
+                    "KDE_TASK_NOTIFICATIONS", "true"
+                ),
             }
         )
 
@@ -145,7 +153,7 @@ def build_realtime_session(settings: Settings) -> dict[str, object]:
                 "turn_detection": {
                     "type": "semantic_vad",
                     "eagerness": "high",
-                    "create_response": True,
+                    "create_response": False,
                     "interrupt_response": True,
                 },
             },

@@ -64,6 +64,27 @@ class TaskStatusArguments(StrictArguments):
     )
 
 
+class PermissionResolutionArguments(StrictArguments):
+    task_id: str = Field(
+        min_length=3,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$",
+        description="Exact Kanban task id from the permission request.",
+    )
+    block_event_id: int = Field(
+        ge=1,
+        description="Exact task_events id carried by the permission request.",
+    )
+    decision: Literal["approve_once", "deny"] = Field(
+        description="One-shot approval or denial. Blanket approval is not supported.",
+    )
+    response: str = Field(
+        min_length=1,
+        max_length=500,
+        description="The user's explicit answer, without inferred or expanded permissions.",
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CapabilityDefinition:
     name: str
@@ -77,6 +98,8 @@ class CapabilityDefinition:
 class HandoffRecord:
     task_id: str
     title: str
+    board_slug: str | None = None
+    db_path: str | None = None
 
 
 _HANDOFF_LEDGER: list[HandoffRecord] = []
@@ -179,8 +202,13 @@ def _kanban_title(request: str) -> str:
     return f"Voice handoff: {compact[:80]}" if compact else "Voice handoff"
 
 
-def _create_kanban_handoff(request: str) -> JsonObject:
-    hermes_bin = _resolve_hermes_bin()
+def _create_kanban_handoff(
+    request: str,
+    *,
+    hermes_bin: str | None = None,
+    board: tuple[str, str] | None = None,
+) -> JsonObject:
+    hermes_bin = hermes_bin or _resolve_hermes_bin()
     timeout = float(os.getenv("HERMES_KANBAN_CREATE_TIMEOUT_SECONDS", "30"))
     title = _kanban_title(request)
     body = (
@@ -191,9 +219,10 @@ def _create_kanban_handoff(request: str) -> JsonObject:
         "- Keep the final summary concise enough to read or speak back to the user.\n\n"
         f"Request:\n{request}"
     )
-    cmd = [
-        hermes_bin,
-        "kanban",
+    cmd = [hermes_bin, "kanban"]
+    if board is not None:
+        cmd.extend(["--board", board[0]])
+    cmd.extend([
         "create",
         title,
         "--body",
@@ -206,7 +235,7 @@ def _create_kanban_handoff(request: str) -> JsonObject:
         os.getenv("HERMES_KANBAN_HEAVY_MAX_RUNTIME", "30m"),
         "--goal",
         "--json",
-    ]
+    ])
     provider = os.getenv("HERMES_KANBAN_HEAVY_PROVIDER", "").strip()
     model = os.getenv("HERMES_KANBAN_HEAVY_MODEL", "").strip()
     if model:
@@ -216,7 +245,7 @@ def _create_kanban_handoff(request: str) -> JsonObject:
     output = _run_hermes(cmd, timeout, "Kanban create")
     task = _parse_kanban_create_output(output)
     if os.getenv("HERMES_KANBAN_DISPATCH_AFTER_CREATE", "1") not in {"0", "false", "False"}:
-        _dispatch_kanban_once(hermes_bin)
+        _dispatch_kanban_once(hermes_bin, board[0] if board else None)
     return task
 
 
@@ -230,15 +259,41 @@ def _parse_kanban_create_output(output: str) -> JsonObject:
     return {"raw_output": parsed}
 
 
-def _dispatch_kanban_once(hermes_bin: str) -> None:
+def _dispatch_kanban_once(hermes_bin: str, board_slug: str | None = None) -> None:
+    cmd = [hermes_bin, "kanban"]
+    if board_slug:
+        cmd.extend(["--board", board_slug])
+    cmd.extend(["dispatch", "--max", "1"])
     with contextlib.suppress(FileNotFoundError, subprocess.TimeoutExpired):
         subprocess.run(
-            [hermes_bin, "kanban", "dispatch", "--max", "1"],
+            cmd,
             check=False,
             capture_output=True,
             text=True,
             timeout=float(os.getenv("HERMES_KANBAN_DISPATCH_TIMEOUT_SECONDS", "15")),
         )
+
+
+def _resolve_current_kanban_board(hermes_bin: str) -> tuple[str, str] | None:
+    try:
+        output = _run_hermes(
+            [hermes_bin, "kanban", "boards", "list", "--json"],
+            float(os.getenv("HERMES_KANBAN_BOARDS_TIMEOUT_SECONDS", "10")),
+            "Kanban boards list",
+        )
+        boards = json.loads(output)
+    except (ExecutionContractError, json.JSONDecodeError):
+        return None
+    if not isinstance(boards, list):
+        return None
+    for board in boards:
+        if not isinstance(board, dict) or board.get("is_current") is not True:
+            continue
+        slug = board.get("slug")
+        db_path = board.get("db_path")
+        if isinstance(slug, str) and slug and isinstance(db_path, str) and db_path:
+            return slug, db_path
+    return None
 
 
 def _show_kanban_task(task_id: str) -> JsonObject:
@@ -260,10 +315,23 @@ def _show_kanban_task(task_id: str) -> JsonObject:
 
 def _handoff_to_hermes_agent(arguments: StrictArguments, _now_provider: NowProvider) -> JsonObject:
     assert isinstance(arguments, HermesAgentArguments)
-    task = _create_kanban_handoff(arguments.request)
+    hermes_bin = _resolve_hermes_bin()
+    board = _resolve_current_kanban_board(hermes_bin)
+    task = _create_kanban_handoff(
+        arguments.request,
+        hermes_bin=hermes_bin,
+        board=board,
+    )
     task_id = str(task.get("id") or task.get("task_id") or "")
     if task_id:
-        _record_handoff(HandoffRecord(task_id=task_id, title=str(task.get("title", ""))))
+        _record_handoff(
+            HandoffRecord(
+                task_id=task_id,
+                title=str(task.get("title", "")),
+                board_slug=board[0] if board else None,
+                db_path=board[1] if board else None,
+            )
+        )
     return {
         "action": "hermes.agent.handoff",
         "status": "queued",
@@ -313,6 +381,15 @@ def _spoken_task_status(status: str, summary: str | None) -> str:
     return f"Your task status is {status}."
 
 
+def _permission_resolution_requires_live_session(
+    _arguments: StrictArguments,
+    _now_provider: NowProvider,
+) -> JsonObject:
+    raise ExecutionContractError(
+        "permission resolution requires the originating live voice session"
+    )
+
+
 CAPABILITIES: tuple[CapabilityDefinition, ...] = (
     CapabilityDefinition(
         name="assistant_get_current_time",
@@ -355,6 +432,17 @@ CAPABILITIES: tuple[CapabilityDefinition, ...] = (
         arguments_model=TaskStatusArguments,
         execution="kanban",
         handler=_check_heavy_agent_task,
+    ),
+    CapabilityDefinition(
+        name="resolve_heavy_agent_block",
+        description=(
+            "Record the user's explicit one-shot approval or denial for the exact blocked "
+            "Kanban event that the assistant just described. Never infer approval, never use "
+            "for another task or block event, and never broaden the requested permission."
+        ),
+        arguments_model=PermissionResolutionArguments,
+        execution="kanban",
+        handler=_permission_resolution_requires_live_session,
     ),
 )
 
@@ -399,6 +487,16 @@ def _format_validation_error(exc: ValidationError) -> str:
         else:
             messages.append(f"{location}: {error['msg']}")
     return "; ".join(messages)
+
+
+def parse_permission_resolution_arguments(
+    arguments: str | Mapping[str, Any],
+) -> PermissionResolutionArguments:
+    parsed = _parse_arguments(arguments)
+    try:
+        return PermissionResolutionArguments.model_validate(parsed)
+    except ValidationError as exc:
+        raise ExecutionContractError(_format_validation_error(exc)) from exc
 
 
 class CapabilityBroker:

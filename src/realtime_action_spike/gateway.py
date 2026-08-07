@@ -21,8 +21,9 @@ from starlette.websockets import WebSocketDisconnect
 from .capabilities import (
     CAPABILITIES,
     CapabilityBroker,
-    ExecutionContractError,
     UnknownCapabilityError,
+    latest_handoff,
+    parse_permission_resolution_arguments,
 )
 from .config import Settings, build_realtime_session
 from .runtime.browser import NoopBrowserHandle
@@ -364,7 +365,31 @@ def create_app(
             )
 
         try:
-            result = broker.execute(execution_request.name, execution_request.arguments)
+            if execution_request.name == "resolve_heavy_agent_block":
+                permission = parse_permission_resolution_arguments(execution_request.arguments)
+                permission_result = await _controller.resolve_task_permission(
+                    session_id=active_session_id,
+                    task_id=permission.task_id,
+                    block_event_id=permission.block_event_id,
+                    decision=permission.decision,
+                    response=permission.response,
+                )
+                result = {
+                    "ok": True,
+                    "capability": execution_request.name,
+                    "execution": "kanban",
+                    "result": permission_result,
+                }
+            else:
+                result = broker.execute(execution_request.name, execution_request.arguments)
+                if execution_request.name == "handoff_to_heavy_agent" and result.get("ok") is True:
+                    handoff = latest_handoff()
+                    returned_task = result.get("result", {}).get("task", {})
+                    returned_task_id = str(
+                        returned_task.get("id") or returned_task.get("task_id") or ""
+                    ) if isinstance(returned_task, dict) else ""
+                    if handoff is not None and handoff.task_id == returned_task_id:
+                        _controller.register_handoff(active_session_id, handoff)
         except UnknownCapabilityError as exc:
             status_code = 400
             body = {
@@ -372,7 +397,7 @@ def create_app(
                 "call_id": execution_request.call_id,
                 "error": {"type": "unknown_capability", "message": str(exc)},
             }
-        except ExecutionContractError as exc:
+        except (ValueError, RuntimeError) as exc:
             status_code = 400
             body = {
                 "ok": False,

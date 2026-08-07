@@ -1,6 +1,7 @@
 "use strict";
 
 import { canApplyRemoteAnswer } from "./peer-lifecycle.js";
+import { TaskTurnScheduler } from "./task-turn-scheduler.js";
 
 const startButton = document.getElementById("start-button");
 const stopButton = document.getElementById("stop-button");
@@ -37,7 +38,7 @@ let disconnectAfterResponse = false;
 let farewellResponseId = null;
 let farewellFallbackTimer = null;
 let transportFailureTimer = null;
-const handledCallIds = new Set();
+const functionCallExecutions = new Map();
 let receivedExecutionCount = 0;
 let isStopping = false;
 let controllerSocket = null;
@@ -50,6 +51,10 @@ let activeMarkSessionReady = null;
 let interruptionStartedMs = null;
 let waitingForNextAudio = false;
 const transcriptTurns = new Map();
+const taskTurnScheduler = new TaskTurnScheduler({
+  sendEvent: (event) => sendRealtimeEvent(event),
+  isReady: () => Boolean(dataChannel && dataChannel.readyState === "open" && !isStopping),
+});
 
 function sendControlMessage(message) {
   if (
@@ -103,6 +108,37 @@ function boundedDiagnosticText(value, maxLength = 512) {
   const normalized = value.replace(/[\u0000-\u001f\u007f]+/gu, " ").trim();
   if (!normalized) return undefined;
   return normalized.slice(0, maxLength);
+}
+
+function parseTaskEventMessage(event) {
+  const validKinds = new Set([
+    "completed",
+    "blocked",
+    "gave_up",
+    "crashed",
+    "timed_out",
+    "block_loop_detected",
+  ]);
+  if (
+    !event
+    || event.type !== "task_event"
+    || event.session_id !== localSessionId
+    || !Number.isInteger(event.event_id)
+    || event.event_id < 1
+    || typeof event.task_id !== "string"
+    || !/^[A-Za-z0-9_-]{3,128}$/u.test(event.task_id)
+    || typeof event.title !== "string"
+    || event.title.length < 1
+    || event.title.length > 160
+    || !validKinds.has(event.kind)
+    || typeof event.requires_user_input !== "boolean"
+  ) {
+    throw new Error("Invalid task event from controller");
+  }
+  if (event.detail !== null && event.detail !== undefined && typeof event.detail !== "string") {
+    throw new Error("Invalid task event detail");
+  }
+  return event;
 }
 
 function recordRealtimeResponseDone(event) {
@@ -217,6 +253,10 @@ function openControllerSocket() {
         controllerSessionClosed = true;
         stopConversation({ preserveError: true, reason: "native_cancel", sendStopMessage: false });
         socket.close();
+        return;
+      }
+      if (event.type === "task_event") {
+        taskTurnScheduler.onTaskEvent(parseTaskEventMessage(event));
         return;
       }
 
@@ -524,10 +564,18 @@ function sendRealtimeEvent(event, channel = dataChannel) {
   channel.send(JSON.stringify(event));
 }
 
-async function executeFunctionCall(item, sessionContext) {
+function executeFunctionCall(item, sessionContext) {
   const callId = item.call_id;
-  if (!callId || handledCallIds.has(callId)) return;
-  handledCallIds.add(callId);
+  if (!callId) return Promise.resolve();
+  const existing = functionCallExecutions.get(callId);
+  if (existing) return existing;
+  const execution = runFunctionCall(item, sessionContext);
+  functionCallExecutions.set(callId, execution);
+  return execution;
+}
+
+async function runFunctionCall(item, sessionContext) {
+  const callId = item.call_id;
 
   let output;
   try {
@@ -604,7 +652,6 @@ async function executeFunctionCall(item, sessionContext) {
       },
       sessionContext.dc
     );
-    sendRealtimeEvent({ type: "response.create" }, sessionContext.dc);
     disconnectAfterResponse = true;
     // Bounded fallback: if output_audio_buffer.stopped never arrives (cancel,
     // provider error, transport stall), still close so wakeword re-arms.
@@ -619,17 +666,20 @@ async function executeFunctionCall(item, sessionContext) {
         stopConversation({ reason: "model_request" });
       }
     }, 15000);
-    return;
+    return output;
   }
-  sendRealtimeEvent({ type: "response.create" }, sessionContext.dc);
+  return output;
 }
 
 async function handleRealtimeEvent(event, sessionContext) {
   appendEvent(event);
   if (event.type === "session.updated") {
+    taskTurnScheduler.onChannelReady();
     if (typeof activeMarkSessionReady === "function") {
       activeMarkSessionReady();
     }
+  } else if (event.type === "input_audio_buffer.committed") {
+    taskTurnScheduler.onAudioCommitted();
   } else if (event.type === "conversation.item.input_audio_transcription.delta") {
     updateTranscriptTurn("user", event.item_id, event.delta, { append: true });
   } else if (event.type === "conversation.item.input_audio_transcription.completed") {
@@ -647,12 +697,15 @@ async function handleRealtimeEvent(event, sessionContext) {
   } else if (event.type === "response.output_audio_transcript.done") {
     updateTranscriptTurn("assistant", event.item_id, event.transcript);
   } else if (event.type === "input_audio_buffer.speech_started") {
+    taskTurnScheduler.onSpeechStarted();
     observeSpeechStarted();
     setStatus("listening", "Listening");
   } else if (event.type === "input_audio_buffer.speech_stopped") {
+    taskTurnScheduler.onSpeechStopped();
     ensureTranscriptTurn("user", event.item_id);
     setStatus("thinking", "Thinking");
   } else if (event.type === "response.created") {
+    taskTurnScheduler.onResponseCreated();
     setStatus("responding", "Responding");
   } else if (event.type === "response.function_call_arguments.done") {
     await executeFunctionCall(
@@ -688,10 +741,13 @@ async function handleRealtimeEvent(event, sessionContext) {
     const functionCalls = (event.response?.output || []).filter(
       (item) => item.type === "function_call"
     );
+    taskTurnScheduler.onResponseDone({
+      status: event.response?.status || "failed",
+      deferContinuation: functionCalls.length > 0,
+    });
     if (functionCalls.length > 0) {
-      for (const item of functionCalls) {
-        await executeFunctionCall(item, sessionContext);
-      }
+      await Promise.all(functionCalls.map((item) => executeFunctionCall(item, sessionContext)));
+      taskTurnScheduler.requestResponse();
     } else if (disconnectAfterResponse) {
       const status = event.response?.status;
       if (status === "completed") {
@@ -720,6 +776,8 @@ async function handleRealtimeEvent(event, sessionContext) {
 
 async function startConversation() {
   clearError();
+  taskTurnScheduler.reset();
+  functionCallExecutions.clear();
   resetTranscript();
   resetInterruptionDiagnostics();
   stopMessageSent = false;
@@ -785,6 +843,7 @@ async function startConversation() {
     dc.addEventListener("open", () => {
       if (peerConnection !== pc || dataChannel !== dc) return;
       recordTiming("data_channel_state", { state: dc.readyState });
+      taskTurnScheduler.onChannelReady();
       setStatus("connecting", "Waiting for Realtime session");
       armSessionReadyFallback();
     });
@@ -908,7 +967,8 @@ function stopConversation(options = {}) {
     }
 
     executionScope = null;
-    handledCallIds.clear();
+    functionCallExecutions.clear();
+    taskTurnScheduler.reset();
     disconnectAfterResponse = false;
     farewellResponseId = null;
     if (farewellFallbackTimer !== null) {

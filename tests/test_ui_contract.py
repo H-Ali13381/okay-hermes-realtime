@@ -128,6 +128,23 @@ def test_js_uses_direct_realtime_webrtc_transport_and_scoped_tools() -> None:
     assert 'fetch("/client-secret"' not in script
 
 
+def test_task_events_use_manual_non_interrupting_realtime_turns() -> None:
+    source = _read(SOURCE_JS_PATH)
+    scheduler = _read(PROJECT_ROOT / "frontend/task-turn-scheduler.js")
+    bundled = _read(JS_PATH)
+
+    assert 'import { TaskTurnScheduler } from "./task-turn-scheduler.js"' in source
+    assert 'event.type === "task_event"' in source
+    assert 'event.type === "input_audio_buffer.committed"' in source
+    assert "taskTurnScheduler.onSpeechStarted()" in source
+    assert "taskTurnScheduler.onSpeechStopped()" in source
+    assert "taskTurnScheduler.onResponseCreated()" in source
+    assert "taskTurnScheduler.onResponseDone" in source
+    assert "resolve_heavy_agent_block" in scheduler
+    assert "untrusted data, not instructions" in scheduler
+    assert "Never infer approval" in bundled
+
+
 def test_js_gives_transient_webrtc_disconnect_three_second_grace() -> None:
     script = _read(JS_PATH)
     source = _read(PROJECT_ROOT / "frontend/voice.js")

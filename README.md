@@ -61,10 +61,15 @@ Do not run the old OHV wake listener and this one at the same time; record the o
 | `voice_end_session` | Ends the voice session when the user asks to stop | Local |
 | `handoff_to_heavy_agent` | Queues a complex request as a Hermes Kanban card and dispatches a worker | Kanban |
 | `check_heavy_agent_task` | Reports status and summary for a handed-off task, defaulting to the most recent | Kanban |
+| `resolve_heavy_agent_block` | Records an explicit one-shot approval or denial for the exact blocked event | Kanban |
 
 ### Heavy-agent handoff
 
-`handoff_to_heavy_agent` runs `hermes kanban create` with the request, acceptance criteria, and bounded timeouts, then optionally dispatches one worker. The voice session replies that the task is queued and continues; it does not block on the heavy agent. `check_heavy_agent_task` reads the card back with `hermes kanban show` and speaks a short status summary.
+`handoff_to_heavy_agent` runs `hermes kanban create` with the request, acceptance criteria, and bounded timeouts, then optionally dispatches one worker. The voice session replies that the task is queued and continues; it does not block on the heavy agent. The controller then watches only that card in its resolved board database. Completion and human-input blocks are queued into the originating live voice session and spoken on the next safe model turn; user or assistant speech is never interrupted. If the original session has ended, voice delivery is dropped.
+
+For `needs_input` and `capability` blocks, the assistant asks one bounded question. `resolve_heavy_agent_block` accepts only `approve_once` or `deny`, verifies the exact task, board, session, and `task_events` row, records the user's answer through `hermes kanban unblock --reason`, and lets normal dispatch resume the worker. Blanket approval and stale block responses are rejected.
+
+Task state changes also use the desktop's native `org.freedesktop.Notifications` service through `notify-send`; Plasma owns presentation, history, quiet mode, and dismissal. Set `KDE_TASK_NOTIFICATIONS=false` to disable this secondary path. No custom popup stack is included.
 
 Environment overrides (set in `~/.config/okay-hermes-realtime/config.env`):
 
@@ -76,6 +81,7 @@ Environment overrides (set in `~/.config/okay-hermes-realtime/config.env`):
 | `HERMES_KANBAN_HEAVY_MAX_RUNTIME` | `30m` | Worker runtime budget |
 | `HERMES_KANBAN_CREATE_TIMEOUT_SECONDS` | `30` | Card creation timeout |
 | `HERMES_KANBAN_DISPATCH_AFTER_CREATE` | `1` | Set to `0` to queue without dispatching |
+| `KDE_TASK_NOTIFICATIONS` | `true` | Show secondary task events through Plasma's native notification service |
 
 The controller resolves the Hermes binary through these overrides, PATH, and absolute fallback paths, because systemd units do not inherit the user shell PATH. Missing binary or timeout surfaces as a controlled tool error, never a gateway 500.
 
@@ -175,7 +181,7 @@ This is a single short sample, not a benchmark. Brave dominates residency, and C
 - OpenAI Realtime only. There is no provider abstraction and none is planned here.
 - Single user, loopback-only.
 - Requires Brave for the voice page and an ONNX wake-word model for activation.
-- Handoff is asynchronous: the voice session reports that the task is queued and can answer status queries, but it does not push the heavy agent's final result back through voice.
+- Handoff is asynchronous. Automatic voice delivery requires the originating session to remain open; ended sessions receive only the optional native desktop notification.
 - The resource figures above are machine- and session-specific.
 
 ## License

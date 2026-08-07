@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
-from realtime_action_spike.capabilities import CapabilityBroker
+from realtime_action_spike.capabilities import CapabilityBroker, HandoffRecord
 
 from .browser import BrowserHandle
 from .protocol import (
@@ -23,12 +23,19 @@ from .protocol import (
     SessionOutcome,
     StopMessage,
     StopReason,
+    TaskEventMessage,
     TeardownCompleteMessage,
     TimingMessage,
     parse_loopback_message,
 )
 from .session_startup import BrowserStartupDeadline
 from .session_state import SessionPhase, SessionState, SessionTransitionError
+from .task_events import (
+    HermesKanbanPermissionClient,
+    KanbanTaskEventSource,
+    NotifySendDesktopNotifier,
+    TaskEventCoordinator,
+)
 from .teardown import (
     TeardownCoordinator,
     TeardownHooks,
@@ -111,6 +118,8 @@ class VoiceSessionController:
         farewell_timeout_seconds: float = 1.5,
         trace_directory: Path | None = None,
         status_observer: StatusObserver | None = None,
+        task_event_coordinator: TaskEventCoordinator | None = None,
+        task_notifications_enabled: bool = True,
     ) -> None:
         self._launcher = launcher
         self._session_id_factory = session_id_factory or (lambda: secrets.token_urlsafe(16))
@@ -132,6 +141,13 @@ class VoiceSessionController:
         self._last_closed_interruption_traces: tuple[InterruptionTrace, ...] = ()
         self._outbound_messages: dict[str, asyncio.Queue[LoopbackMessage]] = {}
         self._teardown_tasks: dict[str, asyncio.Task[TeardownReport]] = {}
+        self._task_events = task_event_coordinator or TaskEventCoordinator(
+            source=KanbanTaskEventSource(),
+            publish=self.publish_task_event,
+            session_is_active=self.session_is_active,
+            notifier=NotifySendDesktopNotifier(enabled=task_notifications_enabled),
+            permission_client=HermesKanbanPermissionClient(),
+        )
 
     @property
     def token_store(self) -> LaunchTokenStore:
@@ -158,6 +174,70 @@ class VoiceSessionController:
         if phase is SessionPhase.STOPPING:
             return "stopping"
         return "idle"
+
+    def session_is_active(self, session_id: str) -> bool:
+        active = self._active_session
+        return (
+            active is not None
+            and active.session_id == session_id
+            and active.state.phase
+            in {SessionPhase.LAUNCHING, SessionPhase.CONNECTING, SessionPhase.LIVE}
+        )
+
+    async def publish_task_event(
+        self,
+        session_id: str,
+        message: TaskEventMessage,
+    ) -> bool:
+        if message.session_id != session_id:
+            return False
+        async with self._lock:
+            if not self.session_is_active(session_id):
+                return False
+            queue = self._outbound_messages.get(session_id)
+            if queue is None or queue.full():
+                return False
+            queue.put_nowait(message)
+            return True
+
+    def register_handoff(self, session_id: str, record: HandoffRecord) -> bool:
+        if not self.session_is_active(session_id):
+            return False
+        if not record.board_slug or not record.db_path:
+            logger.warning(
+                "Kanban handoff %s has no board database; event relay disabled",
+                record.task_id,
+            )
+            return False
+        return self._task_events.register_task(
+            session_id=session_id,
+            task_id=record.task_id,
+            title=record.title,
+            board_slug=record.board_slug,
+            db_path=record.db_path,
+        )
+
+    async def resolve_task_permission(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        block_event_id: int,
+        decision: str,
+        response: str,
+    ) -> dict[str, object]:
+        if not self.session_is_active(session_id):
+            raise StaleControlMessage("permission response is not from the originating session")
+        return await self._task_events.resolve_permission(
+            session_id=session_id,
+            task_id=task_id,
+            block_event_id=block_event_id,
+            decision=decision,
+            response=response,
+        )
+
+    async def shutdown_task_events(self) -> None:
+        await self._task_events.shutdown()
 
     async def activate(self, launch_base_url: str) -> ActivationResult:
         """Create a new local session and launch the control page."""
@@ -509,6 +589,8 @@ class VoiceSessionController:
         raw_message: str,
     ) -> SessionClosedMessage | None:
         message = parse_loopback_message(raw_message, expected_session_id=session_id)
+        if isinstance(message, TaskEventMessage):
+            raise ValueError("task_event messages are controller-to-page only")
         coordinator: TeardownCoordinator | None = None
         request: TeardownRequest | None = None
 

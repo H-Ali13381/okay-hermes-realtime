@@ -10,6 +10,7 @@ def test_settings_defaults_for_browser_automation(monkeypatch: pytest.MonkeyPatc
     monkeypatch.delenv("VOICE_BROWSER_PROFILE", raising=False)
     monkeypatch.delenv("VOICE_PAGE_URL", raising=False)
     monkeypatch.delenv("VOICE_BROWSER_START_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("KDE_TASK_NOTIFICATIONS", raising=False)
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
 
     settings = Settings.from_env()
@@ -18,6 +19,7 @@ def test_settings_defaults_for_browser_automation(monkeypatch: pytest.MonkeyPatc
     assert settings.voice_browser_profile == "~/.local/share/okay-hermes-realtime/brave-profile"
     assert settings.voice_page_url == "http://127.0.0.1:8765/voice"
     assert settings.voice_browser_start_timeout_seconds == 20.0
+    assert settings.kde_task_notifications is True
     assert settings.resolved_activation_socket_path.startswith("/run/user/")
     assert settings.resolved_activation_socket_path.endswith(
         "/okay-hermes-realtime/activation.sock"
@@ -29,6 +31,7 @@ def test_settings_reads_custom_browser_environment(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("VOICE_BROWSER_PROFILE", "/tmp/custom-profile")
     monkeypatch.setenv("VOICE_PAGE_URL", "http://127.0.0.1:9000/voice")
     monkeypatch.setenv("VOICE_BROWSER_START_TIMEOUT_SECONDS", "12.75")
+    monkeypatch.setenv("KDE_TASK_NOTIFICATIONS", "false")
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/tmp/xdg-runtime-custom")
 
     settings = Settings.from_env()
@@ -37,6 +40,7 @@ def test_settings_reads_custom_browser_environment(monkeypatch: pytest.MonkeyPat
     assert settings.voice_browser_profile == "/tmp/custom-profile"
     assert settings.voice_page_url == "http://127.0.0.1:9000/voice"
     assert settings.voice_browser_start_timeout_seconds == 12.75
+    assert settings.kde_task_notifications is False
 
 
 def test_settings_rejects_non_loopback_voice_page_url(monkeypatch: pytest.MonkeyPatch) -> None:

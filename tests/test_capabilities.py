@@ -16,6 +16,7 @@ EXPECTED_CAPABILITIES = {
     "voice_end_session",
     "handoff_to_heavy_agent",
     "check_heavy_agent_task",
+    "resolve_heavy_agent_block",
 }
 
 
@@ -27,7 +28,7 @@ def test_tool_catalog_exposes_all_capabilities() -> None:
     tools = build_openai_tools()
 
     assert {tool["name"] for tool in tools} == EXPECTED_CAPABILITIES
-    assert len(tools) == 4
+    assert len(tools) == 5
     assert all(tool["type"] == "function" for tool in tools)
     assert all(tool["description"].strip() for tool in tools)
     assert all(tool["parameters"]["type"] == "object" for tool in tools)
@@ -74,6 +75,19 @@ def test_voice_end_session_reports_local_lifecycle_intent() -> None:
 def test_disallowed_stage1_capabilities_are_not_in_normal_catalog(capability_name: str) -> None:
     with pytest.raises(UnknownCapabilityError, match=capability_name):
         CapabilityBroker().execute(capability_name, {})
+
+
+def test_permission_resolution_cannot_bypass_live_session_binding() -> None:
+    with pytest.raises(ExecutionContractError, match="originating live voice session"):
+        CapabilityBroker().execute(
+            "resolve_heavy_agent_block",
+            {
+                "task_id": "t_voice01",
+                "block_event_id": 17,
+                "decision": "approve_once",
+                "response": "yes",
+            },
+        )
 
 
 def test_unknown_capability_is_rejected() -> None:
