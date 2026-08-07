@@ -44,6 +44,10 @@ def test_handoff_tool_contract_requires_direct_task_not_request() -> None:
     assert parameters["required"] == ["task"]
     assert "task" in parameters["properties"]
     assert "request" not in parameters["properties"]
+    description = tool["description"].casefold()
+    assert "direct task" in description
+    assert "routing language" in description
+    assert "explicit consent" in description
 
     with pytest.raises(ExecutionContractError, match="unexpected argument: request"):
         CapabilityBroker().execute(

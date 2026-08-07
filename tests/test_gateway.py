@@ -218,12 +218,14 @@ def start_openai_realtime_session(client: TestClient, offer: str = "mock-offer")
     return session_id
 
 
-def test_session_instructions_decline_actions_without_a_supplied_tool() -> None:
+def test_session_instructions_offer_hermes_before_declining_unsupported_actions() -> None:
     session = build_realtime_session(settings())
     instructions = session["instructions"]
 
     assert isinstance(instructions, str)
-    assert "If no supplied tool can perform a requested side effect" in instructions
+    assert "If no direct voice tool can complete a request" in instructions
+    assert "wait for explicit consent" in instructions
+    assert "If neither a direct tool nor Hermes can plausibly perform" in instructions
     assert (
         "Call a tool when the user explicitly requests current time, a timer, media"
         not in instructions

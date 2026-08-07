@@ -442,9 +442,11 @@ CAPABILITIES: tuple[CapabilityDefinition, ...] = (
     CapabilityDefinition(
         name="handoff_to_heavy_agent",
         description=(
-            "Pass a complex, multi-step, tool-using, coding, filesystem, web/current-data, "
-            "automation, memory-dependent, or deep reasoning request to the full Hermes Agent. "
-            "Do not use for simple chat or short factual answers."
+            "Delegate approved work to the full Hermes Agent. Call only for an explicit harmless "
+            "Kanban/Hermes request, after confirmation of consequential explicit work, or after "
+            "explicit consent to an offered handoff. The task must be a direct task containing "
+            "the work itself and every user constraint, with no Hermes or Kanban routing language. "
+            "Do not use for simple answers, direct lightweight tools, impossible, or unsafe work."
         ),
         arguments_model=HermesAgentArguments,
         execution="kanban",

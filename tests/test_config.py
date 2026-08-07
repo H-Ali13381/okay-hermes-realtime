@@ -2,7 +2,23 @@ from __future__ import annotations
 
 import pytest
 
-from realtime_action_spike.config import Settings
+from realtime_action_spike.config import DEFAULT_INSTRUCTIONS, Settings
+
+
+def test_default_instructions_define_voice_to_hermes_routing_policy() -> None:
+    instructions = " ".join(DEFAULT_INSTRUCTIONS.casefold().split())
+
+    assert "explicitly asks" in instructions
+    assert "kanban" in instructions
+    assert "hermes agent" in instructions
+    assert "consequential" in instructions
+    assert "ask one short confirmation" in instructions
+    assert "wait for explicit consent" in instructions
+    assert "impossible or unsafe" in instructions
+    assert "do not delegate" in instructions
+    assert "task argument" in instructions
+    assert "routing language" in instructions
+    assert "preserve every user constraint" in instructions
 
 
 def test_settings_defaults_for_browser_automation(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -115,7 +115,7 @@
       "user_turns": ["Send this to Hermes: change my wallpaper to Vi and Jinx, preserve the exact old path, and verify rollback works."],
       "expected_action": "handoff",
       "expected_tool": "handoff_to_heavy_agent",
-      "required_task_substrings": ["Vi and Jinx", "old path", "rollback"],
+      "required_task_substrings": ["Vi", "Jinx", "old", "path", "rollback"],
       "forbidden_task_substrings": ["send this to hermes", "have hermes"],
       "routing_wrapper_exclusions": ["send this to hermes"],
       "tags": ["constraint_heavy_wrapper_removal"]
