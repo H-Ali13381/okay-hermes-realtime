@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import re
 import shutil
 import subprocess
 from collections.abc import Callable, Mapping
@@ -16,6 +15,8 @@ from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+from .routing import find_routing_wrappers
 
 JsonObject = dict[str, Any]
 NowProvider = Callable[[ZoneInfo | None], datetime]
@@ -46,20 +47,6 @@ class EndSessionArguments(StrictArguments):
     reason: str | None = Field(default=None, max_length=120)
 
 
-_ROUTING_WRAPPER_PREFIX = re.compile(
-    r"""(?ix)^\s*(?:
-        (?:have|ask|tell|let)\s+hermes(?:\s+agent)?\b
-        |(?:send|hand|give)\s+(?:this|that|it|the\s+(?:request|task|job))
-            \s+to\s+hermes(?:\s+agent)?\b
-        |(?:add|create)\s+(?:a\s+)?(?:new\s+)?kanban\s+task\b
-        |(?:add|create)\s+(?:a\s+)?(?:new\s+)?task\s+(?:to|on|in)
-            \s+(?:the\s+)?kanban\b
-        |put\s+(?:(?:this|that|the)\s+)?(?:request|task|job)?\s*
-            (?:on|onto|in|into)\s+(?:the\s+)?kanban\b
-    )"""
-)
-
-
 class HermesAgentArguments(StrictArguments):
     task: str = Field(
         min_length=1,
@@ -74,7 +61,7 @@ class HermesAgentArguments(StrictArguments):
     @field_validator("task")
     @classmethod
     def _task_is_transport_neutral(cls, value: str) -> str:
-        if _ROUTING_WRAPPER_PREFIX.search(value):
+        if find_routing_wrappers(value):
             raise ValueError(
                 "state the direct task itself without Hermes or Kanban routing language"
             )

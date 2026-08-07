@@ -64,6 +64,9 @@ def test_handoff_tool_contract_requires_direct_task_not_request() -> None:
         "Add a Kanban task to audit the configuration.",
         "Put this request on Kanban: audit the configuration.",
         "Send this to Hermes: audit the configuration.",
+        "Please have Hermes review the API document.",
+        "Research AV1 support for my GPU and have Hermes do it.",
+        "Research AV1 support for my GPU, then send it to Hermes.",
     ],
 )
 def test_handoff_contract_rejects_routing_wrappers(wrapped_task: str) -> None:
@@ -76,6 +79,7 @@ def test_handoff_contract_rejects_routing_wrappers(wrapped_task: str) -> None:
     [
         "Build a Kanban dashboard for this project.",
         "Audit Hermes Agent configuration for stale provider settings.",
+        "Document how to have Hermes Agent review API changes safely.",
     ],
 )
 def test_handoff_contract_preserves_literal_kanban_and_hermes_subjects(

@@ -316,6 +316,64 @@ def test_literal_kanban_subject_matter_is_not_mistaken_for_routing() -> None:
     assert misrouted.action_match is False
 
 
+def test_plain_text_answer_rejects_imperative_routing_wrapper() -> None:
+    case = PromptOptCase.model_validate(
+        {
+            "id": "plain-answer",
+            "user_turns": ["What does idempotent mean?"],
+            "expected_action": "answer",
+            "expected_tool": None,
+            "required_task_substrings": [],
+            "forbidden_task_substrings": [],
+            "routing_wrapper_exclusions": [],
+            "tags": ["simple_answer"],
+        }
+    )
+
+    score = score_promptopt_case(
+        case,
+        PromptOptPrediction.model_validate(
+            {
+                "action": "answer",
+                "assistant_text": "Please have Hermes review the repository.",
+            }
+        ),
+    )
+
+    assert score.hard_pass is False
+    assert score.routing_wrapper_hits == ["Please have Hermes"]
+
+
+def test_plain_text_answer_allows_literal_hermes_subject_matter() -> None:
+    case = PromptOptCase.model_validate(
+        {
+            "id": "literal-hermes-answer",
+            "user_turns": ["How can Hermes Agent review API changes safely?"],
+            "expected_action": "answer",
+            "expected_tool": None,
+            "required_task_substrings": [],
+            "forbidden_task_substrings": [],
+            "routing_wrapper_exclusions": [],
+            "tags": ["literal_kanban_hermes_subject_matter"],
+        }
+    )
+
+    score = score_promptopt_case(
+        case,
+        PromptOptPrediction.model_validate(
+            {
+                "action": "answer",
+                "assistant_text": (
+                    "Hermes Agent can review API changes using repository tools."
+                ),
+            }
+        ),
+    )
+
+    assert score.hard_pass is True
+    assert score.routing_wrapper_hits == []
+
+
 def test_promptopt_corpus_files_are_12_case_balanced() -> None:
     corpus = load_promptopt_corpus()
     assert len(corpus.train.cases) == 12

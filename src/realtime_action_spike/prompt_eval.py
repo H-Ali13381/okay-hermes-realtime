@@ -8,6 +8,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .routing import find_routing_wrappers
+
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -141,6 +143,7 @@ def score_promptopt_case(
     """Score hard routing and direct-task invariants for one model prediction."""
 
     task = prediction.task or ""
+    surface_text = task or prediction.assistant_text or ""
     action_match = prediction.action == case.expected_action
     tool_match = prediction.tool_name == case.expected_tool
     missing_required = [
@@ -148,8 +151,12 @@ def score_promptopt_case(
         for required in case.required_task_substrings
         if required.casefold() not in task.casefold()
     ]
-    forbidden_hits = _hits(task, case.forbidden_task_substrings)
-    routing_hits = _hits(task, case.routing_wrapper_exclusions)
+    forbidden_hits = _hits(surface_text, case.forbidden_task_substrings)
+    routing_hits = _hits(surface_text, case.routing_wrapper_exclusions)
+    if case.expected_action is PromptOptAction.answer:
+        for hit in find_routing_wrappers(surface_text):
+            if hit not in routing_hits:
+                routing_hits.append(hit)
 
     hard_checks = [
         action_match,
