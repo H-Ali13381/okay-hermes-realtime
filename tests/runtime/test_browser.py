@@ -124,6 +124,7 @@ def test_launch_builds_expected_command_and_process_options(
                 "--no-first-run",
                 "--disable-default-apps",
                 "--disable-background-mode",
+                "--disable-accelerated-video-decode",
                 "--use-fake-ui-for-media-stream",
             ],
             {

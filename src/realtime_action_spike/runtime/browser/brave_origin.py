@@ -72,6 +72,9 @@ class DedicatedBraveLauncher:
             "--no-first-run",
             "--disable-default-apps",
             "--disable-background-mode",
+            # Avoid NVIDIA BAR1 exhaustion observed with hardware video decode on
+            # Brave Origin Nightly under KWin Wayland.
+            "--disable-accelerated-video-decode",
             # This isolated profile opens only the loopback voice page. Auto-accept
             # its microphone request so wake activation cannot block on a prompt.
             "--use-fake-ui-for-media-stream",
