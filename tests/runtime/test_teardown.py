@@ -197,6 +197,40 @@ async def test_browser_close_failure_forces_media_abort_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_missing_ack_with_successful_forced_close_can_commit_media() -> None:
+    recorder = HookRecorder()
+
+    async def no_ack(_request: TeardownRequest) -> None:
+        recorder.events.append("request_browser_stop")
+
+    hooks = recorder.hooks()
+    coordinator = TeardownCoordinator(
+        TeardownHooks(
+            mark_stopping=hooks.mark_stopping,
+            request_browser_stop=no_ack,
+            close_browser=hooks.close_browser,
+            persist_trace=hooks.persist_trace,
+            finalize_media=hooks.finalize_media,
+            finalize=hooks.finalize,
+        ),
+        acknowledgement_timeout=0.01,
+        step_timeout=0.1,
+    )
+
+    report = await coordinator.run(
+        TeardownRequest(
+            outcome=SessionOutcome.COMPLETED,
+            reason=StopReason.MODEL_REQUEST,
+        )
+    )
+
+    assert any(failure.step == "browser_ack" for failure in report.failures)
+    assert len(recorder.media_requests) == 1
+    assert recorder.media_requests[0].outcome is SessionOutcome.COMPLETED
+    assert recorder.media_requests[0].reason is StopReason.MODEL_REQUEST
+
+
+@pytest.mark.asyncio
 async def test_missing_browser_ack_is_bounded_and_cleanup_continues() -> None:
     recorder = HookRecorder()
 

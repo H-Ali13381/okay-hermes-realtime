@@ -234,11 +234,14 @@ class RuntimeService:
                 timeout=remaining_timeout(),
             )
 
-        with contextlib.suppress(TimeoutError, Exception):
+        media_shutdown_error: Exception | None = None
+        try:
             await asyncio.wait_for(
                 self._controller.shutdown_media(),
                 timeout=remaining_timeout(),
             )
+        except Exception as exc:
+            media_shutdown_error = exc
 
         with contextlib.suppress(TimeoutError, Exception):
             await asyncio.wait_for(
@@ -272,6 +275,11 @@ class RuntimeService:
         self._ready.clear()
         self._started = False
         self._running = False
+
+        if media_shutdown_error is not None:
+            raise RuntimeError(
+                "media cleanup failed during service shutdown"
+            ) from media_shutdown_error
 
     def _publish_controller_status(self, status: str) -> None:
         marker_status = {

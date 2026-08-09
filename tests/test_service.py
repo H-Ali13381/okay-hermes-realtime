@@ -186,6 +186,33 @@ async def test_shutdown_closes_active_session_before_http_and_activation_socket(
 
 
 @pytest.mark.asyncio
+async def test_media_cleanup_failure_is_reported_after_other_shutdown_steps_complete(
+    isolated_service_state_home: Path,
+) -> None:
+    harness = _harness()
+    marker = isolated_service_state_home / "okay-hermes-realtime" / "controller-health"
+
+    async def fail_media_shutdown() -> None:
+        harness.controller.media_shutdown_calls += 1
+        raise RuntimeError("mpv did not exit after forced termination")
+
+    harness.controller.shutdown_media = fail_media_shutdown
+    run_task = asyncio.create_task(harness.service.run())
+    await asyncio.wait_for(harness.http.serve_entered.wait(), timeout=1.0)
+    harness.http.started.set()
+    await asyncio.wait_for(harness.service.ready.wait(), timeout=1.0)
+
+    harness.service.request_shutdown()
+    with pytest.raises(RuntimeError, match="media cleanup failed during service shutdown"):
+        await asyncio.wait_for(run_task, timeout=1.0)
+
+    assert harness.controller.media_shutdown_calls == 1
+    assert harness.http.shutdown_calls == 1
+    assert harness.socket.stop_calls == 1
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
 async def test_controller_health_marker_tracks_service_readiness_and_shutdown(
     isolated_service_state_home: Path,
 ) -> None:
