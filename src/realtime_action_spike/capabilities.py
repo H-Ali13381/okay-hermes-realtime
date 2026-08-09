@@ -14,8 +14,9 @@ from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import Field, ValidationError, field_validator
 
+from .contracts import StrictArguments, YouTubePlayArguments
 from .routing import find_routing_wrappers
 
 JsonObject = dict[str, Any]
@@ -28,10 +29,6 @@ class ExecutionContractError(ValueError):
 
 class UnknownCapabilityError(ExecutionContractError):
     """The model requested a capability that was not exposed."""
-
-
-class StrictArguments(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
 
 class CurrentTimeArguments(StrictArguments):
@@ -405,6 +402,15 @@ def _permission_resolution_requires_live_session(
     )
 
 
+def _youtube_playback_requires_live_session(
+    _arguments: StrictArguments,
+    _now_provider: NowProvider,
+) -> JsonObject:
+    raise ExecutionContractError(
+        "YouTube playback requires the originating live voice session"
+    )
+
+
 CAPABILITIES: tuple[CapabilityDefinition, ...] = (
     CapabilityDefinition(
         name="assistant_get_current_time",
@@ -461,6 +467,17 @@ CAPABILITIES: tuple[CapabilityDefinition, ...] = (
         execution="kanban",
         handler=_permission_resolution_requires_live_session,
     ),
+    CapabilityDefinition(
+        name="media_play_youtube",
+        description=(
+            "Resolve and play one YouTube video from the user's spoken title, channel, recency, "
+            "or topic words. Call this directly for a YouTube playback request; do not ask the "
+            "user to dictate or find a URL. Exact https YouTube video URLs are also accepted."
+        ),
+        arguments_model=YouTubePlayArguments,
+        execution="local",
+        handler=_youtube_playback_requires_live_session,
+    ),
 )
 
 _CAPABILITIES_BY_NAME = {capability.name: capability for capability in CAPABILITIES}
@@ -512,6 +529,16 @@ def parse_permission_resolution_arguments(
     parsed = _parse_arguments(arguments)
     try:
         return PermissionResolutionArguments.model_validate(parsed)
+    except ValidationError as exc:
+        raise ExecutionContractError(_format_validation_error(exc)) from exc
+
+
+def parse_youtube_play_arguments(
+    arguments: str | Mapping[str, Any],
+) -> YouTubePlayArguments:
+    parsed = _parse_arguments(arguments)
+    try:
+        return YouTubePlayArguments.model_validate(parsed)
     except ValidationError as exc:
         raise ExecutionContractError(_format_validation_error(exc)) from exc
 

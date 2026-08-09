@@ -8,6 +8,7 @@ This project is an OpenAI-specific, independently installable successor to [Okay
 
 - **Native wake word listener.** A small C listener captures the microphone through PipeWire and runs a local ONNX wake-word model. No cloud wake detection, no polling loop.
 - **Scoped tool execution.** The model sees a small allowlist of functions and nothing else. The local controller validates every call: scope, function name, bounded JSON arguments, call-ID replay. Model-generated shell or code is never evaluated.
+- **YouTube popup playback.** Spoken titles, channels, recency, or topic words resolve to one allowlisted YouTube video. The controller launches a small always-on-top `mpv` window paused, lets the assistant name the selection, closes the exact voice session, and only then starts playback.
 - **Heavy-agent handoff.** Complex requests (coding, filesystem, web lookups, automation, deep reasoning) become Hermes Kanban cards instead of failing inside the voice session. The voice reply is immediate; the heavy work runs asynchronously. A status tool reports what happened with the task.
 
 ## Runtime topology
@@ -16,6 +17,7 @@ This project is an OpenAI-specific, independently installable successor to [Okay
 native wake listener ──activation socket──> local controller
        ▲                                      │
        │ pause/rearm                          ├─ scoped /execute broker
+       │                                      ├─ yt-dlp resolver → paused mpv popup
        │                                      └─ dedicated Brave app process
 system tray                                         │
                                              WebRTC + oai-events
@@ -27,7 +29,7 @@ The controller launches a dedicated Brave app window in its own process group an
 
 ## Install
 
-Runtime prerequisites: a Linux user systemd session, PipeWire/WirePlumber, Brave (configurable via `BRAVE_BIN`; the default resolves the packaged `brave-origin` command rather than a version-specific `/opt` path), Qt 6 development packages with CMake/Ninja for the tray, a wake-word ONNX model, ONNX Runtime, `uv`, and an OpenAI API key with Realtime access. Rebuilding the committed browser bundle additionally requires Node.js and npm.
+Runtime prerequisites: a Linux user systemd session, PipeWire/WirePlumber, Brave (configurable via `BRAVE_BIN`; the default resolves the packaged `brave-origin` command rather than a version-specific `/opt` path), `mpv`, `yt-dlp`, Qt 6 development packages with CMake/Ninja for the tray, a wake-word ONNX model, ONNX Runtime, `uv`, and an OpenAI API key with Realtime access. Rebuilding the committed browser bundle additionally requires Node.js and npm. The installer validates `mpv` and `yt-dlp` before writing any files and records their resolved absolute paths for the user service; install them with your distribution package manager first.
 
 ```bash
 git clone https://github.com/H-Ali13381/okay-hermes-realtime.git
@@ -59,9 +61,27 @@ Do not run the old OHV wake listener and this one at the same time; record the o
 |---|---|---|
 | `assistant_get_current_time` | Current time, local or by IANA timezone | Local |
 | `voice_end_session` | Ends the voice session when the user asks to stop | Local |
+| `media_play_youtube` | Resolves one spoken YouTube request and prepares popup playback | Local |
 | `handoff_to_heavy_agent` | Queues a complex request as a Hermes Kanban card and dispatches a worker | Kanban |
 | `check_heavy_agent_task` | Reports status and summary for a handed-off task, defaulting to the most recent | Kanban |
 | `resolve_heavy_agent_block` | Records an explicit one-shot approval or denial for the exact blocked event | Kanban |
+
+### YouTube popup playback
+
+`media_play_youtube` accepts one bounded `source`: ordinary spoken search words or an exact `https` YouTube `watch`, `youtu.be`, or `shorts` URL. The gateway never executes model-supplied shell, command flags, hosts, or file paths. It invokes `yt-dlp` as a fixed argv vector, requests one result, validates the returned video ID and canonical YouTube URL, and starts one controller-owned `mpv` process group with a private Unix IPC socket under `$XDG_RUNTIME_DIR/okay-hermes-realtime/media/`.
+
+The player starts paused and silent. A successful tool result identifies the selected title and asks the model for a brief handoff. Playback is unpaused only after the exact originating voice session has completed its farewell, closed Brave, released the profile lock, and persisted its trace. Cancelled, failed, timed-out, stale, or service-shutdown paths terminate and reap the paused player. A newer request replaces the older owned player; unrelated desktop media is never targeted.
+
+Configuration overrides:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MPV_BIN` | `mpv` | Trusted `mpv` command or absolute executable path |
+| `YT_DLP_BIN` | `yt-dlp` | Trusted `yt-dlp` command or absolute executable path |
+| `YOUTUBE_RESOLVE_TIMEOUT_SECONDS` | `12.0` | Bounded metadata-resolution timeout |
+| `YOUTUBE_BROWSER_COOKIES` | unset | Optional trusted `yt-dlp --cookies-from-browser` value, such as `brave:Default` |
+
+If YouTube challenges anonymous requests, set `YOUTUBE_BROWSER_COOKIES` explicitly in the mode-0600 server config. Cookie values and resolver stderr are not returned to the model or health endpoint. `/health` exposes only bounded media state (`idle`, `prepared`, or `playing`) and the selected title/playback generation while active.
 
 ### Heavy-agent handoff
 

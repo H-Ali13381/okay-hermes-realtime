@@ -19,6 +19,7 @@ from realtime_action_spike.gateway import (
     _relay_control_websocket,
     create_app,
 )
+from realtime_action_spike.media import MediaPlaybackError
 from realtime_action_spike.runtime.browser import NoopBrowserHandle
 from realtime_action_spike.runtime.controller import VoiceSessionController
 from realtime_action_spike.runtime.protocol import (
@@ -76,10 +77,25 @@ class CapturingLauncher:
 
 
 class ActiveSessionController:
-    def __init__(self, active_session_id: str | None = None) -> None:
+    def __init__(
+        self,
+        active_session_id: str | None = None,
+        *,
+        media_error: str | None = None,
+    ) -> None:
         self.active_session_id = active_session_id
+        self.media_error = media_error
         self.registrations: list[tuple[str, object]] = []
         self.permission_resolutions: list[dict[str, object]] = []
+        self.media_preparations: list[dict[str, object]] = []
+
+    @property
+    def status(self) -> str:
+        return "live" if self.active_session_id else "idle"
+
+    @property
+    def media_status(self) -> dict[str, object]:
+        return {"status": "idle"}
 
     def register_handoff(self, session_id: str, record: object) -> bool:
         self.registrations.append((session_id, record))
@@ -93,6 +109,20 @@ class ActiveSessionController:
             "task_id": kwargs["task_id"],
             "block_event_id": kwargs["block_event_id"],
             "decision": kwargs["decision"],
+        }
+
+    async def prepare_youtube_playback(self, **kwargs: object) -> dict[str, object]:
+        self.media_preparations.append(kwargs)
+        if self.media_error is not None:
+            raise MediaPlaybackError(self.media_error)
+        return {
+            "action": "media.youtube.play",
+            "playback_id": "playback-test-1",
+            "title": "Selected video",
+            "channel": "Selected channel",
+            "webpage_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "status": "prepared",
+            "end_session": True,
         }
 
 
@@ -248,7 +278,7 @@ def test_session_configuration_uses_fast_natural_voice_defaults() -> None:
     }
     assert session["audio"]["input"]["transcription"] == {"model": "gpt-4o-mini-transcribe"}
     assert session["tool_choice"] == "auto"
-    assert len(session["tools"]) == 5
+    assert len(session["tools"]) == 6
     assert "Do not claim an action succeeded before its tool result" in session["instructions"]
     assert "resolve_heavy_agent_block" in session["instructions"]
     assert "Never infer approval" in session["instructions"]
@@ -270,8 +300,10 @@ def test_health_reports_model_and_missing_key_without_secret_material() -> None:
             "handoff_to_heavy_agent",
             "check_heavy_agent_task",
             "resolve_heavy_agent_block",
+            "media_play_youtube",
         ],
         "controller_status": "idle",
+        "media": {"status": "idle"},
     }
 
 
@@ -567,6 +599,107 @@ def test_permission_resolution_is_bound_to_live_scope_and_exact_block_event() ->
     ]
     assert invalid.status_code == 400
     assert invalid.json()["error"]["type"] == "invalid_arguments"
+
+
+def test_youtube_playback_is_session_bound_prepared_and_replay_safe() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_media"},
+        )
+    )
+    controller = ActiveSessionController(active_session_id="local-session-1234")
+    client = TestClient(
+        create_app(
+            settings(),
+            upstream_client=upstream,
+            controller=controller,  # type: ignore[arg-type]
+        )
+    )
+    session = client.post(
+        "/session?local_session_id=local-session-1234",
+        content="v=0\r\nmock-offer",
+        headers={
+            LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE,
+            "Content-Type": "application/sdp",
+        },
+    )
+    request = {
+        "scope": session.headers["x-okay-hermes-execution-scope"],
+        "call_id": "call_media_01",
+        "name": "media_play_youtube",
+        "arguments": {"source": "latest Technology Connections video"},
+    }
+    headers = {LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE}
+
+    first = client.post("/execute", json=request, headers=headers)
+    replay = client.post("/execute", json=request, headers=headers)
+
+    assert first.status_code == 200
+    assert first.json()["result"] == {
+        "action": "media.youtube.play",
+        "playback_id": "playback-test-1",
+        "title": "Selected video",
+        "channel": "Selected channel",
+        "webpage_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "status": "prepared",
+        "end_session": True,
+    }
+    assert replay.content == first.content
+    assert controller.media_preparations == [
+        {
+            "session_id": "local-session-1234",
+            "source": "latest Technology Connections video",
+        }
+    ]
+
+
+def test_youtube_playback_failure_is_actionable_and_does_not_close_session() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_media_failure"},
+        )
+    )
+    controller = ActiveSessionController(
+        active_session_id="local-session-1234",
+        media_error="mpv is not installed or is not executable",
+    )
+    client = TestClient(
+        create_app(
+            settings(),
+            upstream_client=upstream,
+            controller=controller,  # type: ignore[arg-type]
+        )
+    )
+    session = client.post(
+        "/session?local_session_id=local-session-1234",
+        content="v=0\r\nmock-offer",
+        headers={
+            LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE,
+            "Content-Type": "application/sdp",
+        },
+    )
+
+    failure = client.post(
+        "/execute",
+        json={
+            "scope": session.headers["x-okay-hermes-execution-scope"],
+            "call_id": "call_media_failure_01",
+            "name": "media_play_youtube",
+            "arguments": {"source": "specific video"},
+        },
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
+    )
+
+    assert failure.status_code == 503
+    assert failure.json()["error"] == {
+        "type": "media_playback_failed",
+        "message": "mpv is not installed or is not executable",
+    }
+    assert "end_session" not in failure.json()
 
 
 def test_execute_rejects_missing_or_stale_scope() -> None:

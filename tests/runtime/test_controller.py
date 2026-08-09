@@ -95,6 +95,37 @@ class SequenceFactory:
         return value
 
 
+class RecordingMediaManager:
+    def __init__(self) -> None:
+        self.prepare_calls: list[dict[str, str]] = []
+        self.finalize_calls: list[dict[str, object]] = []
+        self.shutdown_calls = 0
+
+    @property
+    def status(self) -> dict[str, object]:
+        return {"status": "prepared"} if self.prepare_calls else {"status": "idle"}
+
+    async def prepare(self, session_id: str, source: str):
+        from realtime_action_spike.media import PreparedPlayback
+
+        self.prepare_calls.append({"session_id": session_id, "source": source})
+        return PreparedPlayback(
+            playback_id=f"playback-{len(self.prepare_calls)}",
+            title="Selected title",
+            channel="Selected channel",
+            webpage_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        )
+
+    async def finalize_session(self, session_id: str, **kwargs: object) -> None:
+        self.finalize_calls.append({"session_id": session_id, **kwargs})
+
+    async def abort_prepared_for_session(self, session_id: str) -> None:
+        self.finalize_calls.append({"session_id": session_id, "abort_only": True})
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
 class RecordingTaskEvents:
     def __init__(self) -> None:
         self.registrations: list[dict[str, object]] = []
@@ -219,6 +250,102 @@ async def test_task_events_are_session_bound_and_permission_resolution_delegates
 
     await controller.shutdown_task_events()
     assert task_events.shutdown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_youtube_playback_prepares_and_commits_after_model_teardown() -> None:
+    media = RecordingMediaManager()
+    launcher = DeterministicLauncher()
+    controller = VoiceSessionController(
+        launcher,
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-media"])),
+        session_id_factory=SequenceFactory(["local-media-01"]),
+        media_manager=media,  # type: ignore[arg-type]
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id == "local-media-01"
+    await controller.process_control_message(
+        session_id,
+        encode_loopback_message(PageReadyMessage(type="page_ready", session_id=session_id)),
+    )
+    await controller.process_control_message(
+        session_id,
+        encode_loopback_message(PageStartedMessage(type="page_started", session_id=session_id)),
+    )
+
+    result = await controller.prepare_youtube_playback(
+        session_id=session_id,
+        source="latest useful video",
+    )
+
+    assert result["status"] == "prepared"
+    assert result["end_session"] is True
+    assert media.prepare_calls == [
+        {"session_id": "local-media-01", "source": "latest useful video"}
+    ]
+    assert controller.media_status == {"status": "prepared"}
+
+    stop = StopMessage(type="stop", session_id=session_id, reason=StopReason.MODEL_REQUEST)
+    await controller.process_control_message(session_id, encode_loopback_message(stop))
+    closed = await controller.process_control_message(
+        session_id,
+        encode_loopback_message(
+            TeardownCompleteMessage(type="teardown_complete", session_id=session_id)
+        ),
+    )
+
+    assert isinstance(closed, SessionClosedMessage)
+    assert media.finalize_calls == [
+        {
+            "session_id": session_id,
+            "playback_id": "playback-1",
+            "commit": True,
+        }
+    ]
+    assert launcher.handles[0].closed_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_non_model_or_failed_teardown_aborts_prepared_playback() -> None:
+    media = RecordingMediaManager()
+    controller = VoiceSessionController(
+        DeterministicLauncher(),
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-media-abort"])),
+        session_id_factory=SequenceFactory(["local-media-abort"]),
+        media_manager=media,  # type: ignore[arg-type]
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id == "local-media-abort"
+    await controller.prepare_youtube_playback(session_id=session_id, source="video")
+
+    await controller.request_teardown(
+        session_id,
+        outcome=SessionOutcome.FAILED,
+        reason=StopReason.TRANSPORT_FAILURE,
+    )
+
+    assert media.finalize_calls == [
+        {
+            "session_id": session_id,
+            "playback_id": "playback-1",
+            "commit": False,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_media_delegates_to_singleton_manager() -> None:
+    media = RecordingMediaManager()
+    controller = VoiceSessionController(
+        DeterministicLauncher(),
+        media_manager=media,  # type: ignore[arg-type]
+    )
+
+    await controller.shutdown_media()
+
+    assert media.shutdown_calls == 1
 
 
 @pytest.mark.asyncio

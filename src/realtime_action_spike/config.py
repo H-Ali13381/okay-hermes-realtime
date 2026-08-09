@@ -25,6 +25,10 @@ Hold an ordinary conversation and use the supplied tools for supported assistant
 # Tools
 - Use only tools supplied in this session and only for actions described by their schemas.
 - Use a direct lightweight tool when one can complete the request.
+- For a YouTube playback request, call media_play_youtube with the user's spoken title,
+  channel, recency, or topic words. Do not ask the user to dictate a URL.
+- After media_play_youtube reports prepared, say only which video was selected and a brief
+  natural handoff such as "Here you go." Do not claim playback is audible or that it started.
 
 # Delegation policy
 - If the user explicitly asks to use Kanban, Hermes, or Hermes Agent for work, treat that as
@@ -72,6 +76,11 @@ class Settings(BaseModel):
     voice_page_url: str = "http://127.0.0.1:8765/voice"
     voice_browser_start_timeout_seconds: float = 20.0
     kde_task_notifications: bool = True
+
+    mpv_bin: str = Field(default="mpv", min_length=1, max_length=4_096)
+    yt_dlp_bin: str = Field(default="yt-dlp", min_length=1, max_length=4_096)
+    youtube_resolve_timeout_seconds: float = Field(default=12.0, gt=0, le=60)
+    youtube_browser_cookies: str | None = Field(default=None, min_length=1, max_length=200)
 
     @staticmethod
     def default_activation_socket_path(xdg_runtime_dir: str | None = None) -> str:
@@ -144,6 +153,12 @@ class Settings(BaseModel):
                 "kde_task_notifications": os.getenv(
                     "KDE_TASK_NOTIFICATIONS", "true"
                 ),
+                "mpv_bin": os.getenv("MPV_BIN", "mpv"),
+                "yt_dlp_bin": os.getenv("YT_DLP_BIN", "yt-dlp"),
+                "youtube_resolve_timeout_seconds": os.getenv(
+                    "YOUTUBE_RESOLVE_TIMEOUT_SECONDS", "12.0"
+                ),
+                "youtube_browser_cookies": os.getenv("YOUTUBE_BROWSER_COOKIES") or None,
             }
         )
 

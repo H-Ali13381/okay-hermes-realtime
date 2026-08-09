@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Literal, Protocol
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from realtime_action_spike.capabilities import CapabilityBroker, HandoffRecord
+from realtime_action_spike.media import MediaPlaybackManager
 
 from .browser import BrowserHandle
 from .protocol import (
@@ -99,6 +100,7 @@ class _WakeSession:
     stop_reason: StopReason | None = None
     resolved_result: TerminalSessionResult | None = None
     startup_deadline: BrowserStartupDeadline | None = None
+    prepared_playback_id: str | None = None
 
 
 class VoiceSessionController:
@@ -120,6 +122,7 @@ class VoiceSessionController:
         status_observer: StatusObserver | None = None,
         task_event_coordinator: TaskEventCoordinator | None = None,
         task_notifications_enabled: bool = True,
+        media_manager: MediaPlaybackManager | None = None,
     ) -> None:
         self._launcher = launcher
         self._session_id_factory = session_id_factory or (lambda: secrets.token_urlsafe(16))
@@ -148,6 +151,7 @@ class VoiceSessionController:
             notifier=NotifySendDesktopNotifier(enabled=task_notifications_enabled),
             permission_client=HermesKanbanPermissionClient(),
         )
+        self._media_manager = media_manager or MediaPlaybackManager()
 
     @property
     def token_store(self) -> LaunchTokenStore:
@@ -174,6 +178,10 @@ class VoiceSessionController:
         if phase is SessionPhase.STOPPING:
             return "stopping"
         return "idle"
+
+    @property
+    def media_status(self) -> dict[str, object]:
+        return self._media_manager.status
 
     def session_is_active(self, session_id: str) -> bool:
         active = self._active_session
@@ -236,8 +244,37 @@ class VoiceSessionController:
             response=response,
         )
 
+    async def prepare_youtube_playback(
+        self,
+        *,
+        session_id: str,
+        source: str,
+    ) -> dict[str, object]:
+        if not self.session_is_active(session_id):
+            raise StaleControlMessage("playback request is not from the originating session")
+        prepared = await self._media_manager.prepare(session_id, source)
+        async with self._lock:
+            if not self.session_is_active(session_id):
+                stale = True
+            else:
+                active = self._require_active_session(session_id)
+                active.prepared_playback_id = prepared.playback_id
+                active.trace.record(
+                    "media_playback_prepared",
+                    source="controller",
+                    data={"playback_id": prepared.playback_id},
+                )
+                stale = False
+        if stale:
+            await self._media_manager.abort_prepared_for_session(session_id)
+            raise StaleControlMessage("playback session ended before preparation completed")
+        return prepared.tool_result()
+
     async def shutdown_task_events(self) -> None:
         await self._task_events.shutdown()
+
+    async def shutdown_media(self) -> None:
+        await self._media_manager.shutdown()
 
     async def activate(self, launch_base_url: str) -> ActivationResult:
         """Create a new local session and launch the control page."""
@@ -462,6 +499,25 @@ class VoiceSessionController:
                 return
             await asyncio.to_thread(release)
 
+        async def finalize_media(request: TeardownRequest) -> None:
+            playback_id = session.prepared_playback_id
+            if playback_id is None:
+                return
+            commit = (
+                request.outcome is SessionOutcome.COMPLETED
+                and request.reason is StopReason.MODEL_REQUEST
+            )
+            await self._media_manager.finalize_session(
+                session.session_id,
+                playback_id=playback_id,
+                commit=commit,
+            )
+            session.trace.record(
+                "media_playback_committed" if commit else "media_playback_aborted",
+                source="controller",
+                data={"playback_id": playback_id},
+            )
+
         async def persist_trace(failures: tuple[TeardownStepFailure, ...]) -> None:
             for failure in failures:
                 session.trace.record(
@@ -522,6 +578,7 @@ class VoiceSessionController:
 
                 close_browser=close_browser,
                 persist_trace=persist_trace,
+                finalize_media=finalize_media,
                 finalize=finalize,
                 release_profile_lock=release_profile_lock,
             ),

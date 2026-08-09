@@ -19,6 +19,7 @@ EXPECTED_CAPABILITIES = {
     "handoff_to_heavy_agent",
     "check_heavy_agent_task",
     "resolve_heavy_agent_block",
+    "media_play_youtube",
 }
 
 
@@ -30,7 +31,7 @@ def test_tool_catalog_exposes_all_capabilities() -> None:
     tools = build_openai_tools()
 
     assert {tool["name"] for tool in tools} == EXPECTED_CAPABILITIES
-    assert len(tools) == 5
+    assert len(tools) == 6
     assert all(tool["type"] == "function" for tool in tools)
     assert all(tool["description"].strip() for tool in tools)
     assert all(tool["parameters"]["type"] == "object" for tool in tools)
@@ -141,6 +142,21 @@ def test_permission_resolution_cannot_bypass_live_session_binding() -> None:
                 "response": "yes",
             },
         )
+
+
+def test_youtube_playback_contract_is_strict_and_requires_live_session_binding() -> None:
+    tool = next(tool for tool in build_openai_tools() if tool["name"] == "media_play_youtube")
+
+    assert tool["parameters"]["required"] == ["source"]
+    assert list(tool["parameters"]["properties"]) == ["source"]
+    assert tool["parameters"]["additionalProperties"] is False
+    description = tool["description"].casefold()
+    assert "spoken" in description
+    assert "do not ask" in description
+    assert "youtube" in description
+
+    with pytest.raises(ExecutionContractError, match="originating live voice session"):
+        CapabilityBroker().execute("media_play_youtube", {"source": "latest useful video"})
 
 
 def test_unknown_capability_is_rejected() -> None:

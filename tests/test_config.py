@@ -19,6 +19,9 @@ def test_default_instructions_define_voice_to_hermes_routing_policy() -> None:
     assert "task argument" in instructions
     assert "routing language" in instructions
     assert "preserve every user constraint" in instructions
+    assert "media_play_youtube" in instructions
+    assert "do not ask the user to dictate a url" in instructions
+    assert "do not claim playback is audible" in instructions
 
 
 def test_settings_defaults_for_browser_automation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -27,6 +30,10 @@ def test_settings_defaults_for_browser_automation(monkeypatch: pytest.MonkeyPatc
     monkeypatch.delenv("VOICE_PAGE_URL", raising=False)
     monkeypatch.delenv("VOICE_BROWSER_START_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("KDE_TASK_NOTIFICATIONS", raising=False)
+    monkeypatch.delenv("MPV_BIN", raising=False)
+    monkeypatch.delenv("YT_DLP_BIN", raising=False)
+    monkeypatch.delenv("YOUTUBE_RESOLVE_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("YOUTUBE_BROWSER_COOKIES", raising=False)
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
 
     settings = Settings.from_env()
@@ -36,6 +43,10 @@ def test_settings_defaults_for_browser_automation(monkeypatch: pytest.MonkeyPatc
     assert settings.voice_page_url == "http://127.0.0.1:8765/voice"
     assert settings.voice_browser_start_timeout_seconds == 20.0
     assert settings.kde_task_notifications is True
+    assert settings.mpv_bin == "mpv"
+    assert settings.yt_dlp_bin == "yt-dlp"
+    assert settings.youtube_resolve_timeout_seconds == 12.0
+    assert settings.youtube_browser_cookies is None
     assert settings.resolved_activation_socket_path.startswith("/run/user/")
     assert settings.resolved_activation_socket_path.endswith(
         "/okay-hermes-realtime/activation.sock"
@@ -48,6 +59,10 @@ def test_settings_reads_custom_browser_environment(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("VOICE_PAGE_URL", "http://127.0.0.1:9000/voice")
     monkeypatch.setenv("VOICE_BROWSER_START_TIMEOUT_SECONDS", "12.75")
     monkeypatch.setenv("KDE_TASK_NOTIFICATIONS", "false")
+    monkeypatch.setenv("MPV_BIN", "/tmp/mpv")
+    monkeypatch.setenv("YT_DLP_BIN", "/tmp/yt-dlp")
+    monkeypatch.setenv("YOUTUBE_RESOLVE_TIMEOUT_SECONDS", "7.5")
+    monkeypatch.setenv("YOUTUBE_BROWSER_COOKIES", "brave:Profile 1")
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/tmp/xdg-runtime-custom")
 
     settings = Settings.from_env()
@@ -57,6 +72,10 @@ def test_settings_reads_custom_browser_environment(monkeypatch: pytest.MonkeyPat
     assert settings.voice_page_url == "http://127.0.0.1:9000/voice"
     assert settings.voice_browser_start_timeout_seconds == 12.75
     assert settings.kde_task_notifications is False
+    assert settings.mpv_bin == "/tmp/mpv"
+    assert settings.yt_dlp_bin == "/tmp/yt-dlp"
+    assert settings.youtube_resolve_timeout_seconds == 7.5
+    assert settings.youtube_browser_cookies == "brave:Profile 1"
 
 
 def test_settings_rejects_non_loopback_voice_page_url(monkeypatch: pytest.MonkeyPatch) -> None:

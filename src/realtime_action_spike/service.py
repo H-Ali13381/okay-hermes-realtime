@@ -12,6 +12,7 @@ import uvicorn
 
 from .config import Settings
 from .gateway import create_app
+from .media import MediaPlaybackManager, YouTubeResolver
 from .runtime.activation_socket import ActivationSocket
 from .runtime.browser import DedicatedBraveLauncher
 from .runtime.controller import VoiceSessionController
@@ -133,6 +134,14 @@ class RuntimeService:
                 trace_directory=state_home / "okay-hermes-realtime" / "traces",
                 status_observer=self._publish_controller_status,
                 task_notifications_enabled=settings.kde_task_notifications,
+                media_manager=MediaPlaybackManager(
+                    resolver=YouTubeResolver(
+                        yt_dlp_bin=settings.yt_dlp_bin,
+                        timeout_seconds=settings.youtube_resolve_timeout_seconds,
+                        browser_cookies=settings.youtube_browser_cookies,
+                    ),
+                    mpv_bin=settings.mpv_bin,
+                ),
             )
         else:
             self._controller = controller_factory(self._launcher)
@@ -222,6 +231,12 @@ class RuntimeService:
         with contextlib.suppress(TimeoutError, Exception):
             await asyncio.wait_for(
                 self._controller.shutdown_task_events(),
+                timeout=remaining_timeout(),
+            )
+
+        with contextlib.suppress(TimeoutError, Exception):
+            await asyncio.wait_for(
+                self._controller.shutdown_media(),
                 timeout=remaining_timeout(),
             )
 

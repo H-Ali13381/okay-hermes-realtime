@@ -16,6 +16,7 @@ from realtime_action_spike.runtime.teardown import (
 @dataclass
 class HookRecorder:
     events: list[str] = field(default_factory=list)
+    media_requests: list[TeardownRequest] = field(default_factory=list)
     fail_step: str | None = None
     coordinator: TeardownCoordinator | None = None
 
@@ -41,6 +42,10 @@ class HookRecorder:
     async def persist_trace(self, _failures: tuple[object, ...]) -> None:
         await self._record("persist_trace")
 
+    async def finalize_media(self, request: TeardownRequest) -> None:
+        self.media_requests.append(request)
+        await self._record("finalize_media")
+
     async def finalize(
         self,
         _request: TeardownRequest,
@@ -54,6 +59,7 @@ class HookRecorder:
             request_browser_stop=self.request_browser_stop,
             close_browser=self.close_browser,
             persist_trace=self.persist_trace,
+            finalize_media=self.finalize_media,
             finalize=self.finalize,
             release_profile_lock=self.release_profile_lock,
         )
@@ -77,6 +83,7 @@ async def test_teardown_runs_the_required_order_and_records_acknowledgement() ->
         "close_browser",
         "release_profile_lock",
         "persist_trace",
+        "finalize_media",
         "finalize",
     ]
     assert report.request == request
@@ -139,6 +146,7 @@ async def test_duplicate_teardown_runs_once_and_first_request_wins() -> None:
         "close_browser",
         "release_profile_lock",
         "persist_trace",
+        "finalize_media",
         "finalize",
     ],
 )
@@ -164,6 +172,28 @@ async def test_teardown_continues_to_finalize_after_each_step_failure(
     assert recorder.events[-1] == "finalize"
     assert any(failure.step == failed_step for failure in report.failures)
     assert recorder.events.count("finalize") == 1
+
+
+@pytest.mark.asyncio
+async def test_browser_close_failure_forces_media_abort_request() -> None:
+    recorder = HookRecorder(fail_step="close_browser")
+    coordinator = TeardownCoordinator(
+        recorder.hooks(),
+        acknowledgement_timeout=0.01,
+        step_timeout=0.1,
+    )
+    recorder.coordinator = coordinator
+
+    await coordinator.run(
+        TeardownRequest(
+            outcome=SessionOutcome.COMPLETED,
+            reason=StopReason.MODEL_REQUEST,
+        )
+    )
+
+    assert len(recorder.media_requests) == 1
+    assert recorder.media_requests[0].outcome is SessionOutcome.CANCELLED
+    assert recorder.media_requests[0].reason is StopReason.NATIVE_CANCEL
 
 
 @pytest.mark.asyncio
@@ -261,6 +291,7 @@ async def test_unshielded_shutdown_cancellation_finalizes_and_leaves_no_task() -
             request_browser_stop=hooks.request_browser_stop,
             close_browser=blocked_browser_close,
             persist_trace=hooks.persist_trace,
+            finalize_media=hooks.finalize_media,
             finalize=hooks.finalize,
         ),
         acknowledgement_timeout=0.01,
@@ -282,5 +313,6 @@ async def test_unshielded_shutdown_cancellation_finalizes_and_leaves_no_task() -
     assert shared_task.done()
     assert shared_task.cancelled()
     assert recorder.events.count("finalize") == 1
+    assert recorder.events.count("finalize_media") == 1
     assert recorder.events.count("close_browser") == 1
     assert "persist_trace" not in recorder.events

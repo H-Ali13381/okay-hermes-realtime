@@ -24,8 +24,10 @@ from .capabilities import (
     UnknownCapabilityError,
     latest_handoff,
     parse_permission_resolution_arguments,
+    parse_youtube_play_arguments,
 )
 from .config import Settings, build_realtime_session
+from .media import MediaPlaybackError, MediaPlaybackManager, YouTubeResolver
 from .runtime.browser import NoopBrowserHandle
 from .runtime.controller import StaleControlMessage, VoiceSessionController
 from .runtime.protocol import StopMessage
@@ -221,15 +223,23 @@ def create_app(
         def launch(self, loopback_url: str) -> NoopBrowserHandle:
             return NoopBrowserHandle()
 
-    _controller = (
-        controller
-        if controller is not None
-        else VoiceSessionController(
+    if controller is not None:
+        _controller = controller
+    else:
+        media_manager = MediaPlaybackManager(
+            resolver=YouTubeResolver(
+                yt_dlp_bin=settings.yt_dlp_bin,
+                timeout_seconds=settings.youtube_resolve_timeout_seconds,
+                browser_cookies=settings.youtube_browser_cookies,
+            ),
+            mpv_bin=settings.mpv_bin,
+        )
+        _controller = VoiceSessionController(
             launcher=_DiagnosticLauncher(),
             token_store=LaunchTokenStore(),
             capability_broker=broker,
+            media_manager=media_manager,
         )
-    )
 
     active_session_id: str | None = None
     active_execution_scope: str | None = None
@@ -300,6 +310,7 @@ def create_app(
             "model": settings.realtime_model,
             "capabilities": [capability.name for capability in CAPABILITIES],
             "controller_status": _controller.status,
+            "media": _controller.media_status,
         }
 
     @app.post("/execute")
@@ -365,7 +376,19 @@ def create_app(
             )
 
         try:
-            if execution_request.name == "resolve_heavy_agent_block":
+            if execution_request.name == "media_play_youtube":
+                youtube = parse_youtube_play_arguments(execution_request.arguments)
+                playback_result = await _controller.prepare_youtube_playback(
+                    session_id=active_session_id,
+                    source=youtube.source,
+                )
+                result = {
+                    "ok": True,
+                    "capability": execution_request.name,
+                    "execution": "local",
+                    "result": playback_result,
+                }
+            elif execution_request.name == "resolve_heavy_agent_block":
                 permission = parse_permission_resolution_arguments(execution_request.arguments)
                 permission_result = await _controller.resolve_task_permission(
                     session_id=active_session_id,
@@ -396,6 +419,13 @@ def create_app(
                 "ok": False,
                 "call_id": execution_request.call_id,
                 "error": {"type": "unknown_capability", "message": str(exc)},
+            }
+        except MediaPlaybackError as exc:
+            status_code = 503
+            body = {
+                "ok": False,
+                "call_id": execution_request.call_id,
+                "error": {"type": "media_playback_failed", "message": str(exc)},
             }
         except (ValueError, RuntimeError) as exc:
             status_code = 400
