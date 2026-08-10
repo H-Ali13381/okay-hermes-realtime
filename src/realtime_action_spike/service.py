@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import os
 import signal
+import sys
 from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import Protocol
@@ -16,6 +17,14 @@ from .media import MediaPlaybackManager, YouTubeResolver
 from .runtime.activation_socket import ActivationSocket
 from .runtime.browser import DedicatedBraveLauncher
 from .runtime.controller import VoiceSessionController
+from .runtime.instance_lock import (
+    ControllerAlreadyRunningError,
+    ControllerInstanceLock,
+    ControllerInstanceLockError,
+    default_controller_lock_path,
+)
+
+CONTROLLER_ALREADY_RUNNING_EXIT_CODE = 73
 
 
 class HTTPServerProtocol(Protocol):
@@ -119,18 +128,12 @@ class RuntimeService:
         self._signal_handlers_registered = False
 
         self._launcher = launcher_factory(settings)
-        state_home = Path(
-            os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
-        )
-        self._controller_health_path = (
-            state_home / "okay-hermes-realtime" / "controller-health"
-        )
+        state_home = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
+        self._controller_health_path = state_home / "okay-hermes-realtime" / "controller-health"
         if controller_factory is None:
             self._controller = VoiceSessionController(
                 launcher=self._launcher,
-                browser_start_timeout_seconds=(
-                    settings.voice_browser_start_timeout_seconds
-                ),
+                browser_start_timeout_seconds=(settings.voice_browser_start_timeout_seconds),
                 trace_directory=state_home / "okay-hermes-realtime" / "traces",
                 status_observer=self._publish_controller_status,
                 task_notifications_enabled=settings.kde_task_notifications,
@@ -318,12 +321,25 @@ class RuntimeService:
 
 
 def main() -> int:
-    service = RuntimeService(Settings.from_env())
+    lock = ControllerInstanceLock(default_controller_lock_path())
     try:
-        asyncio.run(service.run())
-        return 0
-    except KeyboardInterrupt:
-        return 130
+        lock.acquire()
+    except ControllerAlreadyRunningError:
+        print("Okay Hermes Realtime controller is already running.", file=sys.stderr)
+        return CONTROLLER_ALREADY_RUNNING_EXIT_CODE
+    except ControllerInstanceLockError:
+        print("Okay Hermes Realtime controller lock could not be acquired.", file=sys.stderr)
+        return 1
+
+    try:
+        service = RuntimeService(Settings.from_env())
+        try:
+            asyncio.run(service.run())
+            return 0
+        except KeyboardInterrupt:
+            return 130
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":

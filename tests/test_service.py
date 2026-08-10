@@ -406,6 +406,255 @@ async def test_uvicorn_adapter_leaves_signal_ownership_to_runtime_service(
     assert not captured_signals
 
 
+class _RecordingRuntimeService:
+    def __init__(self, settings: object, events: list[str]) -> None:
+        self.settings = settings
+        self._events = events
+        self._events.append("runtime construct")
+
+    async def run(self) -> None:
+        self._events.append("run")
+
+
+class _KeyboardInterruptRuntimeService:
+    def __init__(self, _settings: object, events: list[str]) -> None:
+        self._events = events
+        self._events.append("runtime construct")
+
+    async def run(self) -> None:
+        self._events.append("run")
+        raise KeyboardInterrupt
+
+
+class _RecordingLock:
+    def __init__(self, path: object, events: list[str]) -> None:
+        self.path = path
+        self._events = events
+        self._events.append("lock construct")
+
+    def acquire(self) -> None:
+        self._events.append("acquire")
+
+    def release(self) -> None:
+        self._events.append("release")
+
+
+class _AlreadyRunningLock:
+    def __init__(self, _path: object) -> None:
+        pass
+
+    def acquire(self) -> None:
+        raise service_module.ControllerAlreadyRunningError("controller already running")
+
+    def release(self) -> None:
+        raise AssertionError("release must not be called when acquire fails")
+
+
+class _GenericLockErrorLock:
+    def __init__(self, _path: object) -> None:
+        pass
+
+    def acquire(self) -> None:
+        raise service_module.ControllerInstanceLockError("controller lock could not be acquired")
+
+    def release(self) -> None:
+        raise AssertionError("release must not be called when acquire fails")
+
+
+def test_main_rejects_duplicate_controller_processes_early(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    called = {"settings": False, "runtime": False}
+
+    monkeypatch.setattr(service_module, "ControllerInstanceLock", _AlreadyRunningLock)
+    monkeypatch.setattr(
+        service_module, "default_controller_lock_path", lambda: Path("/tmp/controller.lock")
+    )
+    monkeypatch.setattr(
+        service_module.Settings, "from_env", lambda: called.__setitem__("settings", True) or None
+    )
+    monkeypatch.setattr(
+        service_module,
+        "RuntimeService",
+        lambda _settings: called.__setitem__("runtime", True) or None,
+    )
+
+    exit_code = service_module.main()
+    captured = capsys.readouterr()
+
+    assert exit_code == service_module.CONTROLLER_ALREADY_RUNNING_EXIT_CODE
+    assert captured.err == "Okay Hermes Realtime controller is already running.\n"
+    assert called == {"settings": False, "runtime": False}
+
+
+def test_main_reports_generic_controller_lock_failures_without_touching_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    called = {"settings": False, "runtime": False}
+
+    monkeypatch.setattr(service_module, "ControllerInstanceLock", _GenericLockErrorLock)
+    monkeypatch.setattr(
+        service_module, "default_controller_lock_path", lambda: Path("/tmp/controller.lock")
+    )
+    monkeypatch.setattr(
+        service_module.Settings, "from_env", lambda: called.__setitem__("settings", True) or None
+    )
+    monkeypatch.setattr(
+        service_module,
+        "RuntimeService",
+        lambda _settings: called.__setitem__("runtime", True) or None,
+    )
+
+    exit_code = service_module.main()
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.err == "Okay Hermes Realtime controller lock could not be acquired.\n"
+    assert called == {"settings": False, "runtime": False}
+
+
+def test_main_loads_settings_after_lock_before_constructing_runtime_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    def fake_from_env() -> object:
+        events.append("settings")
+        return object()
+
+    def fake_runtime_service(settings: object) -> _RecordingRuntimeService:
+        return _RecordingRuntimeService(settings, events)
+
+    monkeypatch.setattr(
+        service_module, "ControllerInstanceLock", lambda path: _RecordingLock(path, events)
+    )
+    monkeypatch.setattr(
+        service_module, "default_controller_lock_path", lambda: Path("/tmp/controller.lock")
+    )
+    monkeypatch.setattr(service_module.Settings, "from_env", fake_from_env)
+    monkeypatch.setattr(service_module, "RuntimeService", fake_runtime_service)
+
+    exit_code = service_module.main()
+
+    assert exit_code == 0
+    assert events == [
+        "lock construct",
+        "acquire",
+        "settings",
+        "runtime construct",
+        "run",
+        "release",
+    ]
+
+
+def test_main_releases_lock_when_runtime_service_construction_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    def fake_from_env() -> object:
+        events.append("settings")
+        return object()
+
+    def fake_runtime_service(_settings: object) -> object:
+        events.append("runtime construct")
+        raise RuntimeError("runtime constructor failed")
+
+    monkeypatch.setattr(
+        service_module, "ControllerInstanceLock", lambda path: _RecordingLock(path, events)
+    )
+    monkeypatch.setattr(
+        service_module, "default_controller_lock_path", lambda: Path("/tmp/controller.lock")
+    )
+    monkeypatch.setattr(service_module.Settings, "from_env", fake_from_env)
+    monkeypatch.setattr(service_module, "RuntimeService", fake_runtime_service)
+
+    with pytest.raises(RuntimeError, match="runtime constructor failed"):
+        service_module.main()
+
+    assert events == ["lock construct", "acquire", "settings", "runtime construct", "release"]
+
+
+def test_main_releases_lock_when_runtime_run_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    def fake_from_env() -> object:
+        events.append("settings")
+        return object()
+
+    class FakeRuntimeService:
+        def __init__(self, _settings: object) -> None:
+            events.append("runtime construct")
+
+        async def run(self) -> None:
+            events.append("run")
+            raise RuntimeError("runtime failed")
+
+    monkeypatch.setattr(
+        service_module, "ControllerInstanceLock", lambda path: _RecordingLock(path, events)
+    )
+    monkeypatch.setattr(
+        service_module, "default_controller_lock_path", lambda: Path("/tmp/controller.lock")
+    )
+    monkeypatch.setattr(service_module.Settings, "from_env", fake_from_env)
+    monkeypatch.setattr(service_module, "RuntimeService", FakeRuntimeService)
+
+    with pytest.raises(RuntimeError, match="runtime failed"):
+        service_module.main()
+
+    assert events == [
+        "lock construct",
+        "acquire",
+        "settings",
+        "runtime construct",
+        "run",
+        "release",
+    ]
+
+
+def test_main_returns_130_for_keyboard_interrupt_and_releases_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    def fake_from_env() -> object:
+        events.append("settings")
+        return object()
+
+    class FakeRuntimeService:
+        def __init__(self, _settings: object) -> None:
+            events.append("runtime construct")
+
+        async def run(self) -> None:
+            events.append("run")
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        service_module, "ControllerInstanceLock", lambda path: _RecordingLock(path, events)
+    )
+    monkeypatch.setattr(
+        service_module, "default_controller_lock_path", lambda: Path("/tmp/controller.lock")
+    )
+    monkeypatch.setattr(service_module.Settings, "from_env", fake_from_env)
+    monkeypatch.setattr(service_module, "RuntimeService", FakeRuntimeService)
+
+    exit_code = service_module.main()
+
+    assert exit_code == 130
+    assert events == [
+        "lock construct",
+        "acquire",
+        "settings",
+        "runtime construct",
+        "run",
+        "release",
+    ]
+
+
 def test_service_module_executes_main_only_under_module_entrypoint() -> None:
     source = Path(service_module.__file__).read_text(encoding="utf-8")
 
