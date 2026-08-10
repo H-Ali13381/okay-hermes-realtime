@@ -92,19 +92,67 @@ def test_unusable_parent_path_raises_bounded_lock_directory_error(tmp_path: Path
     assert isinstance(excinfo.value.__cause__, OSError)
 
 
-def test_symlink_final_path_fails_closed(tmp_path: Path) -> None:
-    path = tmp_path / "runtime" / "controller.lock"
-    target = tmp_path / "escaped" / "controller.lock"
-    target.parent.mkdir(parents=True)
-    target.write_text("do not follow", encoding="utf-8")
-    path.parent.mkdir(parents=True)
-    path.symlink_to(target)
+def test_symlinked_parent_component_fails_closed(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "runtime-target"
+    runtime_root.mkdir()
+    runtime_root.chmod(0o755)
 
-    with pytest.raises(ControllerInstanceLockError, match=r"unsafe|regular file"):
+    runtime_link = tmp_path / "runtime"
+    runtime_link.symlink_to(runtime_root, target_is_directory=True)
+
+    path = runtime_link / "controller.lock"
+    target_lock = runtime_root / "controller.lock"
+
+    with pytest.raises(ControllerInstanceLockError, match="unsafe"):
         ControllerInstanceLock(path).acquire()
 
-    assert path.is_symlink()
-    assert target.read_text(encoding="utf-8") == "do not follow"
+    assert runtime_link.is_symlink()
+    assert not target_lock.exists()
+    assert stat.S_IMODE(runtime_root.stat().st_mode) == 0o755
+
+
+@pytest.mark.parametrize(
+    ("failing_attr", "exc_type"),
+    [
+        ("fstat", OSError),
+        ("fchmod", PermissionError),
+        ("set_inheritable", OSError),
+    ],
+)
+def test_non_contention_setup_errors_become_instance_lock_errors_and_close_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_attr: str,
+    exc_type: type[BaseException],
+) -> None:
+    path = tmp_path / "runtime" / "controller.lock"
+    lock = ControllerInstanceLock(path)
+    seen: dict[str, int | None] = {"fd": None}
+
+    original_open = os.open
+    original_attr = getattr(os, failing_attr)
+    original_fstat = os.fstat
+
+    def wrapped_open(*args, **kwargs):
+        fd = original_open(*args, **kwargs)
+        seen["fd"] = fd
+        return fd
+
+    def failing_call(*args, **kwargs):
+        raise exc_type(f"boom in {failing_attr}")
+
+    monkeypatch.setattr(os, "open", wrapped_open)
+    monkeypatch.setattr(os, failing_attr, failing_call)
+
+    with pytest.raises(ControllerInstanceLockError, match=r"controller lock"):
+        lock.acquire()
+
+    assert not lock.acquired
+    assert seen["fd"] is not None
+    with pytest.raises(OSError):
+        original_fstat(seen["fd"])
+
+    monkeypatch.setattr(os, failing_attr, original_attr)
 
 
 def test_holder_subprocess_releases_lock_for_new_owner(tmp_path: Path) -> None:

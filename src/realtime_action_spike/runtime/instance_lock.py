@@ -41,6 +41,12 @@ class ControllerInstanceLock:
             raise ControllerInstanceLockError("controller lock path must be absolute")
 
         parent = self._path.parent
+        # The runtime directory is trusted, but we fail closed if any already-existing
+        # ancestor is a symlink so mkdir/chmod never operate through a redirected path.
+        for candidate in (parent, *parent.parents):
+            if candidate.is_symlink():
+                raise ControllerInstanceLockError("controller lock directory is unsafe")
+
         try:
             parent.mkdir(parents=True, exist_ok=True)
             parent.chmod(0o700)
@@ -57,19 +63,26 @@ class ControllerInstanceLock:
             raise ControllerInstanceLockError("controller lock file is unsafe") from exc
 
         try:
-            file_status = os.fstat(fd)
-            if not stat.S_ISREG(file_status.st_mode):
-                raise ControllerInstanceLockError("controller lock must be a regular file")
-            os.fchmod(fd, 0o600)
-            os.set_inheritable(fd, False)
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise ControllerAlreadyRunningError("controller already running") from exc
-            except OSError as exc:
-                if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                file_status = os.fstat(fd)
+                if not stat.S_ISREG(file_status.st_mode):
+                    raise ControllerInstanceLockError("controller lock must be a regular file")
+                os.fchmod(fd, 0o600)
+                os.set_inheritable(fd, False)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
                     raise ControllerAlreadyRunningError("controller already running") from exc
-                raise ControllerInstanceLockError("controller lock could not be acquired") from exc
+                except OSError as exc:
+                    if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                        raise ControllerAlreadyRunningError("controller already running") from exc
+                    raise ControllerInstanceLockError(
+                        "controller lock could not be acquired"
+                    ) from exc
+            except OSError as exc:
+                raise ControllerInstanceLockError(
+                    "controller lock could not be safely initialized"
+                ) from exc
         except BaseException:
             with suppress(OSError):
                 os.close(fd)
