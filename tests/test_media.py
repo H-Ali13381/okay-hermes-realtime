@@ -326,7 +326,7 @@ class RecordingIpc:
     async def wait_ready(
         self,
         path: Path,
-        process: FakePlayerProcess,
+        process: Any,
         timeout: float,
     ) -> None:
         del timeout
@@ -554,6 +554,63 @@ async def test_commit_failure_aborts_and_reaps_paused_player(tmp_path: Path) -> 
     ]
     assert signaler.calls == [(process.pid, signal.SIGTERM)]
     assert manager.status == {"status": "idle"}
+
+
+@pytest.mark.asyncio
+async def test_commit_failure_keeps_exact_stubborn_player_owned_until_explicit_exit(
+    tmp_path: Path,
+) -> None:
+    process = FakePlayerProcess(31012)
+    resolver = StubResolver([_video("dQw4w9WgXcQ", "Selected title")])
+    factory = RecordingPlayerFactory([process])
+    ipc = RecordingIpc(fail_on_command=0)
+    signaler = StubbornGroupSignaler()
+    playback_ids = iter(["playback-1"])
+    manager = MediaPlaybackManager(
+        resolver=resolver,
+        mpv_bin="mpv",
+        runtime_directory=tmp_path / "media",
+        process_factory=factory,
+        wait_for_ipc=ipc.wait_ready,
+        send_ipc=ipc.send,
+        executable_resolver=lambda command: f"/usr/bin/{Path(command).name}",
+        process_group_signaler=signaler,
+        playback_id_factory=lambda: next(playback_ids),
+        ipc_timeout_seconds=0.01,
+        process_exit_timeout_seconds=0.01,
+    )
+    prepared = await manager.prepare("voice-session-1", "video")
+    ipc_path = manager.active_ipc_path_for_testing
+    assert ipc_path is not None and ipc_path.exists()
+
+    with pytest.raises(MediaPlaybackError, match="forced termination"):
+        await asyncio.wait_for(
+            manager.commit("voice-session-1", prepared.playback_id),
+            timeout=0.2,
+        )
+
+    assert ipc.commands == [
+        (
+            ipc.ready_paths[0],
+            ["set_property", "fullscreen", True],
+        )
+    ]
+    assert signaler.calls == [
+        (process.pid, signal.SIGTERM),
+        (process.pid, signal.SIGKILL),
+    ]
+    assert manager.status == {
+        "status": "prepared",
+        "playback_id": prepared.playback_id,
+        "title": "Selected title",
+    }
+    assert ipc_path.exists()
+
+    process.exit(0)
+    await manager.shutdown()
+
+    assert manager.status == {"status": "idle"}
+    assert not ipc_path.exists()
 
 
 @pytest.mark.asyncio
