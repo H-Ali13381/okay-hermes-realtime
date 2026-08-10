@@ -181,6 +181,10 @@ failure/resume event. If a process remains alive even after forced termination, 
 exact ownership and non-idle status rather than falsely reporting idle or orphaning the player;
 later shutdown/replacement may retry cleanup.
 
+The no-polling rule applies to fullscreen/compositor confirmation. It does not remove the existing
+bounded IPC-readiness probe, which uses `get_property pause` to establish that the private mpv socket
+is responsive before the preview is reported prepared.
+
 ## Player completion and resume
 
 The exact owned player watcher handles every process exit. It clears matching runtime state under

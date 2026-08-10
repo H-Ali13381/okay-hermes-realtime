@@ -139,7 +139,9 @@ async def _commit_active_locked(self, player: _OwnedPlayer) -> None:
 Do not add fullscreen to `_build_mpv_argv`. On either IPC failure, use the existing bounded
 stop/reap path and re-raise. A successfully reaped player returns to idle; a process still alive
 after forced-termination timeout remains exactly owned and non-idle so it cannot become an orphan.
-Do not poll `get_property` or the compositor.
+Do not add a fullscreen `get_property` loop or poll the compositor. Preserve the pre-existing
+bounded IPC-readiness probe, which uses `get_property pause` only to prove the private socket can
+accept and answer commands before preparation is reported successful.
 
 **Step 4: Run focused verification**
 
