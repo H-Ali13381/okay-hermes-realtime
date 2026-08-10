@@ -549,6 +549,85 @@ def test_main_loads_settings_after_lock_before_constructing_runtime_service(
     ]
 
 
+def test_main_propagates_settings_failure_and_releases_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    def fake_from_env() -> object:
+        events.append("settings")
+        raise RuntimeError("settings failed")
+
+    monkeypatch.setattr(
+        service_module, "ControllerInstanceLock", lambda path: _RecordingLock(path, events)
+    )
+    monkeypatch.setattr(
+        service_module, "default_controller_lock_path", lambda: Path("/tmp/controller.lock")
+    )
+    monkeypatch.setattr(service_module.Settings, "from_env", fake_from_env)
+    runtime_called = False
+
+    def fake_runtime_service(_settings: object) -> object:
+        nonlocal runtime_called
+        runtime_called = True
+        raise AssertionError("runtime service must not be constructed when settings fail")
+
+    monkeypatch.setattr(service_module, "RuntimeService", fake_runtime_service)
+
+    with pytest.raises(RuntimeError, match="settings failed"):
+        service_module.main()
+
+    assert runtime_called is False
+    assert events == ["lock construct", "acquire", "settings", "release"]
+
+
+@pytest.mark.parametrize(
+    ("interrupt_point", "expected_events"),
+    [
+        (
+            "settings",
+            ["lock construct", "acquire", "settings", "release"],
+        ),
+        (
+            "runtime",
+            ["lock construct", "acquire", "settings", "runtime construct", "release"],
+        ),
+    ],
+)
+def test_main_returns_130_for_keyboard_interrupt_during_startup_and_releases_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt_point: str,
+    expected_events: list[str],
+) -> None:
+    events: list[str] = []
+
+    def fake_from_env() -> object:
+        events.append("settings")
+        if interrupt_point == "settings":
+            raise KeyboardInterrupt
+        return object()
+
+    def fake_runtime_service(settings: object) -> object:
+        events.append("runtime construct")
+        if interrupt_point == "runtime":
+            raise KeyboardInterrupt
+        return _RecordingRuntimeService(settings, events)
+
+    monkeypatch.setattr(
+        service_module, "ControllerInstanceLock", lambda path: _RecordingLock(path, events)
+    )
+    monkeypatch.setattr(
+        service_module, "default_controller_lock_path", lambda: Path("/tmp/controller.lock")
+    )
+    monkeypatch.setattr(service_module.Settings, "from_env", fake_from_env)
+    monkeypatch.setattr(service_module, "RuntimeService", fake_runtime_service)
+
+    exit_code = service_module.main()
+
+    assert exit_code == 130
+    assert events == expected_events
+
+
 def test_main_releases_lock_when_runtime_service_construction_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

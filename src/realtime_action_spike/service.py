@@ -332,8 +332,8 @@ def main() -> int:
         return 1
 
     try:
-        service = RuntimeService(Settings.from_env())
         try:
+            service = RuntimeService(Settings.from_env())
             asyncio.run(service.run())
             return 0
         except KeyboardInterrupt:
