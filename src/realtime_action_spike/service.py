@@ -271,7 +271,6 @@ class RuntimeService:
             )
 
         await self._remove_signal_handlers()
-        self._controller_health_path.unlink(missing_ok=True)
         self._ready.clear()
         self._started = False
         self._running = False

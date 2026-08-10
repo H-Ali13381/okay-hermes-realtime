@@ -209,11 +209,11 @@ async def test_media_cleanup_failure_is_reported_after_other_shutdown_steps_comp
     assert harness.controller.media_shutdown_calls == 1
     assert harness.http.shutdown_calls == 1
     assert harness.socket.stop_calls == 1
-    assert not marker.exists()
+    assert marker.read_text(encoding="utf-8") == "ready\n"
 
 
 @pytest.mark.asyncio
-async def test_controller_health_marker_tracks_service_readiness_and_shutdown(
+async def test_controller_health_marker_tracks_service_readiness_and_persists_on_shutdown(
     isolated_service_state_home: Path,
 ) -> None:
     harness = _harness()
@@ -229,7 +229,29 @@ async def test_controller_health_marker_tracks_service_readiness_and_shutdown(
 
     harness.service.request_shutdown()
     await asyncio.wait_for(run_task, timeout=1.0)
-    assert not marker.exists()
+    assert marker.read_text(encoding="utf-8") == "ready\n"
+
+
+@pytest.mark.asyncio
+async def test_failed_secondary_service_does_not_remove_live_health_marker(
+    isolated_service_state_home: Path,
+) -> None:
+    primary = _harness()
+    marker = isolated_service_state_home / "okay-hermes-realtime" / "controller-health"
+    primary_task = asyncio.create_task(primary.service.run())
+    await asyncio.wait_for(primary.http.serve_entered.wait(), timeout=1.0)
+    primary.http.started.set()
+    await asyncio.wait_for(primary.service.ready.wait(), timeout=1.0)
+    assert marker.read_text(encoding="utf-8") == "ready\n"
+
+    secondary = _harness(socket=FakeSocket(start_error=RuntimeError("socket unavailable")))
+    with pytest.raises(RuntimeError, match="socket unavailable"):
+        await secondary.service.run()
+
+    assert marker.read_text(encoding="utf-8") == "ready\n"
+
+    primary.service.request_shutdown()
+    await asyncio.wait_for(primary_task, timeout=1.0)
 
 
 @pytest.mark.asyncio
