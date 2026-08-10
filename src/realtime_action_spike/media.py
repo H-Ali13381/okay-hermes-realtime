@@ -531,6 +531,11 @@ class MediaPlaybackManager:
         try:
             await self._send_ipc(
                 player.ipc_path,
+                ["set_property", "fullscreen", True],
+                self._ipc_timeout_seconds,
+            )
+            await self._send_ipc(
+                player.ipc_path,
                 ["set_property", "pause", False],
                 self._ipc_timeout_seconds,
             )

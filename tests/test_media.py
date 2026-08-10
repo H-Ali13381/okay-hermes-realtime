@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import signal
 import sys
 from pathlib import Path
 from typing import Any
@@ -313,11 +314,13 @@ class RecordingIpc:
         self,
         *,
         fail_send: bool = False,
+        fail_on_command: int | None = None,
         exit_on_ready: bool = False,
     ) -> None:
         self.ready_paths: list[Path] = []
         self.commands: list[tuple[Path, list[object]]] = []
         self.fail_send = fail_send
+        self.fail_on_command = fail_on_command
         self.exit_on_ready = exit_on_ready
 
     async def wait_ready(
@@ -335,7 +338,7 @@ class RecordingIpc:
     async def send(self, path: Path, command: list[object], timeout: float) -> None:
         del timeout
         self.commands.append((path, command))
-        if self.fail_send:
+        if self.fail_send or self.fail_on_command == len(self.commands) - 1:
             raise MediaPlaybackError("simulated IPC failure")
 
 
@@ -424,6 +427,7 @@ async def test_playback_prepare_uses_fixed_paused_mpv_policy_and_private_runtime
     assert "--pause=yes" in argv
     assert "--ontop" in argv
     assert "--no-terminal" in argv
+    assert "--fullscreen" not in argv
     assert "--no-playlist" not in argv
     assert "--geometry=640x360-32-32" in argv
     assert "--script-opts=ytdl_hook-ytdl_path=%15%/usr/bin/yt-dlp" in argv
@@ -484,7 +488,16 @@ async def test_commit_unpauses_only_the_exact_prepared_session_and_generation(
 
     await manager.commit("voice-session-1", prepared.playback_id)
 
-    assert ipc.commands[0][1] == ["set_property", "pause", False]
+    assert ipc.commands == [
+        (
+            ipc.ready_paths[0],
+            ["set_property", "fullscreen", True],
+        ),
+        (
+            ipc.ready_paths[0],
+            ["set_property", "pause", False],
+        ),
+    ]
     assert manager.status["status"] == "playing"
     await manager.shutdown()
 
@@ -517,7 +530,7 @@ async def test_failed_session_finalization_aborts_paused_player_and_cleans_runti
 @pytest.mark.asyncio
 async def test_commit_failure_aborts_and_reaps_paused_player(tmp_path: Path) -> None:
     process = FakePlayerProcess(31011)
-    ipc = RecordingIpc(fail_send=True)
+    ipc = RecordingIpc(fail_on_command=0)
     manager, _resolver, _factory, _ipc, signaler = _manager(
         tmp_path,
         videos=[_video("dQw4w9WgXcQ", "Selected title")],
@@ -533,7 +546,13 @@ async def test_commit_failure_aborts_and_reaps_paused_player(tmp_path: Path) -> 
             commit=True,
         )
 
-    assert signaler.calls[0][0] == process.pid
+    assert ipc.commands == [
+        (
+            ipc.ready_paths[0],
+            ["set_property", "fullscreen", True],
+        )
+    ]
+    assert signaler.calls == [(process.pid, signal.SIGTERM)]
     assert manager.status == {"status": "idle"}
 
 
