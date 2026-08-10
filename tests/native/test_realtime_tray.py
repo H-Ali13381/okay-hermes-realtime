@@ -112,11 +112,33 @@ def test_systemd_signal_connections_retry_and_commands_are_async() -> None:
 def test_turn_off_stops_wakeword_then_controller_through_systemd() -> None:
     source = CPP_PATH.read_text(encoding="utf-8")
     stop_block = source.split("void stopServices() {", maxsplit=1)[1].split(
-        "void openVoicePage() {",
+        "void exitApplication() {",
         maxsplit=1,
     )[0]
 
     assert 'runSystemdCommandsAsync("StopUnit", {kWakewordUnit, kControllerUnit})' in stop_block
+
+
+def test_exit_stops_services_before_quitting_tray() -> None:
+    source = CPP_PATH.read_text(encoding="utf-8")
+    constructor_block = source.split("explicit TrayController", maxsplit=1)[1].split(
+        "private Q_SLOTS:",
+        maxsplit=1,
+    )[0]
+    exit_block = source.split("void exitApplication() {", maxsplit=1)[1].split(
+        "void openVoicePage() {",
+        maxsplit=1,
+    )[0]
+
+    assert "&TrayController::exitApplication" in constructor_block
+    assert "&QApplication::quit" not in constructor_block
+    assert (
+        'runSystemdCommandsAsync("StopUnit", '
+        "{kWakewordUnit, kControllerUnit}, true)"
+    ) in exit_block
+    assert "app.quit()" not in exit_block
+    assert "quitWhenComplete" in source
+    assert "app.quit()" in source
 
 
 def test_cmake_links_all_event_driven_backends() -> None:

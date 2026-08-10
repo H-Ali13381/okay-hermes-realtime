@@ -130,7 +130,7 @@ public:
         QObject::connect(turnOnAction, &QAction::triggered, this, &TrayController::startServices);
         QObject::connect(turnOffAction, &QAction::triggered, this, &TrayController::stopServices);
         QObject::connect(openVoicePageAction, &QAction::triggered, this, &TrayController::openVoicePage);
-        QObject::connect(exitAction, &QAction::triggered, &app, &QApplication::quit);
+        QObject::connect(exitAction, &QAction::triggered, this, &TrayController::exitApplication);
         QObject::connect(switchingTimer, &QTimer::timeout, this, &TrayController::advanceSpinner);
         QObject::connect(captureWatcher, &QFileSystemWatcher::directoryChanged, this, &TrayController::captureHealthChanged);
         QObject::connect(captureWatcher, &QFileSystemWatcher::fileChanged, this, &TrayController::captureHealthChanged);
@@ -163,6 +163,7 @@ private Q_SLOTS:
         if (systemdCommandInFlight) {
             return;
         }
+        exitAction->setEnabled(true);
         const DaemonState state = daemonState();
         switch (state) {
         case DaemonState::NoMicrophone:
@@ -283,6 +284,11 @@ private:
         runSystemdCommandsAsync("StopUnit", {kWakewordUnit, kControllerUnit});
     }
 
+    void exitApplication() {
+        setSwitchingState("Stopping replacement services before exit…");
+        runSystemdCommandsAsync("StopUnit", {kWakewordUnit, kControllerUnit}, true);
+    }
+
     void openVoicePage() {
         if (!controllerActive || openRequestInFlight) {
             return;
@@ -312,6 +318,7 @@ private:
         turnOnAction->setEnabled(false);
         turnOffAction->setEnabled(false);
         openVoicePageAction->setEnabled(false);
+        exitAction->setEnabled(false);
         tray->setToolTip(tooltip);
         tray->setIcon(stateIcon(QColor(234, 179, 8), spinnerFrame));
         switchingTimer->start(150);
@@ -363,17 +370,28 @@ private:
         }
     }
 
-    void runSystemdCommandsAsync(const QString& method, const QStringList& units) {
+    void runSystemdCommandsAsync(
+        const QString& method,
+        const QStringList& units,
+        bool quitWhenComplete = false) {
         if (systemdCommandInFlight) {
             return;
         }
         systemdCommandInFlight = true;
-        runSystemdCommandAt(method, units, 0);
+        runSystemdCommandAt(method, units, 0, quitWhenComplete);
     }
 
-    void runSystemdCommandAt(const QString& method, const QStringList& units, int index) {
+    void runSystemdCommandAt(
+        const QString& method,
+        const QStringList& units,
+        int index,
+        bool quitWhenComplete) {
         if (index >= units.size()) {
             systemdCommandInFlight = false;
+            if (quitWhenComplete) {
+                app.quit();
+                return;
+            }
             requestUnitStates();
             return;
         }
@@ -381,7 +399,8 @@ private:
             method, units.at(index), QStringLiteral("replace"));
         auto* watcher = new QDBusPendingCallWatcher(pending, this);
         QObject::connect(watcher, &QDBusPendingCallWatcher::finished, this,
-                         [this, method, units, index](QDBusPendingCallWatcher* finished) {
+                         [this, method, units, index, quitWhenComplete](
+                             QDBusPendingCallWatcher* finished) {
             QDBusPendingReply<QDBusObjectPath> reply(*finished);
             finished->deleteLater();
             if (!reply.isValid()) {
@@ -396,7 +415,7 @@ private:
                 requestUnitStates();
                 return;
             }
-            runSystemdCommandAt(method, units, index + 1);
+            runSystemdCommandAt(method, units, index + 1, quitWhenComplete);
         });
     }
 
