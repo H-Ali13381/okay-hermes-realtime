@@ -79,6 +79,19 @@ def test_relative_paths_fail_closed() -> None:
         ControllerInstanceLock(Path("runtime/controller.lock")).acquire()
 
 
+def test_unusable_parent_path_raises_bounded_lock_directory_error(tmp_path: Path) -> None:
+    path = tmp_path / "runtime" / "controller.lock"
+    path.parent.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(
+        ControllerInstanceLockError,
+        match="controller lock directory is unsafe",
+    ) as excinfo:
+        ControllerInstanceLock(path).acquire()
+
+    assert isinstance(excinfo.value.__cause__, OSError)
+
+
 def test_symlink_final_path_fails_closed(tmp_path: Path) -> None:
     path = tmp_path / "runtime" / "controller.lock"
     target = tmp_path / "escaped" / "controller.lock"

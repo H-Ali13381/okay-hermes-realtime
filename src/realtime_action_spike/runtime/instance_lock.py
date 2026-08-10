@@ -41,8 +41,11 @@ class ControllerInstanceLock:
             raise ControllerInstanceLockError("controller lock path must be absolute")
 
         parent = self._path.parent
-        parent.mkdir(parents=True, exist_ok=True)
-        parent.chmod(0o700)
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+            parent.chmod(0o700)
+        except OSError as exc:
+            raise ControllerInstanceLockError("controller lock directory is unsafe") from exc
 
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
         if hasattr(os, "O_NOFOLLOW"):
