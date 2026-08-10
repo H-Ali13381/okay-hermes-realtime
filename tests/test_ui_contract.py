@@ -128,6 +128,18 @@ def test_js_uses_direct_realtime_webrtc_transport_and_scoped_tools() -> None:
     assert 'fetch("/client-secret"' not in script
 
 
+def test_end_session_update_preserves_required_realtime_session_type() -> None:
+    source = _read(SOURCE_JS_PATH)
+    end_session_block = _extract_block(
+        source,
+        "if (output.ok && output.result?.end_session) {",
+        "return output;",
+    )
+
+    assert 'type: "session.update"' in end_session_block
+    assert 'session: {\n          type: "realtime",' in end_session_block
+
+
 def test_task_events_use_manual_non_interrupting_realtime_turns() -> None:
     source = _read(SOURCE_JS_PATH)
     scheduler = _read(PROJECT_ROOT / "frontend/task-turn-scheduler.js")

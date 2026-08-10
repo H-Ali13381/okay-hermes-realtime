@@ -639,6 +639,7 @@ async function runFunctionCall(item, sessionContext) {
       {
         type: "session.update",
         session: {
+          type: "realtime",
           audio: {
             input: {
               turn_detection: {
