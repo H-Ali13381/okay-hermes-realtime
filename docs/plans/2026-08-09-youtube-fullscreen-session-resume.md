@@ -363,7 +363,10 @@ git commit -m "feat: add media continuity protocol"
 **Objective:** Make `media_ready` commit the exact prepared preview while keeping the local voice session live, then relay exact player completion to the browser.
 
 **Files:**
+- Modify: `src/realtime_action_spike/media.py:285-302`
 - Modify: `src/realtime_action_spike/runtime/controller.py:60-828`
+- Modify: `src/realtime_action_spike/gateway.py:112-203` only if the generic relay regression exposes a defect
+- Modify: `tests/test_media.py`
 - Modify: `tests/runtime/test_controller.py:90-348`
 - Modify: `tests/integration/test_session_failures.py`
 - Modify: `tests/test_gateway.py`
@@ -410,8 +413,15 @@ Add tests that:
 - new activation returns busy through prepared/playing/resuming;
 - `media_cancel` stops only the exact paused generation and leaves voice live;
 - button/service/tray teardown stops prepared or playing media and never queues resume;
+- player exit racing terminal teardown cannot leave or deliver a resumable `media_finished`;
+- terminal teardown removes an already queued `MediaFinishedMessage` before the next outbound read;
+- a full outbound queue fails closed through one terminal teardown instead of silently dropping the
+  critical `MediaFinishedMessage` or leaving the session stuck in `resuming`;
 - commit failure queues a bounded failed completion and leaves the voice session resumable;
 - no controller lock is held while awaiting media IPC.
+
+Add a media result contract test in `tests/test_media.py` proving
+`PreparedPlayback.tool_result()` contains `media_handoff: true` and contains no `end_session` field.
 
 Add a gateway relay regression proving a queued `MediaFinishedMessage` is sent over the
 existing control WebSocket without closing it, then the socket continues accepting a matching
@@ -440,6 +450,9 @@ continuation_history: tuple[ContinuationItem, ...] = ()
 
 Bind the manager completion handler in controller construction. Update preparation to set `prepared` and return `media_handoff`, not `end_session`.
 
+Make the producer change in `PreparedPlayback.tool_result()` itself; the controller must not rewrite
+the media manager's result after the fact.
+
 Handle `MediaReadyMessage` in two phases:
 
 1. under the controller lock, validate exact session/generation and capture the commit arguments;
@@ -450,21 +463,30 @@ If teardown wins the race, stop the exact media generation instead of reviving i
 
 The completion handler must acquire only the controller lock, verify exact session/playback/phase, set `resuming`, and enqueue one `MediaFinishedMessage`. It must never call media-manager methods from inside the callback.
 
+`MediaFinishedMessage` is critical control traffic. If the bounded outbound queue is full, mark the
+media phase failed and start one terminal teardown after releasing the controller lock; never leave
+the session in `resuming` and never silently drop the event. As soon as terminal teardown begins,
+invalidate the active media generation and remove queued `MediaFinishedMessage` values for that
+generation before publishing terminal `StopMessage`. `MediaResumeCompleteMessage` is inbound and
+must be rejected once terminal teardown has started.
+
 On terminal teardown, call `stop_for_session` for both prepared and playing media. Remove the old “commit from `finalize_media` when reason is MODEL_REQUEST” behavior.
 
 **Step 4: Run focused verification**
 
 ```bash
 uv run ruff check src/realtime_action_spike/runtime/controller.py tests/runtime/test_controller.py \
+  src/realtime_action_spike/media.py tests/test_media.py \
   tests/integration/test_session_failures.py tests/test_gateway.py
 uv run pytest -q tests/runtime/test_controller.py tests/runtime/test_teardown.py \
-  tests/integration/test_session_failures.py tests/test_gateway.py
+  tests/test_media.py tests/integration/test_session_failures.py tests/test_gateway.py
 ```
 
 **Step 5: Commit**
 
 ```bash
-git add src/realtime_action_spike/runtime/controller.py tests/runtime/test_controller.py \
+git add src/realtime_action_spike/media.py src/realtime_action_spike/runtime/controller.py \
+  tests/test_media.py tests/runtime/test_controller.py \
   tests/integration/test_session_failures.py tests/test_gateway.py
 git commit -m "feat: keep voice session alive during media"
 ```
@@ -646,6 +668,8 @@ Add focused source-contract tests proving:
 - `taskTurnScheduler.setSuspended(true)` precedes `media_ready`;
 - `media_finished` exact-peer handling restores VAD/microphone and creates one contextual follow-up;
 - `media_resume_complete` is sent with `mode: "exact"`;
+- `media_finished` is ignored once terminal stopping has begun, even if the control relay already
+  pulled it from the controller queue;
 - no `stopConversation({ reason: "model_request" })` exists in the media handoff block;
 - a bounded confirmation timeout sends `media_cancel` and restores voice rather than tearing down;
 - media state is generation-bound by the stored playback ID;
