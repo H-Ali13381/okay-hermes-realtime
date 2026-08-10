@@ -7,7 +7,12 @@ from pydantic import ValidationError
 
 from realtime_action_spike.runtime.protocol import (
     ActivationMessage,
+    ContinuationItem,
     LoopbackMessage,
+    MediaCancelMessage,
+    MediaFinishedMessage,
+    MediaReadyMessage,
+    MediaResumeCompleteMessage,
     PageReadyMessage,
     PageStartedMessage,
     SessionClosedMessage,
@@ -745,3 +750,270 @@ def test_playback_suppressed_accepts_scoped_response_id() -> None:
 
     assert isinstance(parsed, TimingMessage)
     assert parsed.data["response_id"] == "resp-current"
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("  hello\nworld\t ", "hello world"),
+        ("one\r\ntwo\vthree", "one two three"),
+    ],
+)
+def test_continuation_item_normalizes_whitespace(text: str, expected: str) -> None:
+    item = ContinuationItem(role="user", text=text)
+
+    assert item.role == "user"
+    assert item.text == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "   ", "x" * 16001, "bad\x00text"],
+)
+def test_continuation_item_rejects_blank_controls_and_oversize_text(text: str) -> None:
+    with pytest.raises((ValidationError, ValueError)):
+        ContinuationItem(role="assistant", text=text)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "type": "media_ready",
+            "session_id": "local-session-01",
+            "playback_id": "abc12345",
+            "history": [
+                {"role": "user", "text": "hello", "tool": {"call_id": "call_1"}}
+            ],
+        },
+        {
+            "type": "media_ready",
+            "session_id": "local-session-01",
+            "playback_id": "abc12345",
+            "history": [
+                {
+                    "role": "assistant",
+                    "text": "hello",
+                    "tool_payload": {"secret": "value"},
+                }
+            ],
+        },
+    ],
+)
+def test_media_ready_history_rejects_nested_unknown_payloads(payload: dict[str, object]) -> None:
+    with pytest.raises((ValidationError, ValueError)):
+        parse_loopback_message(payload)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        MediaReadyMessage(
+            type="media_ready",
+            session_id="local-session-01",
+            playback_id="abc12345",
+            history=[
+                ContinuationItem(role="user", text="  Hello   there  "),
+                ContinuationItem(role="assistant", text="General\nKenobi"),
+            ],
+        ),
+        MediaCancelMessage(
+            type="media_cancel",
+            session_id="local-session-01",
+            playback_id="abc12345",
+            reason="browser_failure",
+        ),
+        MediaFinishedMessage(
+            type="media_finished",
+            session_id="local-session-01",
+            playback_id="abc12345",
+            outcome="completed",
+        ),
+        MediaResumeCompleteMessage(
+            type="media_resume_complete",
+            session_id="local-session-01",
+            playback_id="abc12345",
+            mode="exact",
+        ),
+    ],
+)
+def test_media_messages_round_trip_and_parse_with_session_guard(message: LoopbackMessage) -> None:
+    encoded = encode_loopback_message(message)
+
+    parsed = parse_loopback_message(encoded, expected_session_id="local-session-01")
+
+    assert parsed == message
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "type": "media_ready",
+            "session_id": "local-session-01",
+            "playback_id": "abc123",
+            "history": [],
+        },
+        {
+            "type": "media_cancel",
+            "session_id": "local-session-01",
+            "playback_id": "abc123!",
+            "reason": "browser_failure",
+        },
+        {
+            "type": "media_finished",
+            "session_id": "local-session-01",
+            "playback_id": "abc12345",
+            "outcome": "done",
+        },
+        {
+            "type": "media_resume_complete",
+            "session_id": "local-session-01",
+            "playback_id": "abc12345",
+            "mode": "approximate",
+        },
+    ],
+)
+def test_media_messages_reject_invalid_playback_ids_and_enums(payload: dict[str, object]) -> None:
+    with pytest.raises((ValidationError, ValueError)):
+        parse_loopback_message(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "type": "media_ready",
+            "session_id": "call_abcdefgh",
+            "playback_id": "abc12345",
+            "history": [],
+        },
+        {
+            "type": "media_cancel",
+            "session_id": "session_abcdefgh",
+            "playback_id": "abc12345",
+            "reason": "confirmation_failed",
+        },
+        {
+            "type": "media_finished",
+            "session_id": "call_abcdefgh",
+            "playback_id": "abc12345",
+            "outcome": "failed",
+        },
+        {
+            "type": "media_resume_complete",
+            "session_id": "session_abcdefgh",
+            "playback_id": "abc12345",
+            "mode": "reconstructed",
+        },
+    ],
+)
+def test_media_messages_reject_provider_looking_session_ids(payload: dict[str, object]) -> None:
+    with pytest.raises((ValidationError, ValueError)):
+        parse_loopback_message(payload)
+
+
+def test_media_ready_history_enforces_count_and_aggregate_length() -> None:
+    valid_lengths = [666] * 23 + [682]
+    valid_history = [
+        ContinuationItem(role="user" if index % 2 == 0 else "assistant", text="x" * length)
+        for index, length in enumerate(valid_lengths)
+    ]
+    message = MediaReadyMessage(
+        type="media_ready",
+        session_id="local-session-01",
+        playback_id="abc12345",
+        history=valid_history,
+    )
+    assert len(message.history) == 24
+    assert sum(len(item.text) for item in message.history) == 16000
+    assert parse_loopback_message(encode_loopback_message(message)) == message
+
+    with pytest.raises((ValidationError, ValueError)):
+        MediaReadyMessage(
+            type="media_ready",
+            session_id="local-session-01",
+            playback_id="abc12345",
+            history=[*valid_history, ContinuationItem(role="user", text="x")],
+        )
+
+    over_total_history = [*valid_history[:-1], ContinuationItem(role="assistant", text="x" * 683)]
+    with pytest.raises((ValidationError, ValueError)):
+        MediaReadyMessage(
+            type="media_ready",
+            session_id="local-session-01",
+            playback_id="abc12345",
+            history=over_total_history,
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "type": "media_ready",
+            "session_id": "local-session-01",
+            "playback_id": "abc12345",
+            "history": [{"role": "user", "text": "ok"}],
+            "title": "not-allowed",
+        },
+        {
+            "type": "media_cancel",
+            "session_id": "local-session-01",
+            "playback_id": "abc12345",
+            "reason": "confirmation_timed_out",
+            "raw_audio": "not-allowed",
+        },
+    ],
+)
+def test_media_messages_reject_unknown_top_level_fields(payload: dict[str, object]) -> None:
+    with pytest.raises((ValidationError, ValueError)):
+        parse_loopback_message(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "type": "media_ready",
+            "session_id": "local-session-01",
+            "playback_id": "abc12345",
+            "history": [{"role": "user", "text": "ok"}],
+        },
+        {
+            "type": "media_cancel",
+            "session_id": "local-session-01",
+            "playback_id": "abc12345",
+            "reason": "confirmation_failed",
+        },
+        {
+            "type": "media_finished",
+            "session_id": "local-session-01",
+            "playback_id": "abc12345",
+            "outcome": "failed",
+        },
+        {
+            "type": "media_resume_complete",
+            "session_id": "local-session-01",
+            "playback_id": "abc12345",
+            "mode": "reconstructed",
+        },
+    ],
+)
+def test_media_messages_reject_stale_session_ids_when_expected_id_differs(
+    payload: dict[str, object],
+) -> None:
+    parsed = parse_loopback_message(payload, expected_session_id="local-session-01")
+    assert isinstance(
+        parsed,
+        (
+            MediaReadyMessage,
+            MediaCancelMessage,
+            MediaFinishedMessage,
+            MediaResumeCompleteMessage,
+        ),
+    )
+    assert parsed.session_id == "local-session-01"
+
+    with pytest.raises(ValueError, match="session_id mismatch"):
+        parse_loopback_message(payload, expected_session_id="other-session")

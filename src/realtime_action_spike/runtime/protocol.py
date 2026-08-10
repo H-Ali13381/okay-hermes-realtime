@@ -54,6 +54,7 @@ _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,128}$")
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PROVIDER_RESPONSE_ID_RE = re.compile(r"^[A-Za-z0-9._~-]{1,256}$")
+_PLAYBACK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 _SECRET_KEY_NAMES = {
     "api_key",
     "authorization",
@@ -195,6 +196,64 @@ class SessionClosedMessage(_StrictBaseModel):
         return _validate_session_id(value)
 
 
+class ContinuationItem(_StrictBaseModel):
+    role: Literal["user", "assistant"]
+    text: str
+
+    @field_validator("text", mode="before")
+    @classmethod
+    def _validate_text(cls, value: Any) -> str:
+        return _normalize_media_text(value, field_name="text")
+
+
+class _MediaSessionPlaybackMessage(_StrictBaseModel):
+    session_id: str
+    playback_id: str
+
+    @field_validator("session_id")
+    @classmethod
+    def _validate_session_id(cls, value: str) -> str:
+        return _validate_session_id(value)
+
+    @field_validator("playback_id")
+    @classmethod
+    def _validate_playback_id(cls, value: str) -> str:
+        return _validate_playback_id(value)
+
+
+class MediaReadyMessage(_MediaSessionPlaybackMessage):
+    type: Literal["media_ready"] = "media_ready"
+    history: list[ContinuationItem]
+
+    @model_validator(mode="after")
+    def _validate_history(self) -> MediaReadyMessage:
+        if len(self.history) > 24:
+            raise ValueError("history must contain at most 24 items")
+        total_text = sum(len(item.text) for item in self.history)
+        if total_text > 16000:
+            raise ValueError("history text must be at most 16000 characters")
+        return self
+
+
+class MediaCancelMessage(_MediaSessionPlaybackMessage):
+    type: Literal["media_cancel"] = "media_cancel"
+    reason: Literal[
+        "confirmation_failed",
+        "confirmation_timed_out",
+        "browser_failure",
+    ]
+
+
+class MediaFinishedMessage(_MediaSessionPlaybackMessage):
+    type: Literal["media_finished"] = "media_finished"
+    outcome: Literal["completed", "failed"]
+
+
+class MediaResumeCompleteMessage(_MediaSessionPlaybackMessage):
+    type: Literal["media_resume_complete"] = "media_resume_complete"
+    mode: Literal["exact", "reconstructed"]
+
+
 class TaskEventMessage(_StrictBaseModel):
     """Controller-to-browser relay for an exact tracked Kanban event."""
 
@@ -238,13 +297,15 @@ LoopbackMessage = Annotated[
     ActivationMessage
     | PageReadyMessage
     | PageStartedMessage
-
     | TimingMessage
     | StopMessage
     | TeardownCompleteMessage
     | SessionClosedMessage
-    | TaskEventMessage
-    ,
+    | MediaReadyMessage
+    | MediaCancelMessage
+    | MediaFinishedMessage
+    | MediaResumeCompleteMessage
+    | TaskEventMessage,
     Field(discriminator="type"),
 ]
 
@@ -261,6 +322,29 @@ def _validate_session_id(value: str) -> str:
         raise ValueError("session_id must not be provider-looking")
 
     return value
+
+
+def _validate_playback_id(value: str) -> str:
+    if not isinstance(value, str) or not _PLAYBACK_ID_RE.fullmatch(value):
+        raise ValueError("playback_id must be 8..128 chars in [A-Za-z0-9_-]")
+    return value
+
+
+def _normalize_media_text(value: Any, *, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    if any(
+        (ord(character) < 32 or ord(character) == 127)
+        and character not in {"\t", "\n", "\r", "\f", "\v"}
+        for character in value
+    ):
+        raise ValueError(f"{field_name} must not contain disallowed control characters")
+    normalized = " ".join(value.split())
+    if not normalized:
+        raise ValueError(f"{field_name} must not be blank")
+    if len(normalized) > 16000:
+        raise ValueError(f"{field_name} must be at most 16000 characters")
+    return normalized
 
 
 def _normalize_secret_key(key: str) -> str:
