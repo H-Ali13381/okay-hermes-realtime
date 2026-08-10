@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import signal
 import sys
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +15,7 @@ from pydantic import ValidationError
 from realtime_action_spike.media import (
     MediaPlaybackError,
     MediaPlaybackManager,
+    PlaybackCompletion,
     YouTubePlayArguments,
     YouTubeResolver,
     YouTubeVideo,
@@ -725,6 +728,256 @@ async def test_player_normal_exit_releases_only_matching_runtime_state(tmp_path:
 
     assert manager.status == {"status": "idle"}
     assert not ipc_path.exists()
+
+
+def test_playback_completion_is_frozen_and_slot_based() -> None:
+    completion = PlaybackCompletion(
+        session_id="voice-session-1",
+        playback_id="playback-1",
+        title="Selected",
+        channel="Channel",
+        outcome="completed",
+    )
+
+    assert completion.__slots__ == (
+        "session_id",
+        "playback_id",
+        "title",
+        "channel",
+        "outcome",
+    )
+    with pytest.raises(FrozenInstanceError):
+        completion.outcome = "failed"  # type: ignore[misc]
+
+
+@pytest.mark.asyncio
+async def test_committed_player_exit_notifies_once_after_state_clears_and_handler_can_reenter(
+    tmp_path: Path,
+) -> None:
+    process = FakePlayerProcess(31014)
+    manager, _resolver, _factory, _ipc, _signaler = _manager(
+        tmp_path,
+        videos=[_video("dQw4w9WgXcQ", "Selected title")],
+        processes=[process],
+    )
+    completions: list[PlaybackCompletion] = []
+    entered = asyncio.Event()
+    released = asyncio.Event()
+
+    async def handler(completion: PlaybackCompletion) -> None:
+        completions.append(completion)
+        assert completion == PlaybackCompletion(
+            session_id="voice-session-1",
+            playback_id="playback-1",
+            title="Selected title",
+            channel="Channel",
+            outcome="completed",
+        )
+        assert manager.status == {"status": "idle"}
+        assert manager.active_ipc_path_for_testing is None
+        entered.set()
+        await asyncio.wait_for(manager.shutdown(), timeout=0.1)
+        released.set()
+
+    manager.bind_completion_handler(handler)
+    prepared = await manager.prepare("voice-session-1", "video")
+    await manager.commit("voice-session-1", prepared.playback_id)
+
+    process.exit(0)
+    await asyncio.wait_for(entered.wait(), timeout=0.2)
+    await asyncio.wait_for(released.wait(), timeout=0.2)
+
+    assert completions == [
+        PlaybackCompletion(
+            session_id="voice-session-1",
+            playback_id=prepared.playback_id,
+            title="Selected title",
+            channel="Channel",
+            outcome="completed",
+        )
+    ]
+    assert manager.status == {"status": "idle"}
+
+
+@pytest.mark.asyncio
+async def test_committed_player_exit_reports_failed_outcome_when_process_exits_nonzero(
+    tmp_path: Path,
+) -> None:
+    process = FakePlayerProcess(31015)
+    manager, _resolver, _factory, _ipc, _signaler = _manager(
+        tmp_path,
+        videos=[_video("dQw4w9WgXcQ", "Selected title")],
+        processes=[process],
+    )
+    completions: list[PlaybackCompletion] = []
+
+    async def handler(completion: PlaybackCompletion) -> None:
+        completions.append(completion)
+
+    manager.bind_completion_handler(handler)
+    prepared = await manager.prepare("voice-session-1", "video")
+    await manager.commit("voice-session-1", prepared.playback_id)
+
+    process.exit(1)
+    for _ in range(20):
+        if completions:
+            break
+        await asyncio.sleep(0)
+
+    assert completions == [
+        PlaybackCompletion(
+            session_id="voice-session-1",
+            playback_id=prepared.playback_id,
+            title="Selected title",
+            channel="Channel",
+            outcome="failed",
+        )
+    ]
+    assert manager.status == {"status": "idle"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["shutdown", "stop_for_session"])
+async def test_shutdown_and_exact_stop_for_session_do_not_notify_completion(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    process = FakePlayerProcess(31016)
+    manager, _resolver, _factory, _ipc, _signaler = _manager(
+        tmp_path,
+        videos=[_video("dQw4w9WgXcQ", "Selected title")],
+        processes=[process],
+    )
+    completions: list[PlaybackCompletion] = []
+
+    async def handler(completion: PlaybackCompletion) -> None:
+        completions.append(completion)
+
+    manager.bind_completion_handler(handler)
+    prepared = await manager.prepare("voice-session-1", "video")
+    await manager.commit("voice-session-1", prepared.playback_id)
+
+    if action == "shutdown":
+        await manager.shutdown()
+    else:
+        await manager.stop_for_session("voice-session-1", prepared.playback_id)
+
+    await asyncio.sleep(0)
+
+    assert completions == []
+    assert manager.status == {"status": "idle"}
+
+
+@pytest.mark.asyncio
+async def test_stop_for_session_ignores_stale_session_or_playback_id(tmp_path: Path) -> None:
+    process = FakePlayerProcess(31017)
+    manager, _resolver, _factory, _ipc, _signaler = _manager(
+        tmp_path,
+        videos=[_video("dQw4w9WgXcQ", "Selected title")],
+        processes=[process],
+    )
+    completions: list[PlaybackCompletion] = []
+
+    async def handler(completion: PlaybackCompletion) -> None:
+        completions.append(completion)
+
+    manager.bind_completion_handler(handler)
+    prepared = await manager.prepare("voice-session-1", "video")
+    await manager.commit("voice-session-1", prepared.playback_id)
+
+    await manager.stop_for_session("stale-session", prepared.playback_id)
+    await manager.stop_for_session("voice-session-1", "older-playback")
+
+    assert completions == []
+    assert manager.status["status"] == "playing"
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stale_player_exit_does_not_notify_or_clear_newer_generation(tmp_path: Path) -> None:
+    old = FakePlayerProcess(31018)
+    new = FakePlayerProcess(31019)
+    manager, _resolver, _factory, _ipc, _signaler = _manager(
+        tmp_path,
+        videos=[
+            _video("dQw4w9WgXcQ", "First"),
+            _video("aqz-KE-bpKQ", "Second"),
+        ],
+        processes=[old, new],
+    )
+    completions: list[PlaybackCompletion] = []
+
+    async def handler(completion: PlaybackCompletion) -> None:
+        completions.append(completion)
+
+    manager.bind_completion_handler(handler)
+
+    await manager.prepare("voice-session-1", "first")
+    await manager.prepare("voice-session-1", "second")
+    old.exit(0)
+    await asyncio.sleep(0)
+
+    assert completions == []
+    assert manager.status["title"] == "Second"
+
+    new.exit(0)
+    for _ in range(20):
+        if completions:
+            break
+        await asyncio.sleep(0)
+
+    assert completions == [
+        PlaybackCompletion(
+            session_id="voice-session-1",
+            playback_id="playback-2",
+            title="Second",
+            channel="Channel",
+            outcome="completed",
+        )
+    ]
+    assert manager.status == {"status": "idle"}
+
+
+@pytest.mark.asyncio
+async def test_handler_exception_is_logged_and_state_stays_cleared(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    process = FakePlayerProcess(31020)
+    manager, _resolver, _factory, _ipc, _signaler = _manager(
+        tmp_path,
+        videos=[_video("dQw4w9WgXcQ", "Selected title")],
+        processes=[process],
+    )
+
+    async def handler(_completion: PlaybackCompletion) -> None:
+        raise RuntimeError("boom")
+
+    manager.bind_completion_handler(handler)
+    prepared = await manager.prepare("voice-session-1", "video")
+
+    with caplog.at_level(logging.ERROR, logger="realtime_action_spike.media"):
+        await manager.commit("voice-session-1", prepared.playback_id)
+        process.exit(0)
+        for _ in range(20):
+            if manager.status == {"status": "idle"}:
+                break
+            await asyncio.sleep(0)
+
+    assert manager.status == {"status": "idle"}
+    assert any("completion handler failed" in record.message for record in caplog.records)
+
+
+def test_binding_a_second_completion_handler_is_rejected() -> None:
+    manager = MediaPlaybackManager()
+
+    async def handler(_completion: PlaybackCompletion) -> None:
+        return None
+
+    manager.bind_completion_handler(handler)
+
+    with pytest.raises(MediaPlaybackError, match="already bound"):
+        manager.bind_completion_handler(handler)
 
 
 @pytest.mark.asyncio

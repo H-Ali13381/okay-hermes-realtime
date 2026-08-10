@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import secrets
 import shutil
@@ -21,12 +22,27 @@ class MediaPlaybackError(RuntimeError):
     """A controlled media failure safe to report through the local tool contract."""
 
 
+logger = logging.getLogger(__name__)
+
+
 @dataclass(frozen=True, slots=True)
 class YouTubeVideo:
     video_id: str
     title: str
     channel: str
     webpage_url: str
+
+
+PlaybackOutcome = Literal["completed", "failed"]
+
+
+@dataclass(frozen=True, slots=True)
+class PlaybackCompletion:
+    session_id: str
+    playback_id: str
+    title: str
+    channel: str
+    outcome: PlaybackOutcome
 
 
 class ResolverProcess(Protocol):
@@ -220,6 +236,7 @@ WaitForIpc = Callable[[Path, PlayerProcess, float], Awaitable[None]]
 SendIpc = Callable[[Path, list[object], float], Awaitable[None]]
 ExecutableResolver = Callable[[str], str | None]
 ProcessGroupSignaler = Callable[[int, int], None]
+CompletionHandler = Callable[[PlaybackCompletion], Awaitable[None]]
 
 
 async def _default_player_process_factory(*argv: str, **kwargs: Any) -> PlayerProcess:
@@ -346,6 +363,7 @@ class MediaPlaybackManager:
         self._process_exit_timeout_seconds = process_exit_timeout_seconds
         self._lock = asyncio.Lock()
         self._active: _OwnedPlayer | None = None
+        self._completion_handler: CompletionHandler | None = None
 
     @staticmethod
     def default_runtime_directory() -> Path:
@@ -438,6 +456,11 @@ class MediaPlaybackManager:
                 raise MediaPlaybackError("stale or invalid prepared playback")
             await self._commit_active_locked(player)
 
+    def bind_completion_handler(self, handler: CompletionHandler) -> None:
+        if self._completion_handler is not None:
+            raise MediaPlaybackError("completion handler already bound")
+        self._completion_handler = handler
+
     async def finalize_session(
         self,
         session_id: str,
@@ -458,6 +481,16 @@ class MediaPlaybackManager:
                 await self._commit_active_locked(player)
                 return
             await self._stop_active_locked()
+
+    async def stop_for_session(self, session_id: str, playback_id: str) -> None:
+        async with self._lock:
+            player = self._active
+            if (
+                player is not None
+                and player.session_id == session_id
+                and player.playback_id == playback_id
+            ):
+                await self._stop_active_locked()
 
     async def abort_prepared_for_session(self, session_id: str) -> None:
         async with self._lock:
@@ -521,11 +554,33 @@ class MediaPlaybackManager:
             await player.process.wait()
         except asyncio.CancelledError:
             return
+
+        completion: PlaybackCompletion | None = None
+        handler: CompletionHandler | None = None
         async with self._lock:
             if self._active is not player:
                 return
+            player.watcher = None
             self._active = None
             self._cleanup_runtime(player.ipc_path)
+            returncode = player.process.returncode if player.process.returncode is not None else 1
+            completion = PlaybackCompletion(
+                session_id=player.session_id,
+                playback_id=player.playback_id,
+                title=player.video.title,
+                channel=player.video.channel,
+                outcome="completed" if returncode == 0 else "failed",
+            )
+            handler = self._completion_handler
+
+        if handler is None or completion is None:
+            return
+        try:
+            await handler(completion)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("completion handler failed")
 
     async def _commit_active_locked(self, player: _OwnedPlayer) -> None:
         try:
