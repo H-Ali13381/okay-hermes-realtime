@@ -500,7 +500,6 @@ class MediaPlaybackManager:
             "--pause=yes",
             "--keep-open=no",
             "--idle=no",
-            "--no-playlist",
             f"--script-opts=ytdl_hook-ytdl_path={quoted_yt_dlp_path}",
         ]
         if browser_cookies is not None:

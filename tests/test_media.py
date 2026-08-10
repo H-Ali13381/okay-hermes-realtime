@@ -424,7 +424,7 @@ async def test_playback_prepare_uses_fixed_paused_mpv_policy_and_private_runtime
     assert "--pause=yes" in argv
     assert "--ontop" in argv
     assert "--no-terminal" in argv
-    assert "--no-playlist" in argv
+    assert "--no-playlist" not in argv
     assert "--geometry=640x360-32-32" in argv
     assert "--script-opts=ytdl_hook-ytdl_path=%15%/usr/bin/yt-dlp" in argv
     assert "--ytdl-raw-options-append=cookies-from-browser=brave:Default" in argv
