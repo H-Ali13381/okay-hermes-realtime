@@ -175,9 +175,11 @@ ordered IPC commands:
 ```
 
 The second command is sent only after mpv accepts the first. The controller does not poll the
-compositor or wait for a visual fullscreen acknowledgement. If either IPC command fails, the player
-is stopped and the browser receives a failure/resume event instead of leaving an unmanaged paused
-window.
+compositor or wait for a visual fullscreen acknowledgement. If either IPC command fails, the manager
+attempts its existing bounded TERM/KILL stop-and-reap sequence and the browser receives a
+failure/resume event. If a process remains alive even after forced termination, the manager retains
+exact ownership and non-idle status rather than falsely reporting idle or orphaning the player;
+later shutdown/replacement may retry cleanup.
 
 ## Player completion and resume
 
@@ -252,8 +254,8 @@ References:
 | Preview preparation fails | Controlled tool failure; voice session remains live |
 | Confirmation response fails/cancels | Abort prepared player; keep or restore voice session |
 | Browser sends stale `media_ready` | Reject and abort only the stale prepared generation |
-| Fullscreen IPC fails | Stop/reap player; restore voice and report concise failure |
-| Unpause IPC fails | Stop/reap player; restore voice and report concise failure |
+| Fullscreen IPC fails | Attempt bounded stop/reap; retain ownership if still alive; restore voice and report concise failure |
+| Unpause IPC fails | Attempt bounded stop/reap; retain ownership if still alive; restore voice and report concise failure |
 | Player exits before handoff | Clear exact generation; browser resumes without starting media |
 | Player exits normally/manually | Send one `media_finished`; resume and ask follow-up |
 | Player crashes | Send bounded failed outcome; resume and briefly acknowledge failure |

@@ -99,6 +99,12 @@ async def test_fullscreen_failure_never_unpauses_and_reaps_player(tmp_path: Path
 
 Keep the preview assertions: `--pause=yes`, `--geometry=640x360-32-32`, and `--ontop`. Assert no startup `--fullscreen` flag.
 
+Add a second failure regression using `StubbornGroupSignaler`: fullscreen failure must still send no
+unpause and must attempt TERM then KILL, but when the process remains alive the manager must retain
+the exact prepared player and non-idle status. It must never clear ownership merely to satisfy an
+idle-state assertion. After the fake process is explicitly exited, `shutdown()` must cleanly release
+the retained generation.
+
 **Step 2: Run tests to verify RED**
 
 ```bash
@@ -130,7 +136,10 @@ async def _commit_active_locked(self, player: _OwnedPlayer) -> None:
     player.status = "playing"
 ```
 
-Do not add fullscreen to `_build_mpv_argv`. Do not poll `get_property` or the compositor.
+Do not add fullscreen to `_build_mpv_argv`. On either IPC failure, use the existing bounded
+stop/reap path and re-raise. A successfully reaped player returns to idle; a process still alive
+after forced-termination timeout remains exactly owned and non-idle so it cannot become an orphan.
+Do not poll `get_property` or the compositor.
 
 **Step 4: Run focused verification**
 
