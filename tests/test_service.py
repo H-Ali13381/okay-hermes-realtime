@@ -416,14 +416,20 @@ class _RecordingRuntimeService:
         self._events.append("run")
 
 
-class _KeyboardInterruptRuntimeService:
-    def __init__(self, _settings: object, events: list[str]) -> None:
+class _KeyboardInterruptAcquireLock:
+    def __init__(self, path: object, events: list[str]) -> None:
+        self.path = path
         self._events = events
-        self._events.append("runtime construct")
+        self.release_called = False
+        self._events.append("lock construct")
 
-    async def run(self) -> None:
-        self._events.append("run")
+    def acquire(self) -> None:
+        self._events.append("acquire")
         raise KeyboardInterrupt
+
+    def release(self) -> None:
+        self.release_called = True
+        self._events.append("release")
 
 
 class _RecordingLock:
@@ -512,6 +518,38 @@ def test_main_reports_generic_controller_lock_failures_without_touching_settings
 
     assert exit_code == 1
     assert captured.err == "Okay Hermes Realtime controller lock could not be acquired.\n"
+    assert called == {"settings": False, "runtime": False}
+
+
+def test_main_returns_130_when_lock_acquire_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    called = {"settings": False, "runtime": False}
+    fake_lock = _KeyboardInterruptAcquireLock(Path("/tmp/controller.lock"), events)
+
+    def fake_from_env() -> object:
+        called["settings"] = True
+        raise AssertionError("settings must not be loaded when lock acquisition is interrupted")
+
+    def fake_runtime_service(_settings: object) -> object:
+        called["runtime"] = True
+        raise AssertionError(
+            "runtime service must not be constructed when lock acquisition is interrupted"
+        )
+
+    monkeypatch.setattr(service_module, "ControllerInstanceLock", lambda _path: fake_lock)
+    monkeypatch.setattr(
+        service_module, "default_controller_lock_path", lambda: Path("/tmp/controller.lock")
+    )
+    monkeypatch.setattr(service_module.Settings, "from_env", fake_from_env)
+    monkeypatch.setattr(service_module, "RuntimeService", fake_runtime_service)
+
+    exit_code = service_module.main()
+
+    assert exit_code == 130
+    assert events == ["lock construct", "acquire"]
+    assert fake_lock.release_called is False
     assert called == {"settings": False, "runtime": False}
 
 

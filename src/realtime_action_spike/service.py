@@ -128,12 +128,18 @@ class RuntimeService:
         self._signal_handlers_registered = False
 
         self._launcher = launcher_factory(settings)
-        state_home = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
-        self._controller_health_path = state_home / "okay-hermes-realtime" / "controller-health"
+        state_home = Path(
+            os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
+        )
+        self._controller_health_path = (
+            state_home / "okay-hermes-realtime" / "controller-health"
+        )
         if controller_factory is None:
             self._controller = VoiceSessionController(
                 launcher=self._launcher,
-                browser_start_timeout_seconds=(settings.voice_browser_start_timeout_seconds),
+                browser_start_timeout_seconds=(
+                    settings.voice_browser_start_timeout_seconds
+                ),
                 trace_directory=state_home / "okay-hermes-realtime" / "traces",
                 status_observer=self._publish_controller_status,
                 task_notifications_enabled=settings.kde_task_notifications,
@@ -322,14 +328,19 @@ class RuntimeService:
 
 def main() -> int:
     lock = ControllerInstanceLock(default_controller_lock_path())
+    acquired = False
     try:
         lock.acquire()
+    except KeyboardInterrupt:
+        return 130
     except ControllerAlreadyRunningError:
         print("Okay Hermes Realtime controller is already running.", file=sys.stderr)
         return CONTROLLER_ALREADY_RUNNING_EXIT_CODE
     except ControllerInstanceLockError:
         print("Okay Hermes Realtime controller lock could not be acquired.", file=sys.stderr)
         return 1
+    else:
+        acquired = True
 
     try:
         try:
@@ -339,7 +350,8 @@ def main() -> int:
         except KeyboardInterrupt:
             return 130
     finally:
-        lock.release()
+        if acquired:
+            lock.release()
 
 
 if __name__ == "__main__":
