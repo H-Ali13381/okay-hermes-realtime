@@ -3,6 +3,202 @@ function canApplyRemoteAnswer(activePeer, expectedPeer) {
   return activePeer === expectedPeer && expectedPeer?.signalingState !== "closed";
 }
 
+// frontend/media-confirmation.js
+var ROOT_KEYS = /* @__PURE__ */ new Set([
+  "type",
+  "session_id",
+  "pending_id",
+  "source",
+  "title",
+  "subtitle",
+  "thumbnail_url",
+  "prompt",
+  "episode",
+  "audio_mode",
+  "resume"
+]);
+var EPISODE_KEYS = /* @__PURE__ */ new Set([
+  "series_title",
+  "season_number",
+  "episode_number",
+  "episode_title"
+]);
+var RESUME_KEYS = /* @__PURE__ */ new Set(["start_seconds", "duration_seconds", "reason"]);
+var SAFE_ID = /^[A-Za-z0-9_-]{8,128}$/u;
+var IMAGE_HOSTS = /* @__PURE__ */ new Set(["i.ytimg.com", "img.youtube.com", "cdn.xlsbox.com"]);
+function assertExactKeys(value, allowed, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Invalid media confirmation ${label}`);
+  }
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) throw new Error(`Unknown media confirmation field: ${key}`);
+  }
+}
+function boundedText(value, label, maximum = 300) {
+  if (typeof value !== "string") throw new Error(`Invalid media confirmation ${label}`);
+  const normalized = value.replace(/\s+/gu, " ").trim();
+  if (!normalized || normalized.length > maximum || /[\u0000-\u001f\u007f]/u.test(normalized)) {
+    throw new Error(`Invalid media confirmation ${label}`);
+  }
+  return normalized;
+}
+function parseThumbnail(value) {
+  if (value === null) return null;
+  if (typeof value !== "string" || value.length > 2048) {
+    throw new Error("Invalid media confirmation thumbnail");
+  }
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch (_error) {
+    throw new Error("Invalid media confirmation thumbnail");
+  }
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.port || parsed.hash || !IMAGE_HOSTS.has(parsed.hostname)) {
+    throw new Error("Invalid media confirmation thumbnail");
+  }
+  return parsed.href;
+}
+function parseEpisode(value) {
+  if (value === null) return null;
+  assertExactKeys(value, EPISODE_KEYS, "episode");
+  if (!Number.isInteger(value.episode_number) || value.episode_number < 1) {
+    throw new Error("Invalid media confirmation episode");
+  }
+  if (value.season_number !== null && (!Number.isInteger(value.season_number) || value.season_number < 1)) {
+    throw new Error("Invalid media confirmation season");
+  }
+  return {
+    seriesTitle: boundedText(value.series_title, "series title"),
+    seasonNumber: value.season_number,
+    episodeNumber: value.episode_number,
+    episodeTitle: value.episode_title === null ? null : boundedText(value.episode_title, "episode title")
+  };
+}
+function parseResume(value) {
+  if (value === null) return null;
+  assertExactKeys(value, RESUME_KEYS, "resume");
+  if (!Number.isFinite(value.start_seconds) || value.start_seconds < 0) {
+    throw new Error("Invalid media confirmation resume position");
+  }
+  if (value.duration_seconds !== null && (!Number.isFinite(value.duration_seconds) || value.duration_seconds <= 0)) {
+    throw new Error("Invalid media confirmation duration");
+  }
+  return {
+    startSeconds: value.start_seconds,
+    durationSeconds: value.duration_seconds,
+    reason: boundedText(value.reason, "resume reason")
+  };
+}
+function parseMediaConfirmation(event, expectedSessionId) {
+  assertExactKeys(event, ROOT_KEYS, "message");
+  if (event.type !== "media_confirmation") {
+    throw new Error("Invalid media confirmation type");
+  }
+  if (event.session_id !== expectedSessionId || !SAFE_ID.test(event.session_id || "")) {
+    throw new Error("Invalid media confirmation session");
+  }
+  if (!SAFE_ID.test(event.pending_id || "")) {
+    throw new Error("Invalid media confirmation pending id");
+  }
+  if (!(/* @__PURE__ */ new Set(["youtube", "anime"])).has(event.source)) {
+    throw new Error("Invalid media confirmation source");
+  }
+  if (event.audio_mode !== null && !(/* @__PURE__ */ new Set(["sub", "dub"])).has(event.audio_mode)) {
+    throw new Error("Invalid media confirmation audio mode");
+  }
+  const title = boundedText(event.title, "title");
+  const subtitle = boundedText(event.subtitle, "subtitle");
+  const sourceLabel = event.source === "youtube" ? "YouTube" : "Anime";
+  const modeLabel = event.audio_mode === "sub" ? "Subbed" : event.audio_mode === "dub" ? "Dubbed" : null;
+  return Object.freeze({
+    pendingId: event.pending_id,
+    source: event.source,
+    title,
+    subtitle,
+    thumbnailUrl: parseThumbnail(event.thumbnail_url),
+    prompt: boundedText(event.prompt, "prompt"),
+    episode: parseEpisode(event.episode),
+    audioMode: event.audio_mode,
+    resume: parseResume(event.resume),
+    badge: modeLabel ? `${sourceLabel} \xB7 ${modeLabel}` : sourceLabel
+  });
+}
+var MediaConfirmationState = class {
+  constructor(sessionId) {
+    if (!SAFE_ID.test(sessionId || "")) throw new Error("Invalid media confirmation session");
+    this.sessionId = sessionId;
+    this.current = null;
+  }
+  replace(event) {
+    this.current = parseMediaConfirmation(event, this.sessionId);
+    return this.current;
+  }
+  clearExact(pendingId) {
+    if (!this.current || this.current.pendingId !== pendingId) return false;
+    this.current = null;
+    return true;
+  }
+  clear() {
+    this.current = null;
+  }
+};
+
+// frontend/media-continuity.js
+var SEMANTIC_VAD = {
+  type: "semantic_vad",
+  eagerness: "high",
+  create_response: false,
+  interrupt_response: true
+};
+var MediaContinuity = class {
+  constructor({ sendRealtime, sendControl, microphoneTracks, isExactPeerHealthy }) {
+    this.sendRealtime = sendRealtime;
+    this.sendControl = sendControl;
+    this.microphoneTracks = microphoneTracks;
+    this.isExactPeerHealthy = isExactPeerHealthy;
+    this.playbackId = null;
+  }
+  begin(playbackId) {
+    if (typeof playbackId !== "string" || !/^[A-Za-z0-9_-]{8,128}$/u.test(playbackId)) {
+      throw new Error("Invalid media playback id");
+    }
+    this.playbackId = playbackId;
+    for (const track of this.microphoneTracks()) track.enabled = false;
+    this.sendRealtime({
+      type: "session.update",
+      session: { type: "realtime", audio: { input: { turn_detection: null } } }
+    });
+    this.sendRealtime({ type: "input_audio_buffer.clear" });
+    this.sendControl({ type: "media_ready", playback_id: playbackId, history: [] });
+  }
+  isActive() {
+    return this.playbackId !== null;
+  }
+  finish(event) {
+    if (!this.playbackId || event?.playback_id !== this.playbackId) return false;
+    const playbackId = this.playbackId;
+    this.playbackId = null;
+    if (!this.isExactPeerHealthy()) return false;
+    this.sendRealtime({ type: "input_audio_buffer.clear" });
+    this.sendRealtime({
+      type: "session.update",
+      session: { type: "realtime", audio: { input: { turn_detection: SEMANTIC_VAD } } }
+    });
+    for (const track of this.microphoneTracks()) track.enabled = true;
+    this.sendRealtime({
+      type: "response.create",
+      response: {
+        instructions: event.next_episode_pending ? "Briefly say the episode ended and ask naturally whether to play the proposed next episode or do something else." : "Briefly acknowledge media ended and ask what the user would like to do next."
+      }
+    });
+    this.sendControl({ type: "media_resume_complete", playback_id: playbackId, mode: "exact" });
+    return true;
+  }
+  clear() {
+    this.playbackId = null;
+  }
+};
+
 // frontend/task-turn-scheduler.js
 function eventKey(event) {
   return `${event.task_id}:${event.event_id}`;
@@ -139,6 +335,12 @@ var speechSilenceMs = document.getElementById("speech-silence-ms");
 var responseCancelMs = document.getElementById("response-cancel-ms");
 var truncationMs = document.getElementById("truncation-ms");
 var listeningRestoredMs = document.getElementById("listening-restored-ms");
+var mediaConfirmation = document.getElementById("media-confirmation");
+var mediaThumbnail = document.getElementById("media-thumbnail");
+var mediaBadge = document.getElementById("media-badge");
+var mediaTitle = document.getElementById("media-title");
+var mediaSubtitle = document.getElementById("media-subtitle");
+var mediaPrompt = document.getElementById("media-prompt");
 var initialUrl = new URL(window.location.href);
 var searchParams = new URLSearchParams(window.location.search);
 var activationToken = searchParams.get("activation");
@@ -167,6 +369,15 @@ var sessionReadyFallbackTimer = null;
 var activeMarkSessionReady = null;
 var interruptionStartedMs = null;
 var waitingForNextAudio = false;
+var mediaConfirmationState = localSessionId ? new MediaConfirmationState(localSessionId) : null;
+var mediaContinuity = new MediaContinuity({
+  sendRealtime: (event) => sendRealtimeEvent(event),
+  sendControl: (event) => sendControlMessage(event),
+  microphoneTracks: () => localStream?.getAudioTracks() || [],
+  isExactPeerHealthy: () => Boolean(
+    peerConnection?.connectionState === "connected" && dataChannel?.readyState === "open"
+  )
+});
 var transcriptTurns = /* @__PURE__ */ new Map();
 var taskTurnScheduler = new TaskTurnScheduler({
   sendEvent: (event) => sendRealtimeEvent(event),
@@ -178,6 +389,30 @@ function sendControlMessage(message) {
   }
   controllerSocket.send(JSON.stringify({ ...message, session_id: localSessionId }));
   return true;
+}
+function hideMediaConfirmation(pendingId = null) {
+  if (!mediaConfirmationState) return;
+  if (pendingId && !mediaConfirmationState.clearExact(pendingId)) return;
+  if (!pendingId) mediaConfirmationState.clear();
+  mediaConfirmation.dataset.visible = "false";
+  mediaThumbnail.hidden = true;
+  mediaThumbnail.removeAttribute("src");
+}
+function showMediaConfirmation(event) {
+  if (!mediaConfirmationState) throw new Error("Media confirmation requires a local session");
+  const state = mediaConfirmationState.replace(event);
+  mediaBadge.textContent = state.badge;
+  mediaTitle.textContent = state.title;
+  mediaSubtitle.textContent = state.subtitle;
+  mediaPrompt.textContent = state.prompt;
+  if (state.thumbnailUrl) {
+    mediaThumbnail.src = state.thumbnailUrl;
+    mediaThumbnail.hidden = false;
+  } else {
+    mediaThumbnail.hidden = true;
+    mediaThumbnail.removeAttribute("src");
+  }
+  mediaConfirmation.dataset.visible = "true";
 }
 function controlTimingData(name, data) {
   if (name === "peer_connection_state") {
@@ -335,6 +570,20 @@ function openControllerSocket() {
       }
       if (event.type === "task_event") {
         taskTurnScheduler.onTaskEvent(parseTaskEventMessage(event));
+        return;
+      }
+      if (event.type === "media_confirmation") {
+        showMediaConfirmation(event);
+        return;
+      }
+      if (event.type === "media_finished") {
+        if (!mediaContinuity.finish(event)) {
+          void startConversation({
+            reconstruct: true,
+            playbackId: event.playback_id,
+            nextEpisodePending: event.next_episode_pending
+          });
+        }
         return;
       }
     } catch (_error) {
@@ -644,6 +893,12 @@ async function runFunctionCall(item, sessionContext) {
     return;
   }
   createActionStateCard(output);
+  if (output.ok && item.name === "media_decide" && output.result?.pending_id) {
+    hideMediaConfirmation(output.result.pending_id);
+  }
+  if (output.ok && output.result?.media_handoff && output.result?.pending_id) {
+    mediaContinuity.begin(output.result.pending_id);
+  }
   if (!output.ok) {
     setStatus("connected", "Connected \u2014 tools unavailable");
   }
@@ -788,16 +1043,19 @@ async function handleRealtimeEvent(event, sessionContext) {
     showError(event.error?.message || "The Realtime session returned an error.");
   }
 }
-async function startConversation() {
+async function startConversation(options = {}) {
+  const reconstruct = options.reconstruct === true;
   clearError();
-  taskTurnScheduler.reset();
-  functionCallExecutions.clear();
-  resetTranscript();
-  resetInterruptionDiagnostics();
-  stopMessageSent = false;
-  teardownCompleteSent = false;
+  if (!reconstruct) {
+    taskTurnScheduler.reset();
+    functionCallExecutions.clear();
+    resetTranscript();
+    resetInterruptionDiagnostics();
+    stopMessageSent = false;
+    teardownCompleteSent = false;
+  }
   startButton.disabled = true;
-  setStatus("connecting", "Requesting microphone");
+  setStatus("connecting", reconstruct ? "Restoring voice session" : "Requesting microphone");
   try {
     let markSessionReady = function() {
       if (pageStartedSent || peerConnection !== pc || dataChannel !== dc) return;
@@ -811,6 +1069,21 @@ async function startConversation() {
       if (localSessionId) {
         sendControlMessage({ type: "page_started" });
       }
+      if (reconstruct && options.playbackId) {
+        for (const track of localStream?.getAudioTracks() || []) track.enabled = true;
+        sendRealtimeEvent({ type: "input_audio_buffer.clear" });
+        sendRealtimeEvent({
+          type: "response.create",
+          response: {
+            instructions: options.nextEpisodePending ? "Briefly say the episode ended and ask naturally whether to play the proposed next episode or do something else." : "Briefly acknowledge media ended and ask what the user would like to do next."
+          }
+        });
+        sendControlMessage({
+          type: "media_resume_complete",
+          playback_id: options.playbackId,
+          mode: "reconstructed"
+        });
+      }
     }, armSessionReadyFallback = function() {
       if (sessionReadyFallbackTimer !== null || pageStartedSent) return;
       sessionReadyFallbackTimer = window.setTimeout(() => {
@@ -821,13 +1094,22 @@ async function startConversation() {
         }
       }, 5e3);
     };
-    localStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
-      }
-    });
+    if (!localStream || localStream.getAudioTracks().every((track) => track.readyState === "ended")) {
+      localStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+    }
+    if (reconstruct) {
+      if (dataChannel && dataChannel.readyState !== "closed") dataChannel.close();
+      if (peerConnection && peerConnection.connectionState !== "closed") peerConnection.close();
+      dataChannel = null;
+      peerConnection = null;
+      pageStartedSent = false;
+    }
     const pc = new RTCPeerConnection();
     peerConnection = pc;
     pc.ontrack = (event) => {
@@ -860,11 +1142,13 @@ async function startConversation() {
     });
     dc.addEventListener("error", () => {
       if (peerConnection === pc && dataChannel === dc && !isStopping) {
+        if (mediaContinuity.isActive()) return;
         failConversation("Realtime data channel failed");
       }
     });
     dc.addEventListener("close", () => {
       if (peerConnection === pc && dataChannel === dc && !isStopping) {
+        if (mediaContinuity.isActive()) return;
         failConversation("Realtime data channel closed unexpectedly");
       }
     });
@@ -873,8 +1157,10 @@ async function startConversation() {
       appendEvent({ type: "webrtc.connection_state", state: pc.connectionState });
       recordTiming("peer_connection_state", { state: pc.connectionState });
       if (pc.connectionState === "failed") {
+        if (mediaContinuity.isActive()) return;
         failConversation(`WebRTC ${pc.connectionState}`);
       } else if (pc.connectionState === "disconnected") {
+        if (mediaContinuity.isActive()) return;
         scheduleTransportFailure(pc);
       } else {
         clearTransportFailureTimer();
@@ -936,6 +1222,8 @@ async function startConversation() {
 function stopConversation(options = {}) {
   if (isStopping || teardownCompleteSent) return;
   isStopping = true;
+  hideMediaConfirmation();
+  mediaContinuity.clear();
   clearTransportFailureTimer();
   const shouldSendStopMessage = options.sendStopMessage !== false;
   try {

@@ -214,6 +214,107 @@ button {
   line-height: 1.55;
 }
 
+.media-confirmation {
+  display: none;
+  width: min(100%, 430px);
+  grid-template-columns: 104px minmax(0, 1fr);
+  gap: 16px;
+  align-items: center;
+  padding: 12px;
+  border: 1px solid #465149;
+  border-radius: 14px;
+  background: #141816;
+  text-align: left;
+  box-shadow: 0 16px 42px rgb(0 0 0 / 18%);
+}
+
+.media-confirmation[data-visible="true"] {
+  display: grid;
+}
+
+.voice-card:has(.media-confirmation[data-visible="true"]) .examples {
+  display: none;
+}
+
+.media-artwork {
+  width: 104px;
+  aspect-ratio: 4 / 5;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  color: var(--accent-strong);
+  background: #202522;
+  font-size: 24px;
+}
+
+.media-artwork img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.media-artwork img:not([hidden]) + span {
+  display: none;
+}
+
+.media-confirmation-copy {
+  min-width: 0;
+}
+
+.media-badge {
+  width: fit-content;
+  margin-bottom: 7px;
+  padding: 3px 7px;
+  border: 1px solid #526258;
+  border-radius: 999px;
+  color: var(--accent-strong);
+  background: #202722;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.045em;
+  text-transform: uppercase;
+}
+
+.media-confirmation h3 {
+  margin: 0;
+  overflow: hidden;
+  font-size: 18px;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.media-subtitle,
+.media-prompt,
+.media-natural-reply {
+  margin: 0;
+}
+
+.media-subtitle {
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.media-prompt {
+  margin-top: 11px;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.media-natural-reply {
+  margin-top: 4px;
+  color: var(--quiet);
+  font-size: 11px;
+}
+
 .examples {
   display: grid;
   gap: 8px;
@@ -558,5 +659,16 @@ pre {
 
   .example {
     padding: 7px 9px;
+  }
+
+}
+
+@media (max-width: 460px) {
+  .media-confirmation {
+    grid-template-columns: 76px minmax(0, 1fr);
+  }
+
+  .media-artwork {
+    width: 76px;
   }
 }
