@@ -6,6 +6,7 @@ import re
 from collections.abc import Mapping
 from enum import StrEnum
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
@@ -247,11 +248,71 @@ class MediaCancelMessage(_MediaSessionPlaybackMessage):
 class MediaFinishedMessage(_MediaSessionPlaybackMessage):
     type: Literal["media_finished"] = "media_finished"
     outcome: Literal["completed", "failed"]
+    next_episode_pending: bool = False
 
 
 class MediaResumeCompleteMessage(_MediaSessionPlaybackMessage):
     type: Literal["media_resume_complete"] = "media_resume_complete"
     mode: Literal["exact", "reconstructed"]
+
+
+class MediaEpisodeDisplay(_StrictBaseModel):
+    series_title: str = Field(min_length=1, max_length=300)
+    season_number: int | None = Field(default=None, ge=1)
+    episode_number: int = Field(ge=1)
+    episode_title: str | None = Field(default=None, min_length=1, max_length=300)
+
+
+class MediaResumeDisplay(_StrictBaseModel):
+    start_seconds: float = Field(ge=0)
+    duration_seconds: float | None = Field(default=None, gt=0)
+    reason: str = Field(min_length=1, max_length=300)
+
+
+class MediaConfirmationMessage(_StrictBaseModel):
+    type: Literal["media_confirmation"] = "media_confirmation"
+    session_id: str
+    pending_id: str
+    source: Literal["youtube", "anime"]
+    title: str = Field(min_length=1, max_length=300)
+    subtitle: str = Field(min_length=1, max_length=300)
+    thumbnail_url: str | None = Field(default=None, max_length=2048)
+    prompt: str = Field(min_length=1, max_length=300)
+    episode: MediaEpisodeDisplay | None = None
+    audio_mode: Literal["sub", "dub"] | None = None
+    resume: MediaResumeDisplay | None = None
+
+    @field_validator("session_id")
+    @classmethod
+    def _validate_session_id(cls, value: str) -> str:
+        return _validate_session_id(value)
+
+    @field_validator("pending_id")
+    @classmethod
+    def _validate_pending_id(cls, value: str) -> str:
+        return _validate_playback_id(value)
+
+    @field_validator("title", "subtitle", "prompt", mode="before")
+    @classmethod
+    def _normalize_text(cls, value: Any, info: Any) -> str:
+        return _normalize_media_text(value, field_name=info.field_name)
+
+    @field_validator("thumbnail_url")
+    @classmethod
+    def _validate_thumbnail_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname not in {"i.ytimg.com", "img.youtube.com", "cdn.xlsbox.com"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port not in {None, 443}
+            or parsed.fragment
+        ):
+            raise ValueError("thumbnail_url must use an allowlisted HTTPS image host")
+        return value
 
 
 class TaskEventMessage(_StrictBaseModel):
@@ -305,6 +366,7 @@ LoopbackMessage = Annotated[
     | MediaCancelMessage
     | MediaFinishedMessage
     | MediaResumeCompleteMessage
+    | MediaConfirmationMessage
     | TaskEventMessage,
     Field(discriminator="type"),
 ]

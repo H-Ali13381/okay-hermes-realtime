@@ -88,6 +88,7 @@ class ActiveSessionController:
         self.registrations: list[tuple[str, object]] = []
         self.permission_resolutions: list[dict[str, object]] = []
         self.media_preparations: list[dict[str, object]] = []
+        self.media_decisions: list[dict[str, object]] = []
 
     @property
     def status(self) -> str:
@@ -111,18 +112,34 @@ class ActiveSessionController:
             "decision": kwargs["decision"],
         }
 
-    async def prepare_youtube_playback(self, **kwargs: object) -> dict[str, object]:
-        self.media_preparations.append(kwargs)
+    async def prepare_youtube_media(self, **kwargs: object) -> dict[str, object]:
+        self.media_preparations.append({"kind": "youtube", **kwargs})
         if self.media_error is not None:
             raise MediaPlaybackError(self.media_error)
         return {
-            "action": "media.youtube.play",
-            "playback_id": "playback-test-1",
-            "title": "Selected video",
-            "channel": "Selected channel",
-            "webpage_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-            "status": "prepared",
-            "end_session": True,
+            "status": "awaiting_confirmation",
+            "pending_id": "pending-youtube-01",
+            "prompt": "Play Selected video by Selected channel?",
+        }
+
+    async def prepare_anime_media(self, **kwargs: object) -> dict[str, object]:
+        self.media_preparations.append({"kind": "anime", **kwargs})
+        if self.media_error is not None:
+            raise MediaPlaybackError(self.media_error)
+        return {
+            "status": "awaiting_confirmation",
+            "pending_id": "pending-anime-01",
+            "prompt": "Play Cowboy Bebop, Episode 2 · Subbed?",
+        }
+
+    async def decide_media(self, **kwargs: object) -> dict[str, object]:
+        self.media_decisions.append(kwargs)
+        if self.media_error is not None:
+            raise MediaPlaybackError(self.media_error)
+        return {
+            "status": "playing",
+            "pending_id": kwargs["pending_id"],
+            "media_handoff": True,
         }
 
 
@@ -278,7 +295,7 @@ def test_session_configuration_uses_fast_natural_voice_defaults() -> None:
     }
     assert session["audio"]["input"]["transcription"] == {"model": "gpt-4o-mini-transcribe"}
     assert session["tool_choice"] == "auto"
-    assert len(session["tools"]) == 6
+    assert len(session["tools"]) == 8
     assert "Do not claim an action succeeded before its tool result" in session["instructions"]
     assert "resolve_heavy_agent_block" in session["instructions"]
     assert "Never infer approval" in session["instructions"]
@@ -300,7 +317,9 @@ def test_health_reports_model_and_missing_key_without_secret_material() -> None:
             "handoff_to_heavy_agent",
             "check_heavy_agent_task",
             "resolve_heavy_agent_block",
-            "media_play_youtube",
+            "media_prepare_youtube",
+            "media_prepare_anime",
+            "media_decide",
         ],
         "controller_status": "idle",
         "media": {"status": "idle"},
@@ -601,7 +620,7 @@ def test_permission_resolution_is_bound_to_live_scope_and_exact_block_event() ->
     assert invalid.json()["error"]["type"] == "invalid_arguments"
 
 
-def test_youtube_playback_is_session_bound_prepared_and_replay_safe() -> None:
+def test_media_tools_are_session_bound_and_replay_safe() -> None:
     upstream = StubUpstreamClient(
         httpx.Response(
             201,
@@ -625,34 +644,111 @@ def test_youtube_playback_is_session_bound_prepared_and_replay_safe() -> None:
             "Content-Type": "application/sdp",
         },
     )
-    request = {
-        "scope": session.headers["x-okay-hermes-execution-scope"],
-        "call_id": "call_media_01",
-        "name": "media_play_youtube",
-        "arguments": {"source": "latest Technology Connections video"},
-    }
+    scope = session.headers["x-okay-hermes-execution-scope"]
     headers = {LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE}
+    prepare = {
+        "scope": scope,
+        "call_id": "call_media_prepare_01",
+        "name": "media_prepare_youtube",
+        "arguments": {"query": "latest Technology Connections video"},
+    }
 
-    first = client.post("/execute", json=request, headers=headers)
-    replay = client.post("/execute", json=request, headers=headers)
+    first = client.post("/execute", json=prepare, headers=headers)
+    replay = client.post("/execute", json=prepare, headers=headers)
+    accept = client.post(
+        "/execute",
+        json={
+            "scope": scope,
+            "call_id": "call_media_decide_01",
+            "name": "media_decide",
+            "arguments": {"pending_id": "pending-youtube-01", "action": "accept"},
+        },
+        headers=headers,
+    )
 
     assert first.status_code == 200
     assert first.json()["result"] == {
-        "action": "media.youtube.play",
-        "playback_id": "playback-test-1",
-        "title": "Selected video",
-        "channel": "Selected channel",
-        "webpage_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-        "status": "prepared",
-        "end_session": True,
+        "status": "awaiting_confirmation",
+        "pending_id": "pending-youtube-01",
+        "prompt": "Play Selected video by Selected channel?",
     }
+    assert "end_session" not in first.text
     assert replay.content == first.content
     assert controller.media_preparations == [
         {
+            "kind": "youtube",
             "session_id": "local-session-1234",
-            "source": "latest Technology Connections video",
+            "query": "latest Technology Connections video",
         }
     ]
+    assert accept.status_code == 200
+    assert accept.json()["result"]["status"] == "playing"
+    assert accept.json()["result"]["media_handoff"] is True
+    assert "end_session" not in accept.text
+    assert controller.media_decisions[0]["action"] == "accept"
+
+
+def test_anime_prepare_and_compound_revision_are_typed() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_anime"},
+        )
+    )
+    controller = ActiveSessionController(active_session_id="local-session-1234")
+    client = TestClient(
+        create_app(settings(), upstream_client=upstream, controller=controller)  # type: ignore[arg-type]
+    )
+    session = client.post(
+        "/session?local_session_id=local-session-1234",
+        content="v=0\r\nmock-offer",
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE, "Content-Type": "application/sdp"},
+    )
+    scope = session.headers["x-okay-hermes-execution-scope"]
+    headers = {LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE}
+
+    prepared = client.post(
+        "/execute",
+        json={
+            "scope": scope,
+            "call_id": "call_anime_prepare_01",
+            "name": "media_prepare_anime",
+            "arguments": {"query": "Cowboy Bebop", "episode": 1},
+        },
+        headers=headers,
+    )
+    revised = client.post(
+        "/execute",
+        json={
+            "scope": scope,
+            "call_id": "call_anime_revise_01",
+            "name": "media_decide",
+            "arguments": {
+                "pending_id": "pending-anime-01",
+                "action": "revise",
+                "revision": {"episode_offset": 1, "audio_mode": "dub"},
+            },
+        },
+        headers=headers,
+    )
+
+    assert prepared.status_code == 200
+    assert revised.status_code == 200
+    assert controller.media_preparations == [
+        {
+            "kind": "anime",
+            "session_id": "local-session-1234",
+            "query": "Cowboy Bebop",
+            "episode": 1,
+            "episode_offset": None,
+            "audio_mode": "auto",
+        }
+    ]
+    decision = controller.media_decisions[0]
+    assert decision["action"] == "revise"
+    assert decision["revision"].episode_offset == 1  # type: ignore[union-attr]
+    assert decision["revision"].audio_mode == "dub"  # type: ignore[union-attr]
 
 
 def test_youtube_playback_failure_is_actionable_and_does_not_close_session() -> None:
@@ -688,8 +784,8 @@ def test_youtube_playback_failure_is_actionable_and_does_not_close_session() -> 
         json={
             "scope": session.headers["x-okay-hermes-execution-scope"],
             "call_id": "call_media_failure_01",
-            "name": "media_play_youtube",
-            "arguments": {"source": "specific video"},
+            "name": "media_prepare_youtube",
+            "arguments": {"query": "specific video"},
         },
         headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
     )

@@ -5,7 +5,15 @@ from pathlib import Path
 
 import pytest
 
+from realtime_action_spike.anime import AnimeResolution
 from realtime_action_spike.capabilities import HandoffRecord
+from realtime_action_spike.media import (
+    LaunchedPlayback,
+    PlaybackCompletion,
+    PlaybackProgress,
+    YouTubeVideo,
+)
+from realtime_action_spike.media_state import AnimeProgressStore, MediaPreferenceStore
 from realtime_action_spike.openai.interruption import (
     InterruptionEvent,
     InterruptionEventKind,
@@ -18,6 +26,10 @@ from realtime_action_spike.runtime.controller import (
     VoiceSessionController,
 )
 from realtime_action_spike.runtime.protocol import (
+    MediaConfirmationMessage,
+    MediaFinishedMessage,
+    MediaReadyMessage,
+    MediaResumeCompleteMessage,
     PageReadyMessage,
     PageStartedMessage,
     SessionClosedMessage,
@@ -31,6 +43,11 @@ from realtime_action_spike.runtime.protocol import (
     encode_loopback_message,
 )
 from realtime_action_spike.runtime.tokens import LaunchTokenStore
+
+
+@pytest.fixture(autouse=True)
+def isolate_controller_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
 
 
 class FakeBrowserHandle(NoopBrowserHandle):
@@ -97,33 +114,74 @@ class SequenceFactory:
 
 class RecordingMediaManager:
     def __init__(self) -> None:
-        self.prepare_calls: list[dict[str, str]] = []
-        self.finalize_calls: list[dict[str, object]] = []
+        self.launch_calls: list[dict[str, object]] = []
         self.shutdown_calls = 0
+        self.progress_handler = None
+        self.completion_handler = None
 
     @property
     def status(self) -> dict[str, object]:
-        return {"status": "prepared"} if self.prepare_calls else {"status": "idle"}
+        return {"status": "playing"} if self.launch_calls else {"status": "idle"}
 
-    async def prepare(self, session_id: str, source: str):
-        from realtime_action_spike.media import PreparedPlayback
+    async def launch(self, **kwargs: object) -> LaunchedPlayback:
+        self.launch_calls.append(kwargs)
+        return LaunchedPlayback(
+            playback_id=str(kwargs["playback_id"]),
+            title=str(kwargs["title"]),
+            subtitle=str(kwargs["subtitle"]),
+        )
 
-        self.prepare_calls.append({"session_id": session_id, "source": source})
-        return PreparedPlayback(
-            playback_id=f"playback-{len(self.prepare_calls)}",
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+    def bind_progress_handler(self, handler) -> None:
+        self.progress_handler = handler
+
+    def bind_completion_handler(self, handler) -> None:
+        self.completion_handler = handler
+
+    async def emit_progress(self, sample: PlaybackProgress) -> None:
+        assert self.progress_handler is not None
+        await self.progress_handler(sample)
+
+    async def emit_completion(self, completion: PlaybackCompletion) -> None:
+        assert self.completion_handler is not None
+        await self.completion_handler(completion)
+
+
+class RecordingYouTubeResolver:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def resolve(self, source: str) -> YouTubeVideo:
+        self.calls.append(source)
+        return YouTubeVideo(
+            video_id="dQw4w9WgXcQ",
             title="Selected title",
             channel="Selected channel",
             webpage_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
         )
 
-    async def finalize_session(self, session_id: str, **kwargs: object) -> None:
-        self.finalize_calls.append({"session_id": session_id, **kwargs})
 
-    async def abort_prepared_for_session(self, session_id: str) -> None:
-        self.finalize_calls.append({"session_id": session_id, "abort_only": True})
+class RecordingAnimeAdapter:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
 
-    async def shutdown(self) -> None:
-        self.shutdown_calls += 1
+    async def resolve(self, query: str, **kwargs: object) -> AnimeResolution:
+        self.calls.append({"query": query, **kwargs})
+        episode = int(kwargs.get("episode", 1))
+        mode = kwargs.get("audio_mode", "auto")
+        resolved_mode = "sub" if mode == "auto" else str(mode)
+        return AnimeResolution(
+            series_id="cowboy-bebop-1065",
+            series_title="Cowboy Bebop",
+            episode=episode,
+            audio_mode=resolved_mode,  # type: ignore[arg-type]
+            subtitle=f"Episode {episode} · {'Subbed' if resolved_mode == 'sub' else 'Dubbed'}",
+            poster_url="https://cdn.xlsbox.com/poster/small/1065.jpg",
+            stream_url=f"https://hls.anidb.app/stream/example/ep-{episode}.m3u8",
+            available_episode_numbers=(1, 2, 3, 4),
+        )
 
 
 class RecordingTaskEvents:
@@ -253,72 +311,196 @@ async def test_task_events_are_session_bound_and_permission_resolution_delegates
 
 
 @pytest.mark.asyncio
-async def test_youtube_playback_prepares_and_commits_after_model_teardown() -> None:
+async def test_media_prepare_publishes_card_and_accept_launches_exactly_once() -> None:
     media = RecordingMediaManager()
-    launcher = DeterministicLauncher()
+    youtube = RecordingYouTubeResolver()
     controller = VoiceSessionController(
-        launcher,
+        DeterministicLauncher(),
         token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-media"])),
         session_id_factory=SequenceFactory(["local-media-01"]),
+        pending_id_factory=SequenceFactory(["pending-youtube-01"]),
         media_manager=media,  # type: ignore[arg-type]
+        youtube_resolver=youtube,
     )
     activation = await controller.activate("http://127.0.0.1:8765/voice")
     session_id = activation.session_id
     assert session_id == "local-media-01"
-    await controller.process_control_message(
-        session_id,
-        encode_loopback_message(PageReadyMessage(type="page_ready", session_id=session_id)),
-    )
-    await controller.process_control_message(
-        session_id,
-        encode_loopback_message(PageStartedMessage(type="page_started", session_id=session_id)),
-    )
 
-    result = await controller.prepare_youtube_playback(
+    result = await controller.prepare_youtube_media(
         session_id=session_id,
-        source="latest useful video",
+        query="latest useful video",
     )
+    outbound = await controller.wait_for_outbound_message(session_id)
 
-    assert result["status"] == "prepared"
-    assert result["end_session"] is True
-    assert media.prepare_calls == [
-        {"session_id": "local-media-01", "source": "latest useful video"}
-    ]
-    assert controller.media_status == {"status": "prepared"}
+    assert result == {
+        "status": "awaiting_confirmation",
+        "pending_id": "pending-youtube-01",
+        "prompt": "Play Selected title by Selected channel?",
+    }
+    assert outbound == MediaConfirmationMessage(
+        session_id=session_id,
+        pending_id="pending-youtube-01",
+        source="youtube",
+        title="Selected title",
+        subtitle="Selected channel",
+        thumbnail_url="https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
+        prompt="Play Selected title by Selected channel?",
+    )
+    assert media.launch_calls == []
 
-    stop = StopMessage(type="stop", session_id=session_id, reason=StopReason.MODEL_REQUEST)
-    await controller.process_control_message(session_id, encode_loopback_message(stop))
-    closed = await controller.process_control_message(
+    accepted = await controller.decide_media(
+        session_id=session_id,
+        pending_id="pending-youtube-01",
+        action="accept",
+        revision=None,
+    )
+    assert accepted == {
+        "status": "handoff_pending",
+        "pending_id": "pending-youtube-01",
+        "media_handoff": True,
+    }
+    assert media.launch_calls == []
+    await controller.process_control_message(
         session_id,
-        encode_loopback_message(
-            TeardownCompleteMessage(type="teardown_complete", session_id=session_id)
-        ),
+        MediaReadyMessage(
+            session_id=session_id,
+            playback_id="pending-youtube-01",
+            history=[],
+        ).model_dump_json(),
     )
+    assert len(media.launch_calls) == 1
 
-    assert isinstance(closed, SessionClosedMessage)
-    assert media.finalize_calls == [
-        {
-            "session_id": session_id,
-            "playback_id": "playback-1",
-            "commit": True,
-        }
-    ]
-    assert launcher.handles[0].closed_calls == 1
+    with pytest.raises(StaleControlMessage, match="stale media handoff"):
+        await controller.process_control_message(
+            session_id,
+            MediaReadyMessage(
+                session_id=session_id,
+                playback_id="pending-youtube-01",
+                history=[],
+            ).model_dump_json(),
+        )
+
+    with pytest.raises(ValueError, match="stale"):
+        await controller.decide_media(
+            session_id=session_id,
+            pending_id="pending-youtube-01",
+            action="accept",
+            revision=None,
+        )
+    assert len(media.launch_calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_non_model_or_failed_teardown_aborts_prepared_playback() -> None:
+async def test_anime_revise_replaces_generation_and_reject_never_launches() -> None:
+    media = RecordingMediaManager()
+    anime = RecordingAnimeAdapter()
+    controller = VoiceSessionController(
+        DeterministicLauncher(),
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-anime"])),
+        session_id_factory=SequenceFactory(["local-anime-01"]),
+        pending_id_factory=SequenceFactory(["pending-anime-01", "pending-anime-02"]),
+        media_manager=media,  # type: ignore[arg-type]
+        anime_adapter=anime,
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id == "local-anime-01"
+
+    first = await controller.prepare_anime_media(
+        session_id=session_id,
+        query="Cowboy Bebop",
+        episode=1,
+        episode_offset=None,
+        audio_mode="auto",
+    )
+    await controller.wait_for_outbound_message(session_id)
+    revised = await controller.decide_media(
+        session_id=session_id,
+        pending_id=str(first["pending_id"]),
+        action="revise",
+        revision={"episode_offset": 1, "audio_mode": "dub"},
+    )
+    outbound = await controller.wait_for_outbound_message(session_id)
+
+    assert revised["status"] == "awaiting_confirmation"
+    assert revised["pending_id"] == "pending-anime-02"
+    assert outbound.pending_id == "pending-anime-02"  # type: ignore[union-attr]
+    assert outbound.subtitle == "Episode 2 · Dubbed"  # type: ignore[union-attr]
+    assert anime.calls[-1] == {
+        "query": "Cowboy Bebop",
+        "episode": 2,
+        "audio_mode": "dub",
+    }
+    with pytest.raises(ValueError, match="stale"):
+        await controller.decide_media(
+            session_id=session_id,
+            pending_id="pending-anime-01",
+            action="accept",
+            revision=None,
+        )
+
+    rejected = await controller.decide_media(
+        session_id=session_id,
+        pending_id="pending-anime-02",
+        action="reject",
+        revision=None,
+    )
+    assert rejected == {"status": "rejected", "pending_id": "pending-anime-02"}
+    assert media.launch_calls == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_anime_mode_updates_global_preference_and_auto_reuses_it(
+    tmp_path: Path,
+) -> None:
+    anime = RecordingAnimeAdapter()
+    preference_store = MediaPreferenceStore(tmp_path / "media_state.json")
+    controller = VoiceSessionController(
+        DeterministicLauncher(),
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-preference"])),
+        session_id_factory=SequenceFactory(["local-preference"]),
+        pending_id_factory=SequenceFactory(["pending-pref-01", "pending-pref-02"]),
+        media_manager=RecordingMediaManager(),  # type: ignore[arg-type]
+        anime_adapter=anime,
+        media_preference_store=preference_store,
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id == "local-preference"
+
+    await controller.prepare_anime_media(
+        session_id=session_id,
+        query="Cowboy Bebop",
+        episode=1,
+        episode_offset=None,
+        audio_mode="dub",
+    )
+    assert preference_store.get_audio_mode() == "dub"
+    await controller.prepare_anime_media(
+        session_id=session_id,
+        query="Cowboy Bebop",
+        episode=2,
+        episode_offset=None,
+        audio_mode="auto",
+    )
+    assert anime.calls[-1]["audio_mode"] == "dub"
+
+
+@pytest.mark.asyncio
+async def test_failed_teardown_clears_pending_media_without_launching() -> None:
     media = RecordingMediaManager()
     controller = VoiceSessionController(
         DeterministicLauncher(),
         token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-media-abort"])),
         session_id_factory=SequenceFactory(["local-media-abort"]),
+        pending_id_factory=SequenceFactory(["pending-abort-01"]),
         media_manager=media,  # type: ignore[arg-type]
+        youtube_resolver=RecordingYouTubeResolver(),
     )
     activation = await controller.activate("http://127.0.0.1:8765/voice")
     session_id = activation.session_id
     assert session_id == "local-media-abort"
-    await controller.prepare_youtube_playback(session_id=session_id, source="video")
+    await controller.prepare_youtube_media(session_id=session_id, query="video")
 
     await controller.request_teardown(
         session_id,
@@ -326,13 +508,225 @@ async def test_non_model_or_failed_teardown_aborts_prepared_playback() -> None:
         reason=StopReason.TRANSPORT_FAILURE,
     )
 
-    assert media.finalize_calls == [
-        {
-            "session_id": session_id,
-            "playback_id": "playback-1",
-            "commit": False,
-        }
-    ]
+    assert media.launch_calls == []
+    with pytest.raises(ValueError, match="originating session"):
+        await controller.decide_media(
+            session_id=session_id,
+            pending_id="pending-abort-01",
+            action="accept",
+            revision=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_teardown_clears_accepted_handoff_before_media_ready() -> None:
+    media = RecordingMediaManager()
+    controller = VoiceSessionController(
+        DeterministicLauncher(),
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-handoff-abort"])),
+        session_id_factory=SequenceFactory(["local-handoff-abort"]),
+        pending_id_factory=SequenceFactory(["pending-handoff-abort"]),
+        media_manager=media,  # type: ignore[arg-type]
+        youtube_resolver=RecordingYouTubeResolver(),  # type: ignore[arg-type]
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id == "local-handoff-abort"
+    await controller.prepare_youtube_media(session_id=session_id, query="video")
+    await controller.decide_media(
+        session_id=session_id,
+        pending_id="pending-handoff-abort",
+        action="accept",
+        revision=None,
+    )
+    await controller.request_teardown(
+        session_id,
+        outcome=SessionOutcome.FAILED,
+        reason=StopReason.TRANSPORT_FAILURE,
+    )
+
+    assert media.launch_calls == []
+    with pytest.raises(StaleControlMessage, match="no active session"):
+        await controller.process_control_message(
+            session_id,
+            MediaReadyMessage(
+                session_id=session_id,
+                playback_id="pending-handoff-abort",
+                history=[],
+            ).model_dump_json(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_anime_progress_and_near_eof_queue_next_episode_without_autoplay(
+    tmp_path: Path,
+) -> None:
+    media = RecordingMediaManager()
+    anime = RecordingAnimeAdapter()
+    progress_store = AnimeProgressStore(tmp_path / "media_state.json")
+    controller = VoiceSessionController(
+        DeterministicLauncher(),
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-anime-eof"])),
+        session_id_factory=SequenceFactory(["local-anime-eof"]),
+        pending_id_factory=SequenceFactory(["pending-anime-eof-01", "pending-anime-eof-02"]),
+        media_manager=media,  # type: ignore[arg-type]
+        anime_adapter=anime,
+        anime_progress_store=progress_store,
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id == "local-anime-eof"
+    first = await controller.prepare_anime_media(
+        session_id=session_id,
+        query="Cowboy Bebop",
+        episode=1,
+        episode_offset=None,
+        audio_mode="auto",
+    )
+    await controller.wait_for_outbound_message(session_id)
+    await controller.decide_media(
+        session_id=session_id,
+        pending_id=str(first["pending_id"]),
+        action="accept",
+        revision=None,
+    )
+    await controller.process_control_message(
+        session_id,
+        MediaReadyMessage(
+            session_id=session_id,
+            playback_id="pending-anime-eof-01",
+            history=[],
+        ).model_dump_json(),
+    )
+
+    await media.emit_progress(
+        PlaybackProgress(
+            session_id=session_id,
+            playback_id="pending-anime-eof-01",
+            position_seconds=600,
+            duration_seconds=1800,
+        )
+    )
+    checkpoint = progress_store.get("cowboy-bebop-1065")
+    assert checkpoint is not None
+    assert checkpoint.completed is False
+    assert checkpoint.position_seconds == 600
+
+    await media.emit_completion(
+        PlaybackCompletion(
+            session_id=session_id,
+            playback_id="pending-anime-eof-01",
+            title="Cowboy Bebop",
+            channel="Episode 1 · Subbed",
+            outcome="completed",
+            position_seconds=1785,
+            duration_seconds=1800,
+        )
+    )
+    finished = await controller.wait_for_outbound_message(session_id)
+    next_card = await controller.wait_for_outbound_message(session_id)
+
+    assert finished == MediaFinishedMessage(
+        session_id=session_id,
+        playback_id="pending-anime-eof-01",
+        outcome="completed",
+        next_episode_pending=True,
+    )
+    assert isinstance(next_card, MediaConfirmationMessage)
+    assert next_card.pending_id == "pending-anime-eof-02"
+    assert next_card.subtitle == "Episode 2 · Subbed"
+    assert len(media.launch_calls) == 1
+    completed = progress_store.get("cowboy-bebop-1065")
+    assert completed is not None and completed.completed is True
+
+
+@pytest.mark.asyncio
+async def test_manual_partial_close_preserves_progress_and_does_not_queue_next_episode(
+    tmp_path: Path,
+) -> None:
+    media = RecordingMediaManager()
+    progress_store = AnimeProgressStore(tmp_path / "media_state.json")
+    controller = VoiceSessionController(
+        DeterministicLauncher(),
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-anime-close"])),
+        session_id_factory=SequenceFactory(["local-anime-close"]),
+        pending_id_factory=SequenceFactory(["pending-anime-close-01"]),
+        media_manager=media,  # type: ignore[arg-type]
+        anime_adapter=RecordingAnimeAdapter(),
+        anime_progress_store=progress_store,
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id == "local-anime-close"
+    first = await controller.prepare_anime_media(
+        session_id=session_id,
+        query="Cowboy Bebop",
+        episode=1,
+        episode_offset=None,
+        audio_mode="auto",
+    )
+    await controller.wait_for_outbound_message(session_id)
+    await controller.decide_media(
+        session_id=session_id,
+        pending_id=str(first["pending_id"]),
+        action="accept",
+        revision=None,
+    )
+    await controller.process_control_message(
+        session_id,
+        MediaReadyMessage(
+            session_id=session_id,
+            playback_id="pending-anime-close-01",
+            history=[],
+        ).model_dump_json(),
+    )
+    await media.emit_completion(
+        PlaybackCompletion(
+            session_id=session_id,
+            playback_id="pending-anime-close-01",
+            title="Cowboy Bebop",
+            channel="Episode 1 · Subbed",
+            outcome="completed",
+            position_seconds=300,
+            duration_seconds=1800,
+        )
+    )
+
+    finished = await controller.wait_for_outbound_message(session_id)
+    assert finished == MediaFinishedMessage(
+        session_id=session_id,
+        playback_id="pending-anime-close-01",
+        outcome="completed",
+        next_episode_pending=False,
+    )
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(controller.wait_for_outbound_message(session_id), timeout=0.01)
+    progress = progress_store.get("cowboy-bebop-1065")
+    assert progress is not None
+    assert progress.completed is False
+    assert progress.position_seconds == 300
+
+    await controller.process_control_message(
+        session_id,
+        PageStartedMessage(session_id=session_id).model_dump_json(),
+    )
+    await controller.process_control_message(
+        session_id,
+        MediaResumeCompleteMessage(
+            session_id=session_id,
+            playback_id="pending-anime-close-01",
+            mode="reconstructed",
+        ).model_dump_json(),
+    )
+    with pytest.raises(StaleControlMessage, match="stale media resume"):
+        await controller.process_control_message(
+            session_id,
+            MediaResumeCompleteMessage(
+                session_id=session_id,
+                playback_id="pending-anime-close-01",
+                mode="reconstructed",
+            ).model_dump_json(),
+        )
 
 
 @pytest.mark.asyncio

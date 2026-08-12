@@ -10,6 +10,7 @@ from realtime_action_spike.runtime.protocol import (
     ContinuationItem,
     LoopbackMessage,
     MediaCancelMessage,
+    MediaConfirmationMessage,
     MediaFinishedMessage,
     MediaReadyMessage,
     MediaResumeCompleteMessage,
@@ -835,6 +836,19 @@ def test_media_ready_history_rejects_nested_unknown_payloads(payload: dict[str, 
             playback_id="abc12345",
             mode="exact",
         ),
+        MediaConfirmationMessage(
+            type="media_confirmation",
+            session_id="local-session-01",
+            pending_id="pending_abc12345",
+            source="anime",
+            title="Cowboy Bebop",
+            subtitle="Episode 2 · Subbed",
+            thumbnail_url="https://cdn.xlsbox.com/poster/small/1065.jpg",
+            prompt="Play this episode?",
+            episode={"series_title": "Cowboy Bebop", "episode_number": 2},
+            audio_mode="sub",
+            resume=None,
+        ),
     ],
 )
 def test_media_messages_round_trip_and_parse_with_session_guard(message: LoopbackMessage) -> None:
@@ -843,6 +857,23 @@ def test_media_messages_round_trip_and_parse_with_session_guard(message: Loopbac
     parsed = parse_loopback_message(encoded, expected_session_id="local-session-01")
 
     assert parsed == message
+
+
+def test_media_confirmation_rejects_private_locator_and_unsafe_thumbnail() -> None:
+    payload = {
+        "type": "media_confirmation",
+        "session_id": "local-session-01",
+        "pending_id": "pending_abc12345",
+        "source": "youtube",
+        "title": "A video",
+        "subtitle": "A channel",
+        "thumbnail_url": "http://example.com/thumb.jpg",
+        "prompt": "Play this?",
+        "playback_locator": {"canonical_url": "https://youtube.example/private"},
+    }
+
+    with pytest.raises((ValidationError, ValueError)):
+        parse_loopback_message(payload)
 
 
 @pytest.mark.parametrize(

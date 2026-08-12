@@ -23,8 +23,10 @@ from .capabilities import (
     CapabilityBroker,
     UnknownCapabilityError,
     latest_handoff,
+    parse_media_decision_arguments,
+    parse_media_prepare_anime_arguments,
+    parse_media_prepare_youtube_arguments,
     parse_permission_resolution_arguments,
-    parse_youtube_play_arguments,
 )
 from .config import Settings, build_realtime_session
 from .media import MediaPlaybackError, MediaPlaybackManager, YouTubeResolver
@@ -376,17 +378,46 @@ def create_app(
             )
 
         try:
-            if execution_request.name == "media_play_youtube":
-                youtube = parse_youtube_play_arguments(execution_request.arguments)
-                playback_result = await _controller.prepare_youtube_playback(
+            if execution_request.name == "media_prepare_youtube":
+                youtube = parse_media_prepare_youtube_arguments(execution_request.arguments)
+                playback_result = await _controller.prepare_youtube_media(
                     session_id=active_session_id,
-                    source=youtube.source,
+                    query=youtube.query,
                 )
                 result = {
                     "ok": True,
                     "capability": execution_request.name,
                     "execution": "local",
                     "result": playback_result,
+                }
+            elif execution_request.name == "media_prepare_anime":
+                anime = parse_media_prepare_anime_arguments(execution_request.arguments)
+                anime_result = await _controller.prepare_anime_media(
+                    session_id=active_session_id,
+                    query=anime.query,
+                    episode=anime.episode,
+                    episode_offset=anime.episode_offset,
+                    audio_mode=anime.audio_mode,
+                )
+                result = {
+                    "ok": True,
+                    "capability": execution_request.name,
+                    "execution": "local",
+                    "result": anime_result,
+                }
+            elif execution_request.name == "media_decide":
+                decision = parse_media_decision_arguments(execution_request.arguments)
+                decision_result = await _controller.decide_media(
+                    session_id=active_session_id,
+                    pending_id=decision.pending_id,
+                    action=decision.action,
+                    revision=decision.revision,
+                )
+                result = {
+                    "ok": True,
+                    "capability": execution_request.name,
+                    "execution": "local",
+                    "result": decision_result,
                 }
             elif execution_request.name == "resolve_heavy_agent_block":
                 permission = parse_permission_resolution_arguments(execution_request.arguments)

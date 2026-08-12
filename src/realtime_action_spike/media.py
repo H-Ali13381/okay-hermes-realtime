@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
 from .contracts import YouTubePlayArguments, parse_exact_youtube_url
+from .media_catalog import DirectStreamLocator, PlaybackLocator, YouTubePlaybackLocator
 
 
 class MediaPlaybackError(RuntimeError):
@@ -43,6 +44,16 @@ class PlaybackCompletion:
     title: str
     channel: str
     outcome: PlaybackOutcome
+    position_seconds: float | None = None
+    duration_seconds: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PlaybackProgress:
+    session_id: str
+    playback_id: str
+    position_seconds: float
+    duration_seconds: float
 
 
 class ResolverProcess(Protocol):
@@ -234,9 +245,11 @@ class PlayerProcess(Protocol):
 PlayerProcessFactory = Callable[..., Awaitable[PlayerProcess]]
 WaitForIpc = Callable[[Path, PlayerProcess, float], Awaitable[None]]
 SendIpc = Callable[[Path, list[object], float], Awaitable[None]]
+ReadIpc = Callable[[Path, str, float], Awaitable[float]]
 ExecutableResolver = Callable[[str], str | None]
 ProcessGroupSignaler = Callable[[int, int], None]
 CompletionHandler = Callable[[PlaybackCompletion], Awaitable[None]]
+ProgressHandler = Callable[[PlaybackProgress], Awaitable[None]]
 
 
 async def _default_player_process_factory(*argv: str, **kwargs: Any) -> PlayerProcess:
@@ -295,6 +308,37 @@ async def _default_wait_for_ipc(
         await asyncio.sleep(min(0.02, remaining))
 
 
+async def _default_read_ipc(path: Path, property_name: str, timeout: float) -> float:
+    async def exchange() -> float:
+        reader, writer = await asyncio.open_unix_connection(str(path))
+        try:
+            command = {"command": ["get_property", property_name]}
+            writer.write(json.dumps(command, separators=(",", ":")).encode() + b"\n")
+            await writer.drain()
+            response_line = await reader.readline()
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+        try:
+            response = json.loads(response_line)
+            value = response["data"]
+        except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError) as exc:
+            raise MediaPlaybackError("mpv IPC returned an invalid property") from exc
+        if response.get("error") != "success" or isinstance(value, bool) or not isinstance(
+            value, (int, float)
+        ):
+            raise MediaPlaybackError("mpv IPC returned an invalid property")
+        return float(value)
+
+    try:
+        return await asyncio.wait_for(exchange(), timeout=timeout)
+    except TimeoutError as exc:
+        raise MediaPlaybackError("mpv IPC property read timed out") from exc
+    except (ConnectionError, OSError) as exc:
+        raise MediaPlaybackError("mpv IPC is unavailable") from exc
+
+
 def _default_process_group_signaler(pid: int, signal_number: int) -> None:
     os.killpg(pid, signal_number)
 
@@ -319,6 +363,14 @@ class PreparedPlayback:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class LaunchedPlayback:
+    playback_id: str
+    title: str
+    subtitle: str
+    status: Literal["playing"] = "playing"
+
+
 @dataclass(slots=True)
 class _OwnedPlayer:
     playback_id: str
@@ -328,6 +380,8 @@ class _OwnedPlayer:
     ipc_path: Path
     status: Literal["starting", "prepared", "playing"] = "starting"
     watcher: asyncio.Task[None] | None = None
+    sampler: asyncio.Task[None] | None = None
+    last_progress: PlaybackProgress | None = None
 
 
 class MediaPlaybackManager:
@@ -342,13 +396,19 @@ class MediaPlaybackManager:
         process_factory: PlayerProcessFactory = _default_player_process_factory,
         wait_for_ipc: WaitForIpc = _default_wait_for_ipc,
         send_ipc: SendIpc = _default_send_ipc,
+        read_ipc: ReadIpc = _default_read_ipc,
         executable_resolver: ExecutableResolver = shutil.which,
         process_group_signaler: ProcessGroupSignaler = _default_process_group_signaler,
         playback_id_factory: Callable[[], str] | None = None,
         ipc_timeout_seconds: float = 2.0,
         process_exit_timeout_seconds: float = 1.5,
+        progress_interval_seconds: float = 15.0,
     ) -> None:
-        if ipc_timeout_seconds <= 0 or process_exit_timeout_seconds <= 0:
+        if (
+            ipc_timeout_seconds <= 0
+            or process_exit_timeout_seconds <= 0
+            or progress_interval_seconds <= 0
+        ):
             raise ValueError("media timeouts must be positive")
         self._resolver = resolver or YouTubeResolver()
         self._mpv_bin = mpv_bin
@@ -356,14 +416,17 @@ class MediaPlaybackManager:
         self._process_factory = process_factory
         self._wait_for_ipc = wait_for_ipc
         self._send_ipc = send_ipc
+        self._read_ipc = read_ipc
         self._executable_resolver = executable_resolver
         self._process_group_signaler = process_group_signaler
         self._playback_id_factory = playback_id_factory or (lambda: secrets.token_urlsafe(16))
         self._ipc_timeout_seconds = ipc_timeout_seconds
         self._process_exit_timeout_seconds = process_exit_timeout_seconds
+        self._progress_interval_seconds = progress_interval_seconds
         self._lock = asyncio.Lock()
         self._active: _OwnedPlayer | None = None
         self._completion_handler: CompletionHandler | None = None
+        self._progress_handler: ProgressHandler | None = None
 
     @staticmethod
     def default_runtime_directory() -> Path:
@@ -444,6 +507,93 @@ class MediaPlaybackManager:
                 webpage_url=video.webpage_url,
             )
 
+    async def launch(
+        self,
+        *,
+        session_id: str,
+        playback_id: str,
+        locator: PlaybackLocator,
+        title: str,
+        subtitle: str,
+        start_seconds: float = 0.0,
+    ) -> LaunchedPlayback:
+        """Launch one already-confirmed private locator without resolving or previewing it."""
+        if start_seconds < 0:
+            raise MediaPlaybackError("playback start position must be non-negative")
+        async with self._lock:
+            if self._active is not None:
+                raise MediaPlaybackError("a media generation is already active")
+            mpv_path = self._resolve_executable(self._mpv_bin, "mpv")
+            yt_dlp_path: str | None = None
+            browser_cookies: str | None = None
+            if isinstance(locator, YouTubePlaybackLocator):
+                yt_dlp_path = self._resolve_executable(self._resolver.yt_dlp_bin, "yt-dlp")
+                browser_cookies = self._resolver.browser_cookies
+                target = locator.canonical_url
+            elif isinstance(locator, DirectStreamLocator):
+                target = locator.stream_url
+            else:
+                raise MediaPlaybackError("unsupported playback locator")
+
+            self._runtime_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self._runtime_directory.chmod(0o700)
+            ipc_path = self._runtime_directory / f"{playback_id}.sock"
+            ipc_path.unlink(missing_ok=True)
+            argv = self._build_confirmed_mpv_argv(
+                mpv_path=mpv_path,
+                yt_dlp_path=yt_dlp_path,
+                browser_cookies=browser_cookies,
+                ipc_path=ipc_path,
+                target=target,
+                start_seconds=start_seconds,
+            )
+            try:
+                process = await self._process_factory(
+                    *argv,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except FileNotFoundError as exc:
+                raise MediaPlaybackError("mpv is not installed or is not executable") from exc
+            except OSError as exc:
+                raise MediaPlaybackError("mpv could not be started") from exc
+
+            video_id = (
+                locator.video_id
+                if isinstance(locator, YouTubePlaybackLocator)
+                else "directmedia"
+            )
+            player = _OwnedPlayer(
+                playback_id=playback_id,
+                session_id=session_id,
+                video=YouTubeVideo(
+                    video_id=video_id,
+                    title=title,
+                    channel=subtitle,
+                    webpage_url=target,
+                ),
+                process=process,
+                ipc_path=ipc_path,
+            )
+            self._active = player
+            try:
+                await self._wait_for_ipc(ipc_path, process, self._ipc_timeout_seconds)
+                if process.returncode is not None:
+                    raise MediaPlaybackError("mpv exited before playback was ready")
+            except BaseException:
+                await self._stop_active_locked()
+                raise
+            player.status = "playing"
+            player.watcher = asyncio.create_task(self._watch_player(player))
+            player.sampler = asyncio.create_task(self._sample_progress(player))
+            return LaunchedPlayback(
+                playback_id=playback_id,
+                title=title,
+                subtitle=subtitle,
+            )
+
     async def commit(self, session_id: str, playback_id: str) -> None:
         async with self._lock:
             player = self._active
@@ -460,6 +610,11 @@ class MediaPlaybackManager:
         if self._completion_handler is not None:
             raise MediaPlaybackError("completion handler already bound")
         self._completion_handler = handler
+
+    def bind_progress_handler(self, handler: ProgressHandler) -> None:
+        if self._progress_handler is not None:
+            raise MediaPlaybackError("progress handler already bound")
+        self._progress_handler = handler
 
     async def finalize_session(
         self,
@@ -549,6 +704,38 @@ class MediaPlaybackManager:
         )
         return tuple(argv)
 
+    @staticmethod
+    def _build_confirmed_mpv_argv(
+        *,
+        mpv_path: str,
+        yt_dlp_path: str | None,
+        browser_cookies: str | None,
+        ipc_path: Path,
+        target: str,
+        start_seconds: float,
+    ) -> tuple[str, ...]:
+        argv = [
+            mpv_path,
+            "--no-config",
+            "--no-terminal",
+            "--really-quiet",
+            "--fullscreen=yes",
+            "--pause=no",
+            "--keep-open=no",
+            "--idle=no",
+            f"--start={start_seconds:.3f}",
+        ]
+        if yt_dlp_path is not None:
+            quoted_path = f"%{len(yt_dlp_path.encode('utf-8'))}%{yt_dlp_path}"
+            argv.append(f"--script-opts=ytdl_hook-ytdl_path={quoted_path}")
+            if browser_cookies is not None:
+                argv.append(
+                    "--ytdl-raw-options-append="
+                    f"cookies-from-browser={browser_cookies}"
+                )
+        argv.extend([f"--input-ipc-server={ipc_path}", "--", target])
+        return tuple(argv)
+
     async def _watch_player(self, player: _OwnedPlayer) -> None:
         try:
             await player.process.wait()
@@ -557,9 +744,13 @@ class MediaPlaybackManager:
 
         completion: PlaybackCompletion | None = None
         handler: CompletionHandler | None = None
+        final_progress: PlaybackProgress | None = player.last_progress
         async with self._lock:
             if self._active is not player:
                 return
+            await self._cancel_sampler(player)
+            with contextlib.suppress(MediaPlaybackError):
+                final_progress = await self._read_progress(player)
             player.watcher = None
             self._active = None
             self._cleanup_runtime(player.ipc_path)
@@ -570,9 +761,17 @@ class MediaPlaybackManager:
                 title=player.video.title,
                 channel=player.video.channel,
                 outcome="completed" if returncode == 0 else "failed",
+                position_seconds=(
+                    final_progress.position_seconds if final_progress is not None else None
+                ),
+                duration_seconds=(
+                    final_progress.duration_seconds if final_progress is not None else None
+                ),
             )
             handler = self._completion_handler
 
+        if final_progress is not None:
+            await self._notify_progress(final_progress)
         if handler is None or completion is None:
             return
         try:
@@ -581,6 +780,59 @@ class MediaPlaybackManager:
             raise
         except Exception:
             logger.exception("completion handler failed")
+
+    async def _sample_progress(self, player: _OwnedPlayer) -> None:
+        while True:
+            try:
+                await asyncio.sleep(self._progress_interval_seconds)
+                if self._active is not player or player.status != "playing":
+                    return
+                await self._notify_progress(await self._read_progress(player))
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("media progress sampling failed")
+
+    async def _read_progress(self, player: _OwnedPlayer) -> PlaybackProgress:
+        position = await self._read_ipc(
+            player.ipc_path,
+            "time-pos",
+            self._ipc_timeout_seconds,
+        )
+        duration = await self._read_ipc(
+            player.ipc_path,
+            "duration",
+            self._ipc_timeout_seconds,
+        )
+        if position < 0 or duration <= 0:
+            raise MediaPlaybackError("mpv returned invalid progress")
+        sample = PlaybackProgress(
+            session_id=player.session_id,
+            playback_id=player.playback_id,
+            position_seconds=min(position, duration),
+            duration_seconds=duration,
+        )
+        player.last_progress = sample
+        return sample
+
+    async def _notify_progress(self, sample: PlaybackProgress) -> None:
+        handler = self._progress_handler
+        if handler is None:
+            return
+        try:
+            await handler(sample)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("progress handler failed")
+
+    async def _cancel_sampler(self, player: _OwnedPlayer) -> None:
+        sampler = player.sampler
+        if sampler is not None and sampler is not asyncio.current_task():
+            sampler.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sampler
+        player.sampler = None
 
     async def _commit_active_locked(self, player: _OwnedPlayer) -> None:
         try:
@@ -603,6 +855,7 @@ class MediaPlaybackManager:
         player = self._active
         if player is None:
             return
+        await self._cancel_sampler(player)
         watcher = player.watcher
         if watcher is not None and watcher is not asyncio.current_task():
             watcher.cancel()
@@ -614,6 +867,8 @@ class MediaPlaybackManager:
         except BaseException:
             if player.process.returncode is None and self._active is player:
                 player.watcher = asyncio.create_task(self._watch_player(player))
+                if player.status == "playing":
+                    player.sampler = asyncio.create_task(self._sample_progress(player))
             raise
         if self._active is player:
             self._active = None

@@ -16,10 +16,12 @@ from realtime_action_spike.media import (
     MediaPlaybackError,
     MediaPlaybackManager,
     PlaybackCompletion,
+    PlaybackProgress,
     YouTubePlayArguments,
     YouTubeResolver,
     YouTubeVideo,
 )
+from realtime_action_spike.media_catalog import DirectStreamLocator, YouTubePlaybackLocator
 
 
 class FakeResolverProcess:
@@ -319,12 +321,15 @@ class RecordingIpc:
         fail_send: bool = False,
         fail_on_command: int | None = None,
         exit_on_ready: bool = False,
+        property_values: list[tuple[float, float]] | None = None,
     ) -> None:
         self.ready_paths: list[Path] = []
         self.commands: list[tuple[Path, list[object]]] = []
         self.fail_send = fail_send
         self.fail_on_command = fail_on_command
         self.exit_on_ready = exit_on_ready
+        self.property_values = list(property_values or [])
+        self.property_reads: list[tuple[Path, str]] = []
 
     async def wait_ready(
         self,
@@ -343,6 +348,17 @@ class RecordingIpc:
         self.commands.append((path, command))
         if self.fail_send or self.fail_on_command == len(self.commands) - 1:
             raise MediaPlaybackError("simulated IPC failure")
+
+    async def read(self, path: Path, property_name: str, timeout: float) -> float:
+        del timeout
+        self.property_reads.append((path, property_name))
+        if not self.property_values:
+            raise MediaPlaybackError("simulated IPC property failure")
+        position, duration = self.property_values[0]
+        value = position if property_name == "time-pos" else duration
+        if property_name == "duration":
+            self.property_values.pop(0)
+        return value
 
 
 class RecordingGroupSignaler:
@@ -379,6 +395,7 @@ def _manager(
     processes: list[FakePlayerProcess],
     ipc: RecordingIpc | None = None,
     executable_resolver=lambda command: f"/usr/bin/{Path(command).name}",
+    progress_interval_seconds: float = 15.0,
 ) -> tuple[
     MediaPlaybackManager,
     StubResolver,
@@ -398,11 +415,13 @@ def _manager(
         process_factory=factory,
         wait_for_ipc=ipc.wait_ready,
         send_ipc=ipc.send,
+        read_ipc=ipc.read,
         executable_resolver=executable_resolver,
         process_group_signaler=signaler,
         playback_id_factory=lambda: next(playback_ids),
         ipc_timeout_seconds=0.2,
         process_exit_timeout_seconds=0.2,
+        progress_interval_seconds=progress_interval_seconds,
     )
     return manager, resolver, factory, ipc, signaler
 
@@ -450,6 +469,199 @@ async def test_playback_prepare_uses_fixed_paused_mpv_policy_and_private_runtime
     }
 
     await manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("locator", "expected_target", "needs_ytdlp"),
+    [
+        (
+            YouTubePlaybackLocator(
+                video_id="dQw4w9WgXcQ",
+                canonical_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            ),
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            True,
+        ),
+        (
+            DirectStreamLocator(stream_url="https://hls.anidb.app/stream/example/ep.m3u8"),
+            "https://hls.anidb.app/stream/example/ep.m3u8",
+            False,
+        ),
+    ],
+)
+async def test_launch_starts_confirmed_locator_fullscreen_unpaused_once(
+    tmp_path: Path,
+    locator: object,
+    expected_target: str,
+    needs_ytdlp: bool,
+) -> None:
+    process = FakePlayerProcess(31100)
+    manager, resolver, factory, ipc, _signaler = _manager(
+        tmp_path,
+        videos=[],
+        processes=[process],
+        executable_resolver=lambda command: (
+            None
+            if Path(command).name == "yt-dlp" and not needs_ytdlp
+            else f"/usr/bin/{Path(command).name}"
+        ),
+    )
+
+    launched = await manager.launch(
+        session_id="voice-session-1",
+        playback_id="pending-accepted-1",
+        locator=locator,
+        title="Confirmed title",
+        subtitle="Confirmed subtitle",
+        start_seconds=93.5,
+    )
+
+    assert launched.playback_id == "pending-accepted-1"
+    assert launched.status == "playing"
+    assert resolver.sources == []
+    assert len(factory.calls) == 1
+    argv, kwargs = factory.calls[0]
+    assert "--fullscreen=yes" in argv
+    assert "--pause=no" in argv
+    assert "--start=93.500" in argv
+    assert "--geometry=640x360-32-32" not in argv
+    assert argv[-2:] == ("--", expected_target)
+    assert any("ytdl_hook-ytdl_path" in arg for arg in argv) is needs_ytdlp
+    assert kwargs["start_new_session"] is True
+    assert ipc.ready_paths
+    assert manager.status == {
+        "status": "playing",
+        "playback_id": "pending-accepted-1",
+        "title": "Confirmed title",
+    }
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_launch_generation_never_spawns_second_player(tmp_path: Path) -> None:
+    process = FakePlayerProcess(31101)
+    manager, _resolver, factory, _ipc, _signaler = _manager(
+        tmp_path,
+        videos=[],
+        processes=[process],
+    )
+    locator = DirectStreamLocator(
+        stream_url="https://hls.anidb.app/stream/example/ep.m3u8"
+    )
+    await manager.launch(
+        session_id="voice-session-1",
+        playback_id="pending-accepted-1",
+        locator=locator,
+        title="Confirmed title",
+        subtitle="Confirmed subtitle",
+    )
+
+    with pytest.raises(MediaPlaybackError, match="already active"):
+        await manager.launch(
+            session_id="voice-session-1",
+            playback_id="pending-accepted-1",
+            locator=locator,
+            title="Confirmed title",
+            subtitle="Confirmed subtitle",
+        )
+
+    assert len(factory.calls) == 1
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_launch_samples_progress_periodically_and_completion_carries_final_sample(
+    tmp_path: Path,
+) -> None:
+    process = FakePlayerProcess(31102)
+    ipc = RecordingIpc(property_values=[(120.0, 1800.0), (1785.0, 1800.0)])
+    manager, _resolver, _factory, _ipc, _signaler = _manager(
+        tmp_path,
+        videos=[],
+        processes=[process],
+        ipc=ipc,
+        progress_interval_seconds=0.001,
+    )
+    progress: list[PlaybackProgress] = []
+    completions: list[PlaybackCompletion] = []
+
+    async def on_progress(sample: PlaybackProgress) -> None:
+        progress.append(sample)
+        manager._progress_interval_seconds = 60.0
+
+    async def on_complete(completion: PlaybackCompletion) -> None:
+        completions.append(completion)
+
+    manager.bind_progress_handler(on_progress)
+    manager.bind_completion_handler(on_complete)
+    await manager.launch(
+        session_id="voice-session-1",
+        playback_id="pending-anime-01",
+        locator=DirectStreamLocator(
+            stream_url="https://hls.anidb.app/stream/example/ep.m3u8"
+        ),
+        title="Cowboy Bebop",
+        subtitle="Episode 1 · Subbed",
+    )
+    for _ in range(20):
+        if progress:
+            break
+        await asyncio.sleep(0.001)
+    process.exit(0)
+    for _ in range(20):
+        if completions:
+            break
+        await asyncio.sleep(0.001)
+
+    assert progress[0] == PlaybackProgress(
+        session_id="voice-session-1",
+        playback_id="pending-anime-01",
+        position_seconds=120.0,
+        duration_seconds=1800.0,
+    )
+    assert completions == [
+        PlaybackCompletion(
+            session_id="voice-session-1",
+            playback_id="pending-anime-01",
+            title="Cowboy Bebop",
+            channel="Episode 1 · Subbed",
+            outcome="completed",
+            position_seconds=1785.0,
+            duration_seconds=1800.0,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_progress_handler_failure_never_blocks_player_cleanup(tmp_path: Path) -> None:
+    process = FakePlayerProcess(31103)
+    ipc = RecordingIpc(property_values=[(300.0, 1800.0)])
+    manager, _resolver, _factory, _ipc, _signaler = _manager(
+        tmp_path,
+        videos=[],
+        processes=[process],
+        ipc=ipc,
+        progress_interval_seconds=0.001,
+    )
+
+    async def failing_progress(_sample: PlaybackProgress) -> None:
+        raise OSError("disk full")
+
+    manager.bind_progress_handler(failing_progress)
+    await manager.launch(
+        session_id="voice-session-1",
+        playback_id="pending-anime-01",
+        locator=DirectStreamLocator(
+            stream_url="https://hls.anidb.app/stream/example/ep.m3u8"
+        ),
+        title="Cowboy Bebop",
+        subtitle="Episode 1 · Subbed",
+    )
+    await asyncio.sleep(0.01)
+    await asyncio.wait_for(manager.shutdown(), timeout=0.2)
+
+    assert manager.status == {"status": "idle"}
 
 
 @pytest.mark.asyncio
@@ -745,6 +957,8 @@ def test_playback_completion_is_frozen_and_slot_based() -> None:
         "title",
         "channel",
         "outcome",
+        "position_seconds",
+        "duration_seconds",
     )
     with pytest.raises(FrozenInstanceError):
         completion.outcome = "failed"  # type: ignore[misc]
