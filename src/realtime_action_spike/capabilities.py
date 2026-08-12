@@ -16,7 +16,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, ValidationError, field_validator
 
-from .contracts import StrictArguments, YouTubePlayArguments
+from .contracts import (
+    MediaDecisionArguments,
+    MediaPrepareAnimeArguments,
+    MediaPrepareYouTubeArguments,
+    StrictArguments,
+    YouTubePlayArguments,
+)
 from .routing import find_routing_wrappers
 
 JsonObject = dict[str, Any]
@@ -402,12 +408,12 @@ def _permission_resolution_requires_live_session(
     )
 
 
-def _youtube_playback_requires_live_session(
+def _media_action_requires_live_session(
     _arguments: StrictArguments,
     _now_provider: NowProvider,
 ) -> JsonObject:
     raise ExecutionContractError(
-        "YouTube playback requires the originating live voice session"
+        "media preparation and decisions require the originating live voice session"
     )
 
 
@@ -468,15 +474,39 @@ CAPABILITIES: tuple[CapabilityDefinition, ...] = (
         handler=_permission_resolution_requires_live_session,
     ),
     CapabilityDefinition(
-        name="media_play_youtube",
+        name="media_prepare_youtube",
         description=(
-            "Resolve and play one YouTube video from the user's spoken title, channel, recency, "
-            "or topic words. Call this directly for a YouTube playback request; do not ask the "
-            "user to dictate or find a URL. Exact https YouTube video URLs are also accepted."
+            "Prepare one YouTube confirmation proposal from the user's spoken title, channel, "
+            "recency, topic words, or exact YouTube URL. Do not ask the user to dictate a URL. "
+            "After preparation, interpret conversational replies such as \"yep, that's it\" "
+            "through media_decide. Requires the originating live session."
         ),
-        arguments_model=YouTubePlayArguments,
+        arguments_model=MediaPrepareYouTubeArguments,
         execution="local",
-        handler=_youtube_playback_requires_live_session,
+        handler=_media_action_requires_live_session,
+    ),
+    CapabilityDefinition(
+        name="media_prepare_anime",
+        description=(
+            "Prepare one anime episode confirmation proposal. Interpret spoken episode and "
+            "audio details, including compound corrections such as next episode, but do not "
+            "launch playback. Requires the originating live session."
+        ),
+        arguments_model=MediaPrepareAnimeArguments,
+        execution="local",
+        handler=_media_action_requires_live_session,
+    ),
+    CapabilityDefinition(
+        name="media_decide",
+        description=(
+            "Turn the user's natural conversational replies into one strict action for the exact "
+            "pending proposal: accept, reject, cancel, or revise. For example, \"no, play the "
+            "next episode\" is one revise action with an episode_offset revision. Requires the "
+            "originating live session."
+        ),
+        arguments_model=MediaDecisionArguments,
+        execution="local",
+        handler=_media_action_requires_live_session,
     ),
 )
 
@@ -541,6 +571,44 @@ def parse_youtube_play_arguments(
         return YouTubePlayArguments.model_validate(parsed)
     except ValidationError as exc:
         raise ExecutionContractError(_format_validation_error(exc)) from exc
+
+
+ArgumentsModel = type[StrictArguments]
+
+
+def _parse_typed_arguments(
+    arguments: str | Mapping[str, Any],
+    model: ArgumentsModel,
+) -> StrictArguments:
+    parsed = _parse_arguments(arguments)
+    try:
+        return model.model_validate(parsed)
+    except ValidationError as exc:
+        raise ExecutionContractError(_format_validation_error(exc)) from exc
+
+
+def parse_media_prepare_youtube_arguments(
+    arguments: str | Mapping[str, Any],
+) -> MediaPrepareYouTubeArguments:
+    parsed = _parse_typed_arguments(arguments, MediaPrepareYouTubeArguments)
+    assert isinstance(parsed, MediaPrepareYouTubeArguments)
+    return parsed
+
+
+def parse_media_prepare_anime_arguments(
+    arguments: str | Mapping[str, Any],
+) -> MediaPrepareAnimeArguments:
+    parsed = _parse_typed_arguments(arguments, MediaPrepareAnimeArguments)
+    assert isinstance(parsed, MediaPrepareAnimeArguments)
+    return parsed
+
+
+def parse_media_decision_arguments(
+    arguments: str | Mapping[str, Any],
+) -> MediaDecisionArguments:
+    parsed = _parse_typed_arguments(arguments, MediaDecisionArguments)
+    assert isinstance(parsed, MediaDecisionArguments)
+    return parsed
 
 
 class CapabilityBroker:

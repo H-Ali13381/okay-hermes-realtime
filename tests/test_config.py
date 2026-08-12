@@ -19,8 +19,13 @@ def test_default_instructions_define_voice_to_hermes_routing_policy() -> None:
     assert "task argument" in instructions
     assert "routing language" in instructions
     assert "preserve every user constraint" in instructions
-    assert "media_play_youtube" in instructions
-    assert "do not ask the user to dictate a url" in instructions
+    assert "media_prepare_youtube" in instructions
+    assert "media_prepare_anime" in instructions
+    assert "media_decide" in instructions
+    assert "interpret conversational replies" in instructions
+    assert "yep, that's it" in instructions
+    assert "no, play the next episode" in instructions
+    assert "strict" in instructions
     assert "do not claim playback is audible" in instructions
 
 
