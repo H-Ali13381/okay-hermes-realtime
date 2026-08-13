@@ -8,7 +8,7 @@ Required:
 
 - user systemd;
 - PipeWire and WirePlumber;
-- Brave Origin Nightly actual executable at `/opt/brave.com/brave-origin-nightly/brave` (or set `BRAVE_BIN` to another real Chromium executable, not a retained shell wrapper);
+- Brave Origin available as the stable `brave-origin` command (or set `BRAVE_BIN` to another trusted Chromium executable);
 - `mpv` and `yt-dlp` on PATH, or trusted executable paths configured through `MPV_BIN` and `YT_DLP_BIN`;
 - CMake, Ninja, a C compiler, Qt 6 Widgets/DBus, and PulseAudioQt for the tray;
 - `uv` or Python 3 for the isolated venv;
@@ -81,7 +81,7 @@ Set at least:
 
 ```dotenv
 OPENAI_API_KEY=...
-BRAVE_BIN=/opt/brave.com/brave-origin-nightly/brave
+BRAVE_BIN=brave-origin
 ```
 
 Keep these replacement defaults unless intentionally relocating the install:
@@ -196,7 +196,7 @@ CONTROLLER=$(systemctl --user show okay-hermes-realtime-controller.service -p Ma
 LISTENER=$(systemctl --user show okay-hermes-realtime-wakeword.service -p MainPID --value)
 TRAY=$(pgrep -n -f '/okay-hermes-realtime-tray$')
 BRAVE=$(ps -eo pid=,args= | \
-  grep '/opt/brave.com/brave-origin-nightly/brave --user-data-dir=.*/okay-hermes-realtime/brave-profile' | \
+  grep '/brave-origin .*--user-data-dir=.*/okay-hermes-realtime/brave-profile' | \
   grep -v -- '--type=' | awk 'NR == 1 {print $1}')
 
 uv run python scripts/measure_runtime.py \
