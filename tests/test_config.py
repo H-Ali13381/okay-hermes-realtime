@@ -26,6 +26,8 @@ def test_default_instructions_define_voice_to_hermes_routing_policy() -> None:
     assert "yep, that's it" in instructions
     assert "no, play the next episode" in instructions
     assert "strict" in instructions
+    assert "rejects without corrected criteria" in instructions
+    assert "ask one short follow-up" in instructions
     assert "do not claim playback is audible" in instructions
 
 

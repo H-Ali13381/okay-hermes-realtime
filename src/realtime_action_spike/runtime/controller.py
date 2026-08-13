@@ -460,10 +460,15 @@ class VoiceSessionController:
             }
         if action in {"reject", "cancel"}:
             self._pending_media.clear_exact(session_id, pending_id)
-            return {
+            result: dict[str, object] = {
                 "status": "rejected" if action == "reject" else "cancelled",
                 "pending_id": pending_id,
             }
+            if action == "reject":
+                result["follow_up"] = (
+                    "Ask one short question about what the user wants instead."
+                )
+            return result
         if action != "revise":
             raise ValueError("unsupported media decision")
         parsed_revision = (

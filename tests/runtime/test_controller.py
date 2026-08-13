@@ -398,7 +398,9 @@ async def test_anime_revise_replaces_generation_and_reject_never_launches() -> N
         DeterministicLauncher(),
         token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-anime"])),
         session_id_factory=SequenceFactory(["local-anime-01"]),
-        pending_id_factory=SequenceFactory(["pending-anime-01", "pending-anime-02"]),
+        pending_id_factory=SequenceFactory(
+            ["pending-anime-01", "pending-anime-02", "pending-anime-03"]
+        ),
         media_manager=media,  # type: ignore[arg-type]
         anime_adapter=anime,
     )
@@ -445,8 +447,58 @@ async def test_anime_revise_replaces_generation_and_reject_never_launches() -> N
         action="reject",
         revision=None,
     )
-    assert rejected == {"status": "rejected", "pending_id": "pending-anime-02"}
+    assert rejected == {
+        "status": "rejected",
+        "pending_id": "pending-anime-02",
+        "follow_up": "Ask one short question about what the user wants instead.",
+    }
+    assert controller.session_is_active(session_id) is True
     assert media.launch_calls == []
+
+    replacement = await controller.prepare_anime_media(
+        session_id=session_id,
+        query="Cowboy Bebop",
+        episode=3,
+        episode_offset=None,
+        audio_mode="sub",
+    )
+    cancelled = await controller.decide_media(
+        session_id=session_id,
+        pending_id=str(replacement["pending_id"]),
+        action="cancel",
+        revision=None,
+    )
+    assert cancelled == {
+        "status": "cancelled",
+        "pending_id": "pending-anime-03",
+    }
+
+
+@pytest.mark.asyncio
+async def test_anime_without_history_or_episode_defaults_explicitly_to_episode_one() -> None:
+    anime = RecordingAnimeAdapter()
+    controller = VoiceSessionController(
+        DeterministicLauncher(),
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-default-episode"])),
+        session_id_factory=SequenceFactory(["local-default-episode"]),
+        pending_id_factory=SequenceFactory(["pending-default-episode"]),
+        media_manager=RecordingMediaManager(),  # type: ignore[arg-type]
+        anime_adapter=anime,
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+
+    result = await controller.prepare_anime_media(
+        session_id=activation.session_id,
+        query="Cowboy Bebop",
+        episode=None,
+        episode_offset=None,
+        audio_mode="auto",
+    )
+
+    assert result["status"] == "awaiting_confirmation"
+    assert anime.calls == [
+        {"query": "Cowboy Bebop", "episode": 1, "audio_mode": "sub"}
+    ]
 
 
 @pytest.mark.asyncio

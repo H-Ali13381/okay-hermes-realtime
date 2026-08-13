@@ -105,7 +105,7 @@ Expected RED: module missing.
 - Create: `tests/test_anime.py`
 - Create fixtures under: `tests/fixtures/anime/`
 
-**RED:** Fixture tests for search candidates, canonical IDs/posters, episode map, sub/dub language selection, HLS extraction/quality selection, ambiguity, no result, missing episode/language, malformed JSON/HTML/playlist, host allowlist, URL control characters, argv-only curl invocation, fixed browser UA, timeout/cancellation/nonzero/oversize/stubborn-process reap, and no secret/stderr leakage.
+**RED:** Fixture tests for search candidates, canonical IDs/posters, episode map, sub/dub language selection, HLS extraction/quality selection, ambiguity, no result, missing episode/language, malformed JSON/HTML/playlist, host allowlist, URL control characters, argv-only curl invocation, fixed browser UA, timeout/cancellation/nonzero/oversize/stubborn-process reap, and no secret/stderr leakage. The anime transport accepts no cookie, credential, or arbitrary-header inputs and never accepts a model-controlled fetch URL; dynamic embed/playlist URLs must come from validated source responses and pass exact host/path checks before spawn.
 
 Run:
 ```bash
@@ -134,7 +134,7 @@ Expected RED: module missing.
 - Modify: `tests/test_service.py`
 - Modify: `tests/test_config.py`
 
-**RED:** Test prepare emits sanitized `media_confirmation` controller message and keeps voice live; accept current pending ID launches once and initiates existing playback handoff/suppression sequence; reject clears pending but keeps voice live; cancel clears only media request; revise invalidates first, resolves replacement, emits atomically, and refuses revision fields on other actions; old/foreign/duplicate IDs fail; teardown cancels resolver and pending state; controller-only outbound messages are rejected inbound; config wires curl/state paths/timeouts.
+**RED:** Test prepare emits sanitized `media_confirmation` controller message and keeps voice live; accept current pending ID launches once and initiates existing playback handoff/suppression sequence; reject clears pending, keeps voice live, and returns a bounded instruction to ask one short follow-up when no corrected criteria were supplied; cancel clears only media request without a follow-up; revise invalidates first, resolves replacement, emits atomically, and refuses revision fields on other actions; an anime request with no history and no episode resolves episode 1; old/foreign/duplicate IDs fail; teardown cancels resolver and pending state; controller-only outbound messages are rejected inbound; config wires curl/state paths/timeouts.
 
 Run:
 ```bash
@@ -210,7 +210,7 @@ Run focused Python/UI tests; expected RED on missing progress and follow-up beha
 
 **Files:**
 - Modify: `README.md`
-- Modify: `docs/superpowers/specs/2026-08-12-realtime-media-confirmation-anime-design.md` only if implementation-derived naming changed without changing approved behavior
+- Treat `docs/superpowers/specs/2026-08-12-realtime-media-confirmation-anime-design.md` as immutable after approval; any behavior or naming amendment requires separate user approval before editing it
 - Modify installer/config tests as required
 - Add targeted architecture/source-structure assertions only where they protect real boundaries
 
