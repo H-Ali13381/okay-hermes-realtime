@@ -183,13 +183,17 @@ def _validate_url(
 ) -> str:
     if not value or len(value) > 2_048 or _CONTROL_RE.search(value):
         raise AnimeSourceError(f"invalid {label}")
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise AnimeSourceError(f"invalid {label}") from exc
     if (
         parsed.scheme != "https"
         or parsed.hostname not in hosts
         or parsed.username is not None
         or parsed.password is not None
-        or parsed.port not in {None, 443}
+        or port not in {None, 443}
         or parsed.fragment
         or not parsed.path.startswith(path_prefix)
     ):

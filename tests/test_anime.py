@@ -118,6 +118,14 @@ def test_source_parsers_enforce_narrow_url_hosts(payload: bytes, message: str) -
         parser(payload)
 
 
+@pytest.mark.parametrize("port", ["99999", "bad"])
+def test_embed_parser_normalizes_malformed_ports_to_bounded_source_error(port: str) -> None:
+    payload = f"file: 'https://hls.anidb.app:{port}/stream/a.m3u8'".encode()
+
+    with pytest.raises(AnimeSourceError, match="invalid stream URL"):
+        parse_embed_html(payload)
+
+
 def test_playlist_rejects_cross_host_and_control_character_variants() -> None:
     with pytest.raises(AnimeSourceError, match="playlist"):
         parse_master_playlist(
