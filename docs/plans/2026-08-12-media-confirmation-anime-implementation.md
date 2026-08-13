@@ -33,6 +33,8 @@
 - Modify: `src/realtime_action_spike/config.py`
 - Modify: `tests/test_capabilities.py`
 - Modify: `tests/test_config.py`
+- Modify with Task 5 integration: `tests/test_gateway.py`
+- Modify with Task 5 integration if its capability assertions change: `tests/test_service.py`
 
 **RED:** Add tests requiring capabilities `media_prepare_youtube`, `media_prepare_anime`, and `media_decide`; `media_decide` action enum `accept | reject | cancel | revise`; revision fields forbidden unless action is `revise`; bounded `query`, positive `episode`, bounded `episode_offset`, `audio_mode=auto|sub|dub`; descriptions explicitly tell the model to interpret conversational replies such as “yep, that's it” and compound revisions such as “no, play the next episode.” Remove the immediate `media_play_youtube` contract.
 
@@ -42,7 +44,7 @@ uv run pytest tests/test_capabilities.py tests/test_config.py -q
 ```
 Expected RED: missing contracts/capabilities and stale prompt assertions.
 
-**GREEN:** Implement Pydantic contracts and parsers, static capability definitions that require live-session binding, and Realtime instructions that preserve natural interpretation while forbidding invented actions/IDs.
+**GREEN:** Implement Pydantic contracts and parsers, static capability definitions that require live-session binding, and Realtime instructions that preserve natural interpretation while forbidding invented actions/IDs. This contract-only slice may be committed before routing only if the repository remains green; otherwise stage it with Task 5 so `/execute`, `/health`, gateway tests, and service capability assertions migrate atomically.
 
 Verify:
 ```bash
@@ -55,6 +57,8 @@ uv run ruff check src/realtime_action_spike/contracts.py src/realtime_action_spi
 ## Task 2: Shared pending-media catalog and metadata-only YouTube preparation
 
 **Objective:** Resolve YouTube metadata into a pending record without spawning `mpv`.
+
+**Dependency:** The catalog and resolver types are independently testable, but replacing the live immediate-play route is not independently deployable. Land the `MediaPlaybackManager.launch()` migration and Task 5 gateway/controller routing in the same green commit boundary so no intermediate revision advertises preparation while still launching, or removes the old route before the new one is wired.
 
 **Files:**
 - Create: `src/realtime_action_spike/media_catalog.py`
@@ -70,11 +74,11 @@ uv run pytest tests/test_media_catalog.py tests/test_media.py -q
 ```
 Expected RED: missing catalog and current prepare path starts `mpv`.
 
-**GREEN:** Add typed source/episode/resume/display models and a controller-facing pending catalog. Refactor `MediaPlaybackManager` so launch accepts a validated private locator and start offset; retain one owned player/process-group/IPC watcher. Keep YouTube resolution in `YouTubeResolver`, include thumbnail metadata, but do not spawn during prepare.
+**GREEN:** Add typed source/episode/resume/display models and a controller-facing pending catalog. Refactor `MediaPlaybackManager` so `launch()` accepts a validated private locator and start offset; retain one owned player/process-group/IPC watcher. Keep YouTube resolution in `YouTubeResolver`, include thumbnail metadata, but do not spawn during prepare. Remove the superseded `prepare()`/`commit()`/`finalize_session()` preview API once all live callers and lifecycle tests use confirmed `launch()`.
 
 Verify focused tests and Ruff.
 
-**Commit:** `refactor: separate media resolution from playback`
+**Commit boundary:** Keep catalog/resolver types reviewable as a Task 2 slice, but commit the live `MediaPlaybackManager.launch()` replacement together with Task 5 as `feat: coordinate confirmed media playback lifecycle` so every committed revision remains runnable.
 
 ## Task 3: Persistent global preference, progress, and resume policy
 
@@ -144,6 +148,8 @@ Expected RED: stale immediate-play route and missing messages/methods.
 
 **GREEN:** Bind source adapters/state/catalog in runtime service; add `prepare_youtube_media`, `prepare_anime_media`, and `decide_media`; queue display-safe messages; use short critical sections around generation checks but perform slow resolution outside lock with post-await lease checks. Maintain gateway call-id replay protections. Do not let `media_decide` accept raw locators.
 
+Define `MediaConfirmationMessage` in `runtime/protocol.py`, add it to the discriminated loopback union, reject it on controller-inbound paths, and migrate protocol tests in this task. `pending_id` is the generation/lease token: `create_or_replace` invalidates the old generation, `get_exact` validates decisions, and `take_exact` transfers only the accepted generation into controller-owned playback handoff state.
+
 **Commit:** `feat: coordinate pending media decisions`
 
 ## Task 6: Inline browser confirmation card
@@ -168,7 +174,7 @@ uv run pytest tests/test_ui_contract.py -q
 ```
 Expected RED: missing module/DOM/message handlers.
 
-**GREEN:** Implement a pure view-state/render helper and inline card matching approved mockup. Controller messages render/replace/clear the card. Buttons call the same strict `/execute` `media_decide` route as accessibility fallbacks, but normal spoken replies continue through the Realtime model. Rebuild bundle.
+**GREEN:** Implement a pure view-state/render helper and inline card matching approved mockup. Import `./media-confirmation.js` (and the continuity helper) from `frontend/voice.js`; the existing esbuild entrypoint then bundles them into packaged `src/realtime_action_spike/web/voice.js`. Controller messages render/replace/clear the card. Buttons call the same strict `/execute` `media_decide` route as accessibility fallbacks, but normal spoken replies continue through the Realtime model. Rebuild bundle and update UI contract tests for the generated asset.
 
 Verify:
 ```bash
@@ -200,7 +206,7 @@ uv run pytest tests/test_ui_contract.py -q
 
 Run focused Python/UI tests; expected RED on missing progress and follow-up behavior.
 
-**GREEN:** Add bounded IPC property reads/sampler task tied to exact player generation. Extend completion metadata with source/series/episode/position. On natural anime EOF, persist completion, restore the existing voice session, then prepare/display the next episode as a new pending generation. Keep YouTube’s generic contextual follow-up behavior. Cancel sampler/follow-up on any terminal shutdown.
+**GREEN:** Add bounded IPC property reads/sampler task tied to exact player generation. Bind `MediaPlaybackManager.bind_progress_handler()` and `bind_completion_handler()` to controller handlers that validate the active `(session_id, playback_id)` generation before persisting through `AnimeProgressStore`. On natural anime EOF, persist completion, restore the existing voice session, then prepare/display the next episode as a new pending generation. Manual close stores the final partial checkpoint. Keep YouTube’s generic contextual follow-up behavior. Cancel sampler/follow-up on any terminal shutdown.
 
 **Commit:** `feat: resume anime and confirm next episode`
 
