@@ -224,9 +224,10 @@ function buildTaskInstructions(events) {
   ].join("\n");
 }
 var TaskTurnScheduler = class {
-  constructor({ sendEvent, isReady }) {
+  constructor({ sendEvent, isReady, responseInstructions = () => null }) {
     this.sendEvent = sendEvent;
     this.isReady = isReady;
+    this.responseInstructions = responseInstructions;
     this.reset();
   }
   reset() {
@@ -236,6 +237,7 @@ var TaskTurnScheduler = class {
     this.assistantResponding = false;
     this.responseCreatePending = false;
     this.responseRequested = false;
+    this.userAudioTurnCommitted = false;
     this.pendingEvents = /* @__PURE__ */ new Map();
     this.inFlightEvents = /* @__PURE__ */ new Map();
   }
@@ -260,6 +262,7 @@ var TaskTurnScheduler = class {
   onAudioCommitted() {
     this.audioCommittedSinceSpeechStarted = true;
     this.awaitingCommit = false;
+    this.userAudioTurnCommitted = true;
     this.requestResponse();
   }
   onResponseCreated() {
@@ -296,12 +299,10 @@ var TaskTurnScheduler = class {
     this.pendingEvents.clear();
     this.responseRequested = false;
     this.responseCreatePending = true;
-    const event = this.inFlightEvents.size > 0 ? {
-      type: "response.create",
-      response: {
-        instructions: buildTaskInstructions([...this.inFlightEvents.values()])
-      }
-    } : { type: "response.create" };
+    const useUserTurnInstructions = this.userAudioTurnCommitted;
+    this.userAudioTurnCommitted = false;
+    const instructions = this.inFlightEvents.size > 0 ? buildTaskInstructions([...this.inFlightEvents.values()]) : useUserTurnInstructions ? this.responseInstructions() : null;
+    const event = typeof instructions === "string" && instructions.length > 0 ? { type: "response.create", response: { instructions } } : { type: "response.create" };
     try {
       this.sendEvent(event);
       return true;
@@ -312,6 +313,7 @@ var TaskTurnScheduler = class {
       this.inFlightEvents.clear();
       this.responseRequested = true;
       this.responseCreatePending = false;
+      this.userAudioTurnCommitted = useUserTurnInstructions;
       return false;
     }
   }
@@ -381,7 +383,18 @@ var mediaContinuity = new MediaContinuity({
 var transcriptTurns = /* @__PURE__ */ new Map();
 var taskTurnScheduler = new TaskTurnScheduler({
   sendEvent: (event) => sendRealtimeEvent(event),
-  isReady: () => Boolean(dataChannel && dataChannel.readyState === "open" && !isStopping)
+  isReady: () => Boolean(dataChannel && dataChannel.readyState === "open" && !isStopping),
+  responseInstructions: () => {
+    const pending = mediaConfirmationState?.current;
+    if (!pending) return null;
+    return [
+      `The exact pending media proposal id is ${pending.pendingId}.`,
+      "Interpret the user's latest natural reply in the context of that proposal.",
+      "If they accept, reject, cancel, or correct it, call media_decide once with that exact pending_id and the strict matching action.",
+      "Use revise for compound corrections. If the reply is unrelated, answer normally and leave the proposal pending.",
+      "Do not claim playback started before the tool succeeds."
+    ].join(" ");
+  }
 });
 function sendControlMessage(message) {
   if (!controllerSocket || controllerSocket.readyState !== WebSocket.OPEN || !localSessionId || controllerSessionClosed) {

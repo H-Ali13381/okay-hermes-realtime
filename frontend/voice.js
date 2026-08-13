@@ -71,6 +71,17 @@ const transcriptTurns = new Map();
 const taskTurnScheduler = new TaskTurnScheduler({
   sendEvent: (event) => sendRealtimeEvent(event),
   isReady: () => Boolean(dataChannel && dataChannel.readyState === "open" && !isStopping),
+  responseInstructions: () => {
+    const pending = mediaConfirmationState?.current;
+    if (!pending) return null;
+    return [
+      `The exact pending media proposal id is ${pending.pendingId}.`,
+      "Interpret the user's latest natural reply in the context of that proposal.",
+      "If they accept, reject, cancel, or correct it, call media_decide once with that exact pending_id and the strict matching action.",
+      "Use revise for compound corrections. If the reply is unrelated, answer normally and leave the proposal pending.",
+      "Do not claim playback started before the tool succeeds.",
+    ].join(" ");
+  },
 });
 
 function sendControlMessage(message) {

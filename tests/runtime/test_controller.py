@@ -941,6 +941,54 @@ async def test_control_message_flow_tracks_state_and_idempotent_stop_teardown() 
 
 
 @pytest.mark.asyncio
+async def test_browser_timing_after_controller_event_uses_controller_clock_order() -> None:
+    controller = VoiceSessionController(
+        DeterministicLauncher(),
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-timing"])),
+        session_id_factory=SequenceFactory(["local-session-timing"]),
+        pending_id_factory=SequenceFactory(["pending-anime-timing"]),
+        anime_adapter=RecordingAnimeAdapter(),  # type: ignore[arg-type]
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id is not None
+    await controller.process_control_message(
+        session_id,
+        encode_loopback_message(PageReadyMessage(type="page_ready", session_id=session_id)),
+    )
+    await controller.process_control_message(
+        session_id,
+        encode_loopback_message(PageStartedMessage(type="page_started", session_id=session_id)),
+    )
+    await controller.prepare_anime_media(
+        session_id=session_id,
+        query="Cowboy Bebop",
+        episode=1,
+        episode_offset=None,
+        audio_mode="sub",
+    )
+
+    marker = TimingMessage(
+        type="timing",
+        session_id=session_id,
+        name=TimingName.REALTIME_RESPONSE_DONE,
+        monotonic_ms=9_349.1,
+        data={
+            "response_id": "resp-after-prepare",
+            "status": "completed",
+            "output_types": ["message"],
+            "remote_audio_muted": False,
+        },
+    )
+
+    assert (
+        await controller.process_control_message(session_id, encode_loopback_message(marker))
+        is None
+    )
+    await controller.close_active_session()
+
+
+@pytest.mark.asyncio
 async def test_teardown_releases_profile_lock_after_browser_close() -> None:
     launcher = LockReleasingLauncher()
     controller = VoiceSessionController(

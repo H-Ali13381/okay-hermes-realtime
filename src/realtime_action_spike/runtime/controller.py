@@ -1058,11 +1058,11 @@ class VoiceSessionController:
 
             if isinstance(message, TimingMessage):
                 diagnostic_data = sanitize_timing_data(message.data)
+                diagnostic_data["browser_monotonic_ms"] = message.monotonic_ms
                 active.trace.record(
                     message.name.value,
                     source="browser",
                     data=diagnostic_data,
-                    monotonic_ns=int(message.monotonic_ms * 1_000_000),
                 )
                 logger.info(
                     "session_diagnostic %s",

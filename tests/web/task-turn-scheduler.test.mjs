@@ -18,7 +18,7 @@ function taskEvent(overrides = {}) {
   };
 }
 
-function harness(initiallyReady = true) {
+function harness(initiallyReady = true, responseInstructions = () => null) {
   const sent = [];
   let ready = initiallyReady;
   const scheduler = new TaskTurnScheduler({
@@ -28,6 +28,7 @@ function harness(initiallyReady = true) {
     isReady() {
       return ready;
     },
+    responseInstructions,
   });
   return {
     scheduler,
@@ -112,6 +113,21 @@ test("manual VAD mode creates a response only after audio is committed", () => {
   assert.deepEqual(sent, [{ type: "response.create" }]);
 });
 
+test("a pending media card binds the next natural reply to its exact decision", () => {
+  const { scheduler, sent } = harness(true, () => (
+    "Interpret the latest user reply for pending media proposal pending-anime-01 and call media_decide."
+  ));
+
+  scheduler.onSpeechStarted();
+  scheduler.onSpeechStopped();
+  scheduler.onAudioCommitted();
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].type, "response.create");
+  assert.match(sent[0].response.instructions, /pending-anime-01/);
+  assert.match(sent[0].response.instructions, /media_decide/);
+});
+
 test("manual VAD mode also tolerates commit arriving before speech_stopped", () => {
   const { scheduler, sent } = harness();
 
@@ -137,6 +153,20 @@ test("function-call continuations keep task events for the tool-result response"
   scheduler.requestResponse();
   assert.equal(sent.length, 1);
   assert.match(sent[0].response.instructions, /"event_id":20/);
+});
+
+test("a tool-result continuation cannot consume pending media as user acceptance", () => {
+  const { scheduler, sent } = harness(true, () => (
+    "Interpret the latest user reply for pending media proposal pending-anime-01 and call media_decide."
+  ));
+
+  scheduler.requestResponse();
+  scheduler.onResponseCreated();
+  sent.length = 0;
+  scheduler.onResponseDone({ status: "completed", deferContinuation: true });
+  scheduler.requestResponse();
+
+  assert.deepEqual(sent, [{ type: "response.create" }]);
 });
 
 test("a failed announcement waits for a later user turn instead of retry-looping", () => {
