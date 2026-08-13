@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import realtime_action_spike.crunchyroll_remote.cli as cli_module
 from realtime_action_spike.crunchyroll_remote.cli import (
     PrototypeConfiguration,
     _listening_sockets,
@@ -58,6 +59,7 @@ def test_cli_defaults_to_isolated_profile_and_installed_brave_candidate() -> Non
         == Path("~/.local/share/okay-hermes-realtime/crunchyroll-brave-profile").expanduser()
     )
     assert config.timeout_seconds == 300
+    assert config.port == 42877
     assert config.brave_binary
     assert config.smoke is False
 
@@ -86,6 +88,31 @@ def test_cli_accepts_explicit_smoke_configuration(tmp_path: Path) -> None:
     assert config.port == 49152
     assert config.debug_port == 49200
     assert config.timeout_seconds == 10
+
+
+def test_controller_owned_broker_uses_stable_firewall_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_run_broker(config: PrototypeConfiguration, **kwargs: object) -> None:
+        captured["config"] = config
+        captured.update(kwargs)
+
+    monkeypatch.setattr(cli_module, "_run_broker", fake_run_broker)
+    __import__("asyncio").run(
+        cli_module.run_login_broker(
+            session_id="voice-session-01",
+            brave_binary="brave",
+            profile_path="/tmp/profile",
+            timeout_seconds=300,
+            ready=__import__("asyncio").Event(),
+        )
+    )
+
+    config = captured["config"]
+    assert isinstance(config, PrototypeConfiguration)
+    assert config.port == 42877
 
 
 def test_require_unused_loopback_port_rejects_an_existing_listener() -> None:

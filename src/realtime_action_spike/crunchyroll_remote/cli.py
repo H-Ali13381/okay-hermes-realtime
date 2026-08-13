@@ -25,6 +25,7 @@ from .contracts import RemotePrototypeError
 from .web import create_remote_app
 
 _DEFAULT_PROFILE = Path("~/.local/share/okay-hermes-realtime/crunchyroll-brave-profile")
+_DEFAULT_PAIRING_PORT = 42877
 _BRAVE_CANDIDATES = (
     "/opt/brave-origin-bin/brave",
     "/opt/brave.com/brave-origin-nightly/brave",
@@ -71,8 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--port",
         type=_port,
-        default=0,
-        help="Pairing HTTP port (default: automatic)",
+        default=_DEFAULT_PAIRING_PORT,
+        help=f"Pairing HTTP port (default: {_DEFAULT_PAIRING_PORT})",
     )
     parser.add_argument(
         "--debug-port", type=_nonzero_port, default=49200, help="Loopback-only Brave CDP port"
@@ -195,7 +196,7 @@ async def run_login_broker(
         brave_binary=brave_binary,
         profile_path=Path(profile_path).expanduser(),
         lan_host=None,
-        port=0,
+        port=_DEFAULT_PAIRING_PORT,
         debug_port=49200,
         timeout_seconds=timeout_seconds,
         smoke=False,
