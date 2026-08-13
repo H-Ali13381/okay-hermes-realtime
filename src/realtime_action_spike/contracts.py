@@ -82,8 +82,6 @@ def parse_exact_youtube_url(value: str, field_name: str = "query") -> tuple[str,
     return video_id, f"https://www.youtube.com/watch?v={video_id}"
 
 
-
-
 class MediaPrepareYouTubeArguments(StrictArguments):
     query: str = Field(
         min_length=1,
@@ -154,6 +152,32 @@ class MediaPrepareAnimeArguments(StrictArguments):
         if self.episode is not None and self.episode_offset is not None:
             raise ValueError("episode and episode_offset are mutually exclusive")
         return self
+
+
+class MediaPrepareCrunchyrollArguments(StrictArguments):
+    query: str = Field(
+        min_length=1,
+        max_length=300,
+        description="Original request that explicitly names Crunchyroll.",
+    )
+    episode: int | None = Field(default=None, ge=1, description="Requested episode number.")
+    audio_mode: Literal["auto", "sub", "dub"] = Field(
+        default="auto",
+        description="Requested audio mode, retained for later official resolution.",
+    )
+
+    @field_validator("query", mode="before")
+    @classmethod
+    def _normalize_query(cls, value: object) -> object:
+        return _normalize_text_value(value)
+
+    @field_validator("query")
+    @classmethod
+    def _validate_query(cls, value: str) -> str:
+        _validate_control_chars("query", value)
+        if "crunchyroll" not in value.casefold():
+            raise ValueError("query must explicitly name Crunchyroll")
+        return value
 
 
 class MediaRevisionArguments(StrictArguments):

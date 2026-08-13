@@ -13,6 +13,7 @@ from realtime_action_spike.capabilities import (
     build_openai_tools,
     parse_media_decision_arguments,
     parse_media_prepare_anime_arguments,
+    parse_media_prepare_crunchyroll_arguments,
     parse_media_prepare_youtube_arguments,
 )
 
@@ -24,6 +25,7 @@ EXPECTED_CAPABILITIES = {
     "resolve_heavy_agent_block",
     "media_prepare_youtube",
     "media_prepare_anime",
+    "media_prepare_crunchyroll",
     "media_decide",
 }
 
@@ -47,7 +49,7 @@ def test_tool_catalog_exposes_all_capabilities() -> None:
     tools = build_openai_tools()
 
     assert {tool["name"] for tool in tools} == EXPECTED_CAPABILITIES
-    assert len(tools) == 8
+    assert len(tools) == 9
     assert all(tool["type"] == "function" for tool in tools)
     assert all(tool["description"].strip() for tool in tools)
     assert all(tool["parameters"]["type"] == "object" for tool in tools)
@@ -212,6 +214,40 @@ def test_media_prepare_anime_contract_requires_episode_and_offset_controls() -> 
         CapabilityBroker().execute(
             "media_prepare_anime",
             {"query": "new series", "episode": 1, "episode_offset": 1},
+        )
+
+
+def test_media_prepare_crunchyroll_contract_is_strict_and_explicit() -> None:
+    tool = next(
+        tool for tool in build_openai_tools() if tool["name"] == "media_prepare_crunchyroll"
+    )
+
+    assert tool["parameters"]["required"] == ["query"]
+    props = tool["parameters"]["properties"]
+    assert list(props) == ["query", "episode", "audio_mode"]
+    assert tool["parameters"]["additionalProperties"] is False
+    description = tool["description"].casefold()
+    assert "explicitly" in description
+    assert "crunchyroll" in description
+    assert "login" in description
+    assert "does not claim playback" in description
+
+    parsed = parse_media_prepare_crunchyroll_arguments(
+        {"query": "Cowboy Bebop on Crunchyroll", "episode": 2, "audio_mode": "dub"}
+    )
+    assert parsed.query == "Cowboy Bebop on Crunchyroll"
+    assert parsed.episode == 2
+    assert parsed.audio_mode == "dub"
+
+    with pytest.raises(ExecutionContractError, match="originating live voice session"):
+        CapabilityBroker().execute(
+            "media_prepare_crunchyroll",
+            {"query": "Cowboy Bebop on Crunchyroll"},
+        )
+    with pytest.raises(ExecutionContractError, match="unexpected argument: fallback"):
+        CapabilityBroker().execute(
+            "media_prepare_crunchyroll",
+            {"query": "Cowboy Bebop", "fallback": "unofficial"},
         )
 
 

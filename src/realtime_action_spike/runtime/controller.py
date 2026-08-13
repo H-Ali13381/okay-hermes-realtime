@@ -94,6 +94,21 @@ class StaleControlMessage(ValueError):
     """Raised when a control message does not match the active session."""
 
 
+class CrunchyrollLogin(Protocol):
+    async def start(
+        self,
+        *,
+        session_id: str,
+        query: str,
+        episode: int | None,
+        audio_mode: Literal["auto", "sub", "dub"],
+    ) -> dict[str, object]: ...
+
+    async def stop_session(self, session_id: str) -> None: ...
+
+    async def shutdown(self) -> None: ...
+
+
 class BrowserLauncher(Protocol):
     """Protocol for launching the browser control URL."""
 
@@ -168,6 +183,7 @@ class VoiceSessionController:
         pending_id_factory: Callable[[], str] | None = None,
         media_preference_store: MediaPreferenceStore | None = None,
         anime_progress_store: AnimeProgressStore | None = None,
+        crunchyroll_login_manager: CrunchyrollLogin | None = None,
     ) -> None:
         self._launcher = launcher
         self._session_id_factory = session_id_factory or (lambda: secrets.token_urlsafe(16))
@@ -198,9 +214,7 @@ class VoiceSessionController:
         )
         self._media_manager = media_manager or MediaPlaybackManager()
         self._youtube_resolver = youtube_resolver or YouTubeResolver()
-        state_root = Path(
-            os.getenv("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
-        )
+        state_root = Path(os.getenv("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
         preference_store = media_preference_store or MediaPreferenceStore(
             state_root / "okay-hermes-realtime" / "media_state.json"
         )
@@ -215,6 +229,7 @@ class VoiceSessionController:
             state_root / "okay-hermes-realtime" / "media_state.json"
         )
         self._anime_playback: _AnimePlaybackContext | None = None
+        self._crunchyroll_login = crunchyroll_login_manager
         self._accepted_media: PendingMedia | None = None
         self._active_playback: tuple[str, str] | None = None
         self._resuming_playback: tuple[str, str] | None = None
@@ -418,6 +433,25 @@ class VoiceSessionController:
             replaces_pending_id=replaces_pending_id,
         )
 
+    async def prepare_crunchyroll_media(
+        self,
+        *,
+        session_id: str,
+        query: str,
+        episode: int | None,
+        audio_mode: Literal["auto", "sub", "dub"],
+    ) -> dict[str, object]:
+        if not self.session_is_active(session_id):
+            raise StaleControlMessage("Crunchyroll request is not from the originating session")
+        if self._crunchyroll_login is None:
+            raise RuntimeError("Crunchyroll login is not configured")
+        return await self._crunchyroll_login.start(
+            session_id=session_id,
+            query=query,
+            episode=episode,
+            audio_mode=audio_mode,
+        )
+
     async def _publish_pending_media(
         self,
         session_id: str,
@@ -433,9 +467,7 @@ class VoiceSessionController:
             else:
                 self._pending_media.replace_exact(session_id, replaces_pending_id, pending)
             display = pending.display_projection()
-            message = MediaConfirmationMessage.model_validate(
-                {"session_id": session_id, **display}
-            )
+            message = MediaConfirmationMessage.model_validate({"session_id": session_id, **display})
             queue = self._outbound_messages[session_id]
             if queue.full():
                 queue.get_nowait()
@@ -480,9 +512,7 @@ class VoiceSessionController:
                 "pending_id": pending_id,
             }
             if action == "reject":
-                result["follow_up"] = (
-                    "Ask one short question about what the user wants instead."
-                )
+                result["follow_up"] = "Ask one short question about what the user wants instead."
             return result
         if action != "revise":
             raise ValueError("unsupported media decision")
@@ -647,6 +677,10 @@ class VoiceSessionController:
 
     async def shutdown_media(self) -> None:
         await self._media_manager.shutdown()
+
+    async def shutdown_crunchyroll(self) -> None:
+        if self._crunchyroll_login is not None:
+            await self._crunchyroll_login.shutdown()
 
     async def activate(self, launch_base_url: str) -> ActivationResult:
         """Create a new local session and launch the control page."""
@@ -854,7 +888,6 @@ class VoiceSessionController:
                     data={"reason": message.reason.value},
                 )
 
-
         async def close_browser() -> None:
             async with self._lock:
                 browser_handle = session.browser_handle
@@ -873,10 +906,9 @@ class VoiceSessionController:
 
         async def finalize_media(_request: TeardownRequest) -> None:
             self._pending_media.clear_session(session.session_id)
-            if (
-                self._accepted_media is not None
-                and self._active_session is session
-            ):
+            if self._crunchyroll_login is not None:
+                await self._crunchyroll_login.stop_session(session.session_id)
+            if self._accepted_media is not None and self._active_session is session:
                 self._accepted_media = None
             if self._active_playback is not None and self._active_playback[0] == session.session_id:
                 self._active_playback = None
@@ -921,9 +953,7 @@ class VoiceSessionController:
                     else SessionPhase.CLOSED
                 )
                 _transition(session, terminal_phase)
-                self._last_closed_interruption_traces = copy.deepcopy(
-                    session.interruptions.traces
-                )
+                self._last_closed_interruption_traces = copy.deepcopy(session.interruptions.traces)
                 self._active_session = None
                 self._notify_status()
                 self._last_closed_session_id = session.session_id
@@ -939,12 +969,10 @@ class VoiceSessionController:
                     error=request.error,
                 )
 
-
         return TeardownCoordinator(
             TeardownHooks(
                 mark_stopping=mark_stopping,
                 request_browser_stop=request_browser_stop,
-
                 close_browser=close_browser,
                 persist_trace=persist_trace,
                 finalize_media=finalize_media,
@@ -1029,9 +1057,7 @@ class VoiceSessionController:
                     TeardownCompleteMessage,
                 ):
                     resolved = self._terminal_results.get(session_id)
-                    outcome = (
-                        resolved.outcome if resolved is not None else SessionOutcome.COMPLETED
-                    )
+                    outcome = resolved.outcome if resolved is not None else SessionOutcome.COMPLETED
                     return SessionClosedMessage(
                         type="session_closed",
                         session_id=session_id,
@@ -1054,7 +1080,6 @@ class VoiceSessionController:
                     active.startup_deadline = None
                 self._notify_status()
                 return None
-
 
             if isinstance(message, TimingMessage):
                 diagnostic_data = sanitize_timing_data(message.data)
@@ -1090,9 +1115,7 @@ class VoiceSessionController:
                         session_id=session_id,
                         playback_id=accepted.pending_id,
                         query=accepted.request_query or accepted.episode.series_title,
-                        series_id=(
-                            accepted.canonical_series_id or accepted.episode.series_title
-                        ),
+                        series_id=(accepted.canonical_series_id or accepted.episode.series_title),
                         series_title=accepted.episode.series_title,
                         episode=accepted.episode.episode_number,
                         audio_mode=accepted.audio_mode or "sub",
@@ -1107,9 +1130,7 @@ class VoiceSessionController:
                         locator=accepted.playback_locator,
                         title=accepted.title,
                         subtitle=accepted.subtitle,
-                        start_seconds=(
-                            accepted.resume.start_seconds if accepted.resume else 0.0
-                        ),
+                        start_seconds=(accepted.resume.start_seconds if accepted.resume else 0.0),
                     )
                 except BaseException:
                     self._active_playback = None

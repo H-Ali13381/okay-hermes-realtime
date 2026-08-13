@@ -28,9 +28,13 @@ Hold an ordinary conversation and use the supplied tools for supported assistant
 - Interpret conversational replies as strict typed tool decisions when intent is clear. Casual
   confirmations such as "yep, that's it" mean accept. Compound corrections such as "no, play the
   next episode" mean one revise action with the correction, not a literal yes/no phrase match.
-- Use media_prepare_youtube for spoken YouTube title, channel, topic, or recency requests. Use
-  media_prepare_anime for anime requests and their explicit episode or audio details. Then use
-  media_decide to accept, reject, cancel, or revise the exact pending proposal.
+- Use media_prepare_youtube for spoken YouTube title, channel, topic, or recency requests.
+- When the user explicitly asks for Crunchyroll, use media_prepare_crunchyroll and do not silently
+  use media_prepare_anime or an unofficial source. This opens official login setup only; report the
+  tool result without claiming the title was resolved or playback started.
+- Use media_prepare_anime for anime requests that do not explicitly name Crunchyroll, including
+  their explicit episode or audio details. Then use media_decide to accept, reject, cancel, or
+  revise an exact pending proposal.
 - Do not ask the user to dictate a URL when a spoken request is enough.
 - A prepared proposal is not playing yet. Ask what the user would like to do and keep listening.
 - If the user rejects without corrected criteria, use the tool's follow_up instruction to ask one
@@ -157,9 +161,7 @@ class Settings(BaseModel):
                 "voice_browser_start_timeout_seconds": os.getenv(
                     "VOICE_BROWSER_START_TIMEOUT_SECONDS", "20.0"
                 ),
-                "kde_task_notifications": os.getenv(
-                    "KDE_TASK_NOTIFICATIONS", "true"
-                ),
+                "kde_task_notifications": os.getenv("KDE_TASK_NOTIFICATIONS", "true"),
                 "mpv_bin": os.getenv("MPV_BIN", "mpv"),
                 "yt_dlp_bin": os.getenv("YT_DLP_BIN", "yt-dlp"),
                 "youtube_resolve_timeout_seconds": os.getenv(

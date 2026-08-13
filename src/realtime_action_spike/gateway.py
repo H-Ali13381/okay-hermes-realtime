@@ -25,10 +25,12 @@ from .capabilities import (
     latest_handoff,
     parse_media_decision_arguments,
     parse_media_prepare_anime_arguments,
+    parse_media_prepare_crunchyroll_arguments,
     parse_media_prepare_youtube_arguments,
     parse_permission_resolution_arguments,
 )
 from .config import Settings, build_realtime_session
+from .crunchyroll_remote.contracts import RemotePrototypeError
 from .media import MediaPlaybackError, MediaPlaybackManager, YouTubeResolver
 from .runtime.browser import NoopBrowserHandle
 from .runtime.controller import StaleControlMessage, VoiceSessionController
@@ -45,7 +47,6 @@ LOCAL_EXECUTION_SCOPE_HEADER = "X-Okay-Hermes-Execution-Scope"
 MAX_OPENAI_CALLS_PER_SESSION = 512
 _LOCAL_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,128}$")
 logger = logging.getLogger(__name__)
-
 
 
 class ExecutionRequest(BaseModel):
@@ -72,7 +73,6 @@ def _execution_fingerprint(execution_request: ExecutionRequest) -> str:
 
 class AsyncPostClient(Protocol):
     async def post(self, url: str, **kwargs: Any) -> httpx.Response: ...
-
 
 
 def _safety_identifier() -> str:
@@ -405,6 +405,20 @@ def create_app(
                     "execution": "local",
                     "result": anime_result,
                 }
+            elif execution_request.name == "media_prepare_crunchyroll":
+                crunchyroll = parse_media_prepare_crunchyroll_arguments(execution_request.arguments)
+                crunchyroll_result = await _controller.prepare_crunchyroll_media(
+                    session_id=active_session_id,
+                    query=crunchyroll.query,
+                    episode=crunchyroll.episode,
+                    audio_mode=crunchyroll.audio_mode,
+                )
+                result = {
+                    "ok": True,
+                    "capability": execution_request.name,
+                    "execution": "local",
+                    "result": crunchyroll_result,
+                }
             elif execution_request.name == "media_decide":
                 decision = parse_media_decision_arguments(execution_request.arguments)
                 decision_result = await _controller.decide_media(
@@ -439,9 +453,11 @@ def create_app(
                 if execution_request.name == "handoff_to_heavy_agent" and result.get("ok") is True:
                     handoff = latest_handoff()
                     returned_task = result.get("result", {}).get("task", {})
-                    returned_task_id = str(
-                        returned_task.get("id") or returned_task.get("task_id") or ""
-                    ) if isinstance(returned_task, dict) else ""
+                    returned_task_id = (
+                        str(returned_task.get("id") or returned_task.get("task_id") or "")
+                        if isinstance(returned_task, dict)
+                        else ""
+                    )
                     if handoff is not None and handoff.task_id == returned_task_id:
                         _controller.register_handoff(active_session_id, handoff)
         except UnknownCapabilityError as exc:
@@ -450,6 +466,13 @@ def create_app(
                 "ok": False,
                 "call_id": execution_request.call_id,
                 "error": {"type": "unknown_capability", "message": str(exc)},
+            }
+        except RemotePrototypeError as exc:
+            status_code = 503
+            body = {
+                "ok": False,
+                "call_id": execution_request.call_id,
+                "error": {"type": "crunchyroll_login_failed", "message": str(exc)},
             }
         except MediaPlaybackError as exc:
             status_code = 503

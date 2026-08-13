@@ -12,7 +12,9 @@ dependencies = [
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
   "pydantic>=2.11,<3",
+  "pynacl>=1.6,<2",
   "python-dotenv>=1.1,<2",
+  "qrcode>=8.2,<9",
   "uvicorn>=0.35,<1",
   "websockets>=15,<16",
 ]
@@ -20,6 +22,7 @@ dependencies = [
 [project.scripts]
 okay-hermes-realtime-controller = "realtime_action_spike.service:main"
 okay-hermes-realtime-activation = "realtime_action_spike.activation_handler:main"
+okay-hermes-crunchyroll-login = "realtime_action_spike.crunchyroll_remote.cli:main"
 
 [dependency-groups]
 dev = [
@@ -36,7 +39,7 @@ exclude = ["/artifacts"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/realtime_action_spike"]
-include = ["src/realtime_action_spike/web/**"]
+include = ["src/realtime_action_spike/web/**", "src/realtime_action_spike/crunchyroll_remote/assets/**"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

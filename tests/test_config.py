@@ -21,6 +21,9 @@ def test_default_instructions_define_voice_to_hermes_routing_policy() -> None:
     assert "preserve every user constraint" in instructions
     assert "media_prepare_youtube" in instructions
     assert "media_prepare_anime" in instructions
+    assert "media_prepare_crunchyroll" in instructions
+    assert "explicitly asks for crunchyroll" in instructions
+    assert "do not silently use media_prepare_anime" in instructions
     assert "media_decide" in instructions
     assert "interpret conversational replies" in instructions
     assert "yep, that's it" in instructions

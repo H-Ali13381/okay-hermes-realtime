@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>Crunchyroll phone login</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      background: #101014;
+      color: #fff;
+      font: 20px system-ui;
+      display: grid;
+      place-items: center;
+      min-height: 100vh;
+      text-align: center;
+    }
+    main { max-width: 720px; padding: 32px; }
+    img {
+      width: min(62vw, 440px);
+      background: #fff;
+      padding: 18px;
+      border-radius: 20px;
+    }
+    h1 { font-size: clamp(30px, 5vw, 58px); margin: .2em; }
+    p { color: #bbb; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Sign in with your phone</h1>
+    <img src="/host/__SESSION_ID__/qr.svg" alt="QR code for the temporary phone remote">
+    <p>
+      Scan this code while connected to the same Wi-Fi. After pairing, this window opens the
+      genuine Crunchyroll login page.
+    </p>
+    <p>
+      The phone sends encrypted text and navigation keys only. The session expires after five
+      minutes.
+    </p>
+  </main>
+</body>
+</html>

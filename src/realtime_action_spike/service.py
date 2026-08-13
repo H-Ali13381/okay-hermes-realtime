@@ -12,6 +12,7 @@ from typing import Protocol
 import uvicorn
 
 from .config import Settings
+from .crunchyroll_remote.manager import CrunchyrollLoginManager
 from .gateway import create_app
 from .media import MediaPlaybackManager, YouTubeResolver
 from .runtime.activation_socket import ActivationSocket
@@ -128,18 +129,12 @@ class RuntimeService:
         self._signal_handlers_registered = False
 
         self._launcher = launcher_factory(settings)
-        state_home = Path(
-            os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
-        )
-        self._controller_health_path = (
-            state_home / "okay-hermes-realtime" / "controller-health"
-        )
+        state_home = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
+        self._controller_health_path = state_home / "okay-hermes-realtime" / "controller-health"
         if controller_factory is None:
             self._controller = VoiceSessionController(
                 launcher=self._launcher,
-                browser_start_timeout_seconds=(
-                    settings.voice_browser_start_timeout_seconds
-                ),
+                browser_start_timeout_seconds=(settings.voice_browser_start_timeout_seconds),
                 trace_directory=state_home / "okay-hermes-realtime" / "traces",
                 status_observer=self._publish_controller_status,
                 task_notifications_enabled=settings.kde_task_notifications,
@@ -150,6 +145,12 @@ class RuntimeService:
                         browser_cookies=settings.youtube_browser_cookies,
                     ),
                     mpv_bin=settings.mpv_bin,
+                ),
+                crunchyroll_login_manager=CrunchyrollLoginManager(
+                    brave_binary=settings.brave_bin,
+                    profile_path=(
+                        Path.home() / ".local/share/okay-hermes-realtime/crunchyroll-brave-profile"
+                    ),
                 ),
             )
         else:
@@ -240,6 +241,12 @@ class RuntimeService:
         with contextlib.suppress(TimeoutError, Exception):
             await asyncio.wait_for(
                 self._controller.shutdown_task_events(),
+                timeout=remaining_timeout(),
+            )
+
+        with contextlib.suppress(TimeoutError, Exception):
+            await asyncio.wait_for(
+                self._controller.shutdown_crunchyroll(),
                 timeout=remaining_timeout(),
             )
 

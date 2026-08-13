@@ -197,6 +197,29 @@ class RecordingAnimeAdapter:
         )
 
 
+class RecordingCrunchyrollLoginManager:
+    def __init__(self) -> None:
+        self.start_calls: list[dict[str, object]] = []
+        self.stop_calls: list[str] = []
+        self.shutdown_calls = 0
+
+    async def start(self, **kwargs: object) -> dict[str, object]:
+        self.start_calls.append(kwargs)
+        return {
+            "status": "authentication_required",
+            "provider": "crunchyroll",
+            "login_window_opened": True,
+            "request_query": kwargs["query"],
+            "message": "Scan the QR code in the Crunchyroll window to sign in.",
+        }
+
+    async def stop_session(self, session_id: str) -> None:
+        self.stop_calls.append(session_id)
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
 class RecordingTaskEvents:
     def __init__(self) -> None:
         self.registrations: list[dict[str, object]] = []
@@ -290,15 +313,18 @@ async def test_task_events_are_session_bound_and_permission_resolution_delegates
     assert await controller.wait_for_outbound_message(session_id) == message
     assert await controller.publish_task_event("other-session-01", message) is False
 
-    assert controller.register_handoff(
-        session_id,
-        HandoffRecord(
-            task_id="t_voice01",
-            title="Voice handoff: probe",
-            board_slug="default",
-            db_path="/tmp/kanban.db",
-        ),
-    ) is True
+    assert (
+        controller.register_handoff(
+            session_id,
+            HandoffRecord(
+                task_id="t_voice01",
+                title="Voice handoff: probe",
+                board_slug="default",
+                db_path="/tmp/kanban.db",
+            ),
+        )
+        is True
+    )
     assert task_events.registrations == [
         {
             "session_id": session_id,
@@ -321,6 +347,49 @@ async def test_task_events_are_session_bound_and_permission_resolution_delegates
 
     await controller.shutdown_task_events()
     assert task_events.shutdown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_crunchyroll_login_is_bound_to_live_session_and_reaped_on_teardown() -> None:
+    login = RecordingCrunchyrollLoginManager()
+    controller = VoiceSessionController(
+        DeterministicLauncher(),
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-crunchyroll"])),
+        session_id_factory=SequenceFactory(["local-crunchyroll-01"]),
+        crunchyroll_login_manager=login,  # type: ignore[arg-type]
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id == "local-crunchyroll-01"
+
+    with pytest.raises(StaleControlMessage, match="originating session"):
+        await controller.prepare_crunchyroll_media(
+            session_id="other-session",
+            query="Cowboy Bebop on Crunchyroll",
+            episode=2,
+            audio_mode="dub",
+        )
+
+    result = await controller.prepare_crunchyroll_media(
+        session_id=session_id,
+        query="Cowboy Bebop on Crunchyroll",
+        episode=2,
+        audio_mode="dub",
+    )
+    assert result["status"] == "authentication_required"
+    assert login.start_calls == [
+        {
+            "session_id": session_id,
+            "query": "Cowboy Bebop on Crunchyroll",
+            "episode": 2,
+            "audio_mode": "dub",
+        }
+    ]
+
+    await controller.close_active_session()
+    assert login.stop_calls == [session_id]
+    await controller.shutdown_crunchyroll()
+    assert login.shutdown_calls == 1
 
 
 @pytest.mark.asyncio
@@ -560,9 +629,7 @@ async def test_anime_without_history_or_episode_defaults_explicitly_to_episode_o
     )
 
     assert result["status"] == "awaiting_confirmation"
-    assert anime.calls == [
-        {"query": "Cowboy Bebop", "episode": 1, "audio_mode": "sub"}
-    ]
+    assert anime.calls == [{"query": "Cowboy Bebop", "episode": 1, "audio_mode": "sub"}]
 
 
 @pytest.mark.asyncio
@@ -1334,9 +1401,7 @@ async def test_stuck_at_connecting_expires_as_timed_out_and_teardown_is_bounded(
             PageReadyMessage(type="page_ready", session_id=activation.session_id)
         ),
     )
-    for name, data in (
-        (TimingName.PEER_CONNECTION_STATE, {"state": "connecting"}),
-    ):
+    for name, data in ((TimingName.PEER_CONNECTION_STATE, {"state": "connecting"}),):
         await controller.process_control_message(
             activation.session_id,
             encode_loopback_message(
@@ -1406,9 +1471,7 @@ async def test_stale_control_message_cannot_resolve_newer_session_terminal_futur
     )
     await controller.process_control_message(
         first_id,
-        encode_loopback_message(
-            PageStartedMessage(type="page_started", session_id=first_id)
-        ),
+        encode_loopback_message(PageStartedMessage(type="page_started", session_id=first_id)),
     )
     await controller.process_control_message(
         first_id,
@@ -1436,18 +1499,14 @@ async def test_stale_control_message_cannot_resolve_newer_session_terminal_futur
     second_id = second.session_id or ""
     await controller.process_control_message(
         second_id,
-        encode_loopback_message(
-            PageReadyMessage(type="page_ready", session_id=second_id)
-        ),
+        encode_loopback_message(PageReadyMessage(type="page_ready", session_id=second_id)),
     )
 
     second_waiter = asyncio.create_task(controller.wait_for_terminal_result(second_id))
 
     await controller.process_control_message(
         second_id,
-        encode_loopback_message(
-            PageStartedMessage(type="page_started", session_id=second_id)
-        ),
+        encode_loopback_message(PageStartedMessage(type="page_started", session_id=second_id)),
     )
     await controller.process_control_message(
         second_id,

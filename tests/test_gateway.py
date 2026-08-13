@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from realtime_action_spike.config import Settings, build_realtime_session
+from realtime_action_spike.crunchyroll_remote.contracts import RemotePrototypeError
 from realtime_action_spike.gateway import (
     LOCAL_CLIENT_HEADER,
     LOCAL_CLIENT_HEADER_VALUE,
@@ -130,6 +131,20 @@ class ActiveSessionController:
             "status": "awaiting_confirmation",
             "pending_id": "pending-anime-01",
             "prompt": "Play Cowboy Bebop, Episode 2 · Subbed?",
+        }
+
+    async def prepare_crunchyroll_media(self, **kwargs: object) -> dict[str, object]:
+        self.media_preparations.append({"kind": "crunchyroll", **kwargs})
+        if self.media_error is not None:
+            if self.media_error.startswith("crunchyroll:"):
+                raise RemotePrototypeError(self.media_error.removeprefix("crunchyroll:"))
+            raise MediaPlaybackError(self.media_error)
+        return {
+            "status": "authentication_required",
+            "provider": "crunchyroll",
+            "login_window_opened": True,
+            "request_query": kwargs["query"],
+            "message": "Scan the QR code in the Crunchyroll window to sign in.",
         }
 
     async def decide_media(self, **kwargs: object) -> dict[str, object]:
@@ -295,7 +310,7 @@ def test_session_configuration_uses_fast_natural_voice_defaults() -> None:
     }
     assert session["audio"]["input"]["transcription"] == {"model": "gpt-4o-mini-transcribe"}
     assert session["tool_choice"] == "auto"
-    assert len(session["tools"]) == 8
+    assert len(session["tools"]) == 9
     assert "Do not claim an action succeeded before its tool result" in session["instructions"]
     assert "resolve_heavy_agent_block" in session["instructions"]
     assert "Never infer approval" in session["instructions"]
@@ -319,6 +334,7 @@ def test_health_reports_model_and_missing_key_without_secret_material() -> None:
             "resolve_heavy_agent_block",
             "media_prepare_youtube",
             "media_prepare_anime",
+            "media_prepare_crunchyroll",
             "media_decide",
         ],
         "controller_status": "idle",
@@ -374,7 +390,6 @@ def test_session_endpoint_relays_sdp_and_server_owned_configuration() -> None:
     assert "x-openai-request-id" not in response.headers
     assert response.text == "v=0\r\nmock-answer"
     assert len(upstream.calls) == 1
-
 
     call = upstream.calls[0]
     assert call["url"] == OPENAI_REALTIME_CALLS_URL
@@ -749,6 +764,98 @@ def test_anime_prepare_and_compound_revision_are_typed() -> None:
     assert decision["action"] == "revise"
     assert decision["revision"].episode_offset == 1  # type: ignore[union-attr]
     assert decision["revision"].audio_mode == "dub"  # type: ignore[union-attr]
+
+
+def test_explicit_crunchyroll_request_opens_official_login_without_unofficial_fallback() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_crunchyroll"},
+        )
+    )
+    controller = ActiveSessionController(active_session_id="local-session-1234")
+    client = TestClient(
+        create_app(settings(), upstream_client=upstream, controller=controller)  # type: ignore[arg-type]
+    )
+    session = client.post(
+        "/session?local_session_id=local-session-1234",
+        content="v=0\r\nmock-offer",
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE, "Content-Type": "application/sdp"},
+    )
+
+    response = client.post(
+        "/execute",
+        json={
+            "scope": session.headers["x-okay-hermes-execution-scope"],
+            "call_id": "call_crunchyroll_prepare_01",
+            "name": "media_prepare_crunchyroll",
+            "arguments": {
+                "query": "Cowboy Bebop on Crunchyroll",
+                "episode": 2,
+                "audio_mode": "dub",
+            },
+        },
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"] == {
+        "status": "authentication_required",
+        "provider": "crunchyroll",
+        "login_window_opened": True,
+        "request_query": "Cowboy Bebop on Crunchyroll",
+        "message": "Scan the QR code in the Crunchyroll window to sign in.",
+    }
+    assert controller.media_preparations == [
+        {
+            "kind": "crunchyroll",
+            "session_id": "local-session-1234",
+            "query": "Cowboy Bebop on Crunchyroll",
+            "episode": 2,
+            "audio_mode": "dub",
+        }
+    ]
+
+
+def test_crunchyroll_startup_failure_is_actionable_and_does_not_close_session() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_crunchyroll_failure"},
+        )
+    )
+    controller = ActiveSessionController(
+        active_session_id="local-session-1234",
+        media_error="crunchyroll:loopback debug port 49200 is already in use",
+    )
+    client = TestClient(
+        create_app(settings(), upstream_client=upstream, controller=controller)  # type: ignore[arg-type]
+    )
+    session = client.post(
+        "/session?local_session_id=local-session-1234",
+        content="v=0\r\nmock-offer",
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE, "Content-Type": "application/sdp"},
+    )
+
+    response = client.post(
+        "/execute",
+        json={
+            "scope": session.headers["x-okay-hermes-execution-scope"],
+            "call_id": "call_crunchyroll_failure_01",
+            "name": "media_prepare_crunchyroll",
+            "arguments": {"query": "Cowboy Bebop on Crunchyroll"},
+        },
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "type": "crunchyroll_login_failed",
+        "message": "loopback debug port 49200 is already in use",
+    }
+    assert "end_session" not in response.json()
 
 
 def test_youtube_playback_failure_is_actionable_and_does_not_close_session() -> None:
