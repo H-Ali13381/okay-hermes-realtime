@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import signal
 import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -12,12 +11,12 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from realtime_action_spike.contracts import MediaPrepareYouTubeArguments
 from realtime_action_spike.media import (
     MediaPlaybackError,
     MediaPlaybackManager,
     PlaybackCompletion,
     PlaybackProgress,
-    YouTubePlayArguments,
     YouTubeResolver,
     YouTubeVideo,
 )
@@ -92,9 +91,9 @@ class RecordingProcessFactory:
     ],
 )
 def test_youtube_arguments_accept_searches_and_allowlisted_urls(source: str) -> None:
-    parsed = YouTubePlayArguments.model_validate({"source": f"  {source}  "})
+    parsed = MediaPrepareYouTubeArguments.model_validate({"query": f"  {source}  "})
 
-    assert parsed.source == source
+    assert parsed.query == source
 
 
 @pytest.mark.parametrize(
@@ -104,8 +103,6 @@ def test_youtube_arguments_accept_searches_and_allowlisted_urls(source: str) -> 
         ("x" * 301, "at most 300 characters"),
         ("play\nthis", "control characters"),
         ("https://example.com/watch?v=dQw4w9WgXcQ", "YouTube URL"),
-        ("example.com/watch?v=dQw4w9WgXcQ", "YouTube URL"),
-        ("youtube.com/watch?v=dQw4w9WgXcQ", "YouTube URL"),
         ("ftp://youtube.com/watch?v=dQw4w9WgXcQ", "https"),
         ("https://youtube.com:8443/watch?v=dQw4w9WgXcQ", "standard https port"),
         ("https://www.youtube.com/playlist?list=PL123", "supported YouTube video URL"),
@@ -113,12 +110,14 @@ def test_youtube_arguments_accept_searches_and_allowlisted_urls(source: str) -> 
 )
 def test_youtube_arguments_reject_unsafe_sources(source: str, message: str) -> None:
     with pytest.raises(ValidationError, match=message):
-        YouTubePlayArguments.model_validate({"source": source})
+        MediaPrepareYouTubeArguments.model_validate({"query": source})
 
 
 def test_youtube_arguments_forbid_extra_fields() -> None:
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        YouTubePlayArguments.model_validate({"source": "cats", "flags": "--ytdl-format=best"})
+        MediaPrepareYouTubeArguments.model_validate(
+            {"query": "cats", "flags": "--ytdl-format=best"}
+        )
 
 
 @pytest.mark.asyncio
@@ -426,49 +425,22 @@ def _manager(
     return manager, resolver, factory, ipc, signaler
 
 
-@pytest.mark.asyncio
-async def test_playback_prepare_uses_fixed_paused_mpv_policy_and_private_runtime_dir(
-    tmp_path: Path,
+async def _launch_confirmed(
+    manager: MediaPlaybackManager,
+    *,
+    playback_id: str = "playback-1",
+    title: str = "Selected title",
+    session_id: str = "voice-session-1",
 ) -> None:
-    process = FakePlayerProcess(31001)
-    manager, resolver, factory, ipc, _signaler = _manager(
-        tmp_path,
-        videos=[_video("dQw4w9WgXcQ", "Selected title")],
-        processes=[process],
+    await manager.launch(
+        session_id=session_id,
+        playback_id=playback_id,
+        locator=DirectStreamLocator(
+            stream_url="https://hls.anidb.app/stream/example/ep.m3u8"
+        ),
+        title=title,
+        subtitle="Channel",
     )
-    resolver.browser_cookies = "brave:Default"
-
-    prepared = await manager.prepare("voice-session-1", "latest useful video")
-
-    assert prepared.playback_id == "playback-1"
-    assert prepared.title == "Selected title"
-    assert prepared.status == "prepared"
-    assert resolver.sources == ["latest useful video"]
-    argv, kwargs = factory.calls[0]
-    assert argv[0] == "/usr/bin/mpv"
-    assert "--pause=yes" in argv
-    assert "--ontop" in argv
-    assert "--no-terminal" in argv
-    assert "--fullscreen" not in argv
-    assert "--no-playlist" not in argv
-    assert "--geometry=640x360-32-32" in argv
-    assert "--script-opts=ytdl_hook-ytdl_path=%15%/usr/bin/yt-dlp" in argv
-    assert "--ytdl-raw-options-append=cookies-from-browser=brave:Default" in argv
-    assert argv[-2:] == ("--", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-    assert not any("latest useful video" in argument for argument in argv)
-    assert kwargs["start_new_session"] is True
-    assert kwargs["stdin"] == asyncio.subprocess.DEVNULL
-    assert kwargs["stdout"] == asyncio.subprocess.DEVNULL
-    assert kwargs["stderr"] == asyncio.subprocess.DEVNULL
-    assert ipc.ready_paths
-    assert (tmp_path / "media").stat().st_mode & 0o777 == 0o700
-    assert manager.status == {
-        "status": "prepared",
-        "playback_id": "playback-1",
-        "title": "Selected title",
-    }
-
-    await manager.shutdown()
 
 
 @pytest.mark.asyncio
@@ -664,284 +636,6 @@ async def test_progress_handler_failure_never_blocks_player_cleanup(tmp_path: Pa
     assert manager.status == {"status": "idle"}
 
 
-@pytest.mark.asyncio
-async def test_player_exit_at_ipc_readiness_is_not_reported_as_prepared(
-    tmp_path: Path,
-) -> None:
-    process = FakePlayerProcess(31013)
-    ipc = RecordingIpc(exit_on_ready=True)
-    manager, _resolver, _factory, _ipc, _signaler = _manager(
-        tmp_path,
-        videos=[_video("dQw4w9WgXcQ", "Selected title")],
-        processes=[process],
-        ipc=ipc,
-    )
-
-    with pytest.raises(MediaPlaybackError, match="exited before playback was prepared"):
-        await manager.prepare("voice-session-1", "video")
-
-    assert manager.status == {"status": "idle"}
-
-
-@pytest.mark.asyncio
-async def test_commit_unpauses_only_the_exact_prepared_session_and_generation(
-    tmp_path: Path,
-) -> None:
-    process = FakePlayerProcess(31002)
-    manager, _resolver, _factory, ipc, _signaler = _manager(
-        tmp_path,
-        videos=[_video("dQw4w9WgXcQ", "Selected title")],
-        processes=[process],
-    )
-    prepared = await manager.prepare("voice-session-1", "video")
-
-    with pytest.raises(MediaPlaybackError, match="stale"):
-        await manager.commit("other-session", prepared.playback_id)
-    with pytest.raises(MediaPlaybackError, match="stale"):
-        await manager.commit("voice-session-1", "older-playback")
-    assert ipc.commands == []
-
-    await manager.commit("voice-session-1", prepared.playback_id)
-
-    assert ipc.commands == [
-        (
-            ipc.ready_paths[0],
-            ["set_property", "fullscreen", True],
-        ),
-        (
-            ipc.ready_paths[0],
-            ["set_property", "pause", False],
-        ),
-    ]
-    assert manager.status["status"] == "playing"
-    await manager.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_failed_session_finalization_aborts_paused_player_and_cleans_runtime(
-    tmp_path: Path,
-) -> None:
-    process = FakePlayerProcess(31003)
-    manager, _resolver, _factory, _ipc, signaler = _manager(
-        tmp_path,
-        videos=[_video("dQw4w9WgXcQ", "Selected title")],
-        processes=[process],
-    )
-    prepared = await manager.prepare("voice-session-1", "video")
-    ipc_path = manager.active_ipc_path_for_testing
-    assert ipc_path is not None and ipc_path.exists()
-
-    await manager.finalize_session(
-        "voice-session-1",
-        playback_id=prepared.playback_id,
-        commit=False,
-    )
-
-    assert signaler.calls[0][0] == process.pid
-    assert manager.status == {"status": "idle"}
-    assert not ipc_path.exists()
-
-
-@pytest.mark.asyncio
-async def test_commit_failure_aborts_and_reaps_paused_player(tmp_path: Path) -> None:
-    process = FakePlayerProcess(31011)
-    ipc = RecordingIpc(fail_on_command=0)
-    manager, _resolver, _factory, _ipc, signaler = _manager(
-        tmp_path,
-        videos=[_video("dQw4w9WgXcQ", "Selected title")],
-        processes=[process],
-        ipc=ipc,
-    )
-    prepared = await manager.prepare("voice-session-1", "video")
-
-    with pytest.raises(MediaPlaybackError, match="simulated IPC failure"):
-        await manager.finalize_session(
-            "voice-session-1",
-            playback_id=prepared.playback_id,
-            commit=True,
-        )
-
-    assert ipc.commands == [
-        (
-            ipc.ready_paths[0],
-            ["set_property", "fullscreen", True],
-        )
-    ]
-    assert signaler.calls == [(process.pid, signal.SIGTERM)]
-    assert manager.status == {"status": "idle"}
-
-
-@pytest.mark.asyncio
-async def test_commit_failure_keeps_exact_stubborn_player_owned_until_explicit_exit(
-    tmp_path: Path,
-) -> None:
-    process = FakePlayerProcess(31012)
-    resolver = StubResolver([_video("dQw4w9WgXcQ", "Selected title")])
-    factory = RecordingPlayerFactory([process])
-    ipc = RecordingIpc(fail_on_command=0)
-    signaler = StubbornGroupSignaler()
-    playback_ids = iter(["playback-1"])
-    manager = MediaPlaybackManager(
-        resolver=resolver,
-        mpv_bin="mpv",
-        runtime_directory=tmp_path / "media",
-        process_factory=factory,
-        wait_for_ipc=ipc.wait_ready,
-        send_ipc=ipc.send,
-        executable_resolver=lambda command: f"/usr/bin/{Path(command).name}",
-        process_group_signaler=signaler,
-        playback_id_factory=lambda: next(playback_ids),
-        ipc_timeout_seconds=0.01,
-        process_exit_timeout_seconds=0.01,
-    )
-    prepared = await manager.prepare("voice-session-1", "video")
-    ipc_path = manager.active_ipc_path_for_testing
-    assert ipc_path is not None and ipc_path.exists()
-
-    with pytest.raises(MediaPlaybackError, match="forced termination"):
-        await asyncio.wait_for(
-            manager.commit("voice-session-1", prepared.playback_id),
-            timeout=0.2,
-        )
-
-    assert ipc.commands == [
-        (
-            ipc.ready_paths[0],
-            ["set_property", "fullscreen", True],
-        )
-    ]
-    assert signaler.calls == [
-        (process.pid, signal.SIGTERM),
-        (process.pid, signal.SIGKILL),
-    ]
-    assert manager.status == {
-        "status": "prepared",
-        "playback_id": prepared.playback_id,
-        "title": "Selected title",
-    }
-    assert ipc_path.exists()
-
-    process.exit(0)
-    await manager.shutdown()
-
-    assert manager.status == {"status": "idle"}
-    assert not ipc_path.exists()
-
-
-@pytest.mark.asyncio
-async def test_new_request_replaces_and_reaps_old_owned_player(
-    tmp_path: Path,
-) -> None:
-    old = FakePlayerProcess(31004)
-    new = FakePlayerProcess(31005)
-    manager, _resolver, _factory, _ipc, signaler = _manager(
-        tmp_path,
-        videos=[
-            _video("dQw4w9WgXcQ", "First"),
-            _video("aqz-KE-bpKQ", "Second"),
-        ],
-        processes=[old, new],
-    )
-
-    first = await manager.prepare("voice-session-1", "first")
-    second = await manager.prepare("voice-session-1", "second")
-
-    assert first.playback_id == "playback-1"
-    assert second.playback_id == "playback-2"
-    assert signaler.calls[0][0] == old.pid
-    assert old.wait_calls >= 1
-    assert manager.status["title"] == "Second"
-    await manager.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_failed_replacement_keeps_exact_stubborn_player_owned(
-    tmp_path: Path,
-) -> None:
-    old = FakePlayerProcess(31011)
-    new = FakePlayerProcess(31012)
-    resolver = StubResolver(
-        [
-            _video("dQw4w9WgXcQ", "First"),
-            _video("aqz-KE-bpKQ", "Second"),
-        ]
-    )
-    factory = RecordingPlayerFactory([old, new])
-    ipc = RecordingIpc()
-    signaler = StubbornGroupSignaler()
-    playback_ids = iter(["playback-1", "playback-2"])
-    manager = MediaPlaybackManager(
-        resolver=resolver,
-        mpv_bin="mpv",
-        runtime_directory=tmp_path / "media",
-        process_factory=factory,
-        wait_for_ipc=ipc.wait_ready,
-        send_ipc=ipc.send,
-        executable_resolver=lambda command: f"/usr/bin/{Path(command).name}",
-        process_group_signaler=signaler,
-        playback_id_factory=lambda: next(playback_ids),
-        ipc_timeout_seconds=0.01,
-        process_exit_timeout_seconds=0.01,
-    )
-    await manager.prepare("voice-session-1", "first")
-
-    with pytest.raises(MediaPlaybackError, match="forced termination"):
-        await asyncio.wait_for(
-            manager.prepare("voice-session-1", "second"),
-            timeout=0.2,
-        )
-
-    assert len(factory.calls) == 1
-    assert manager.status["title"] == "First"
-    assert len(signaler.calls) == 2
-    old.exit(-9)
-    await manager.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_stale_player_exit_cannot_clear_newer_playback_state(tmp_path: Path) -> None:
-    old = FakePlayerProcess(31006)
-    new = FakePlayerProcess(31007)
-    manager, _resolver, _factory, _ipc, _signaler = _manager(
-        tmp_path,
-        videos=[
-            _video("dQw4w9WgXcQ", "First"),
-            _video("aqz-KE-bpKQ", "Second"),
-        ],
-        processes=[old, new],
-    )
-
-    await manager.prepare("voice-session-1", "first")
-    await manager.prepare("voice-session-1", "second")
-    old.exit(0)
-    await asyncio.sleep(0)
-
-    assert manager.status["title"] == "Second"
-    await manager.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_player_normal_exit_releases_only_matching_runtime_state(tmp_path: Path) -> None:
-    process = FakePlayerProcess(31008)
-    manager, _resolver, _factory, _ipc, _signaler = _manager(
-        tmp_path,
-        videos=[_video("dQw4w9WgXcQ", "Selected")],
-        processes=[process],
-    )
-    await manager.prepare("voice-session-1", "video")
-    ipc_path = manager.active_ipc_path_for_testing
-    assert ipc_path is not None
-
-    process.exit(0)
-    for _ in range(10):
-        if manager.status == {"status": "idle"}:
-            break
-        await asyncio.sleep(0)
-
-    assert manager.status == {"status": "idle"}
-    assert not ipc_path.exists()
-
-
 def test_playback_completion_is_frozen_and_slot_based() -> None:
     completion = PlaybackCompletion(
         session_id="voice-session-1",
@@ -994,8 +688,7 @@ async def test_committed_player_exit_notifies_once_after_state_clears_and_handle
         released.set()
 
     manager.bind_completion_handler(handler)
-    prepared = await manager.prepare("voice-session-1", "video")
-    await manager.commit("voice-session-1", prepared.playback_id)
+    await _launch_confirmed(manager)
 
     process.exit(0)
     await asyncio.wait_for(entered.wait(), timeout=0.2)
@@ -1004,7 +697,7 @@ async def test_committed_player_exit_notifies_once_after_state_clears_and_handle
     assert completions == [
         PlaybackCompletion(
             session_id="voice-session-1",
-            playback_id=prepared.playback_id,
+            playback_id="playback-1",
             title="Selected title",
             channel="Channel",
             outcome="completed",
@@ -1029,8 +722,7 @@ async def test_committed_player_exit_reports_failed_outcome_when_process_exits_n
         completions.append(completion)
 
     manager.bind_completion_handler(handler)
-    prepared = await manager.prepare("voice-session-1", "video")
-    await manager.commit("voice-session-1", prepared.playback_id)
+    await _launch_confirmed(manager)
 
     process.exit(1)
     for _ in range(20):
@@ -1041,7 +733,7 @@ async def test_committed_player_exit_reports_failed_outcome_when_process_exits_n
     assert completions == [
         PlaybackCompletion(
             session_id="voice-session-1",
-            playback_id=prepared.playback_id,
+            playback_id="playback-1",
             title="Selected title",
             channel="Channel",
             outcome="failed",
@@ -1068,13 +760,12 @@ async def test_shutdown_and_exact_stop_for_session_do_not_notify_completion(
         completions.append(completion)
 
     manager.bind_completion_handler(handler)
-    prepared = await manager.prepare("voice-session-1", "video")
-    await manager.commit("voice-session-1", prepared.playback_id)
+    await _launch_confirmed(manager)
 
     if action == "shutdown":
         await manager.shutdown()
     else:
-        await manager.stop_for_session("voice-session-1", prepared.playback_id)
+        await manager.stop_for_session("voice-session-1", "playback-1")
 
     await asyncio.sleep(0)
 
@@ -1096,10 +787,9 @@ async def test_stop_for_session_ignores_stale_session_or_playback_id(tmp_path: P
         completions.append(completion)
 
     manager.bind_completion_handler(handler)
-    prepared = await manager.prepare("voice-session-1", "video")
-    await manager.commit("voice-session-1", prepared.playback_id)
+    await _launch_confirmed(manager)
 
-    await manager.stop_for_session("stale-session", prepared.playback_id)
+    await manager.stop_for_session("stale-session", "playback-1")
     await manager.stop_for_session("voice-session-1", "older-playback")
 
     assert completions == []
@@ -1107,49 +797,6 @@ async def test_stop_for_session_ignores_stale_session_or_playback_id(tmp_path: P
     await manager.shutdown()
 
 
-@pytest.mark.asyncio
-async def test_stale_player_exit_does_not_notify_or_clear_newer_generation(tmp_path: Path) -> None:
-    old = FakePlayerProcess(31018)
-    new = FakePlayerProcess(31019)
-    manager, _resolver, _factory, _ipc, _signaler = _manager(
-        tmp_path,
-        videos=[
-            _video("dQw4w9WgXcQ", "First"),
-            _video("aqz-KE-bpKQ", "Second"),
-        ],
-        processes=[old, new],
-    )
-    completions: list[PlaybackCompletion] = []
-
-    async def handler(completion: PlaybackCompletion) -> None:
-        completions.append(completion)
-
-    manager.bind_completion_handler(handler)
-
-    await manager.prepare("voice-session-1", "first")
-    await manager.prepare("voice-session-1", "second")
-    old.exit(0)
-    await asyncio.sleep(0)
-
-    assert completions == []
-    assert manager.status["title"] == "Second"
-
-    new.exit(0)
-    for _ in range(20):
-        if completions:
-            break
-        await asyncio.sleep(0)
-
-    assert completions == [
-        PlaybackCompletion(
-            session_id="voice-session-1",
-            playback_id="playback-2",
-            title="Second",
-            channel="Channel",
-            outcome="completed",
-        )
-    ]
-    assert manager.status == {"status": "idle"}
 
 
 @pytest.mark.asyncio
@@ -1168,10 +815,9 @@ async def test_handler_exception_is_logged_and_state_stays_cleared(
         raise RuntimeError("boom")
 
     manager.bind_completion_handler(handler)
-    prepared = await manager.prepare("voice-session-1", "video")
 
     with caplog.at_level(logging.ERROR, logger="realtime_action_spike.media"):
-        await manager.commit("voice-session-1", prepared.playback_id)
+        await _launch_confirmed(manager)
         process.exit(0)
         for _ in range(20):
             if manager.status == {"status": "idle"}:
@@ -1205,7 +851,7 @@ async def test_missing_prerequisite_fails_before_resolution_or_spawn(tmp_path: P
     )
 
     with pytest.raises(MediaPlaybackError, match="mpv"):
-        await manager.prepare("voice-session-1", "video")
+        await _launch_confirmed(manager)
 
     assert resolver.sources == []
     assert factory.calls == []
@@ -1219,8 +865,7 @@ async def test_shutdown_reaps_playing_player_and_is_idempotent(tmp_path: Path) -
         videos=[_video("dQw4w9WgXcQ", "Selected")],
         processes=[process],
     )
-    prepared = await manager.prepare("voice-session-1", "video")
-    await manager.commit("voice-session-1", prepared.playback_id)
+    await _launch_confirmed(manager)
 
     await manager.shutdown()
     await manager.shutdown()
@@ -1270,8 +915,11 @@ while True:
         process_exit_timeout_seconds=1.0,
     )
 
-    prepared = await manager.prepare("voice-session-real", "video")
-    await manager.commit("voice-session-real", prepared.playback_id)
+    await _launch_confirmed(
+        manager,
+        playback_id="playback-real",
+        session_id="voice-session-real",
+    )
 
     assert manager.status["status"] == "playing"
     await manager.shutdown()

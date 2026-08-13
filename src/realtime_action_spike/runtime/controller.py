@@ -128,7 +128,6 @@ class _WakeSession:
     stop_reason: StopReason | None = None
     resolved_result: TerminalSessionResult | None = None
     startup_deadline: BrowserStartupDeadline | None = None
-    prepared_playback_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

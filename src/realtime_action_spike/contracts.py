@@ -82,34 +82,6 @@ def parse_exact_youtube_url(value: str, field_name: str = "query") -> tuple[str,
     return video_id, f"https://www.youtube.com/watch?v={video_id}"
 
 
-class YouTubePlayArguments(StrictArguments):
-    source: str = Field(
-        min_length=1,
-        max_length=300,
-        description=(
-            "Natural-language YouTube title, channel, recency, or topic words, or one exact "
-            "https YouTube video URL. Do not invent or dictate a URL for a voice request."
-        ),
-    )
-
-    @field_validator("source", mode="before")
-    @classmethod
-    def _normalize_source(cls, value: object) -> object:
-        return _normalize_text_value(value)
-
-    @field_validator("source")
-    @classmethod
-    def _validate_source(cls, value: str) -> str:
-        _validate_control_chars("source", value)
-        if is_url_shaped(value):
-            parse_exact_youtube_url(value, "source")
-        return value
-
-    @property
-    def exact_url(self) -> str | None:
-        if not is_url_shaped(self.source):
-            return None
-        return self.source
 
 
 class MediaPrepareYouTubeArguments(StrictArguments):

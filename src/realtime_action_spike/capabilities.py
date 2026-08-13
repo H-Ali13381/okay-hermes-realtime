@@ -21,7 +21,6 @@ from .contracts import (
     MediaPrepareAnimeArguments,
     MediaPrepareYouTubeArguments,
     StrictArguments,
-    YouTubePlayArguments,
 )
 from .routing import find_routing_wrappers
 
@@ -563,14 +562,6 @@ def parse_permission_resolution_arguments(
         raise ExecutionContractError(_format_validation_error(exc)) from exc
 
 
-def parse_youtube_play_arguments(
-    arguments: str | Mapping[str, Any],
-) -> YouTubePlayArguments:
-    parsed = _parse_arguments(arguments)
-    try:
-        return YouTubePlayArguments.model_validate(parsed)
-    except ValidationError as exc:
-        raise ExecutionContractError(_format_validation_error(exc)) from exc
 
 
 ArgumentsModel = type[StrictArguments]

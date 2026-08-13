@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
-from .contracts import YouTubePlayArguments, parse_exact_youtube_url
+from .contracts import MediaPrepareYouTubeArguments, parse_exact_youtube_url
 from .media_catalog import DirectStreamLocator, PlaybackLocator, YouTubePlaybackLocator
 
 
@@ -104,8 +104,8 @@ class YouTubeResolver:
         return self._browser_cookies
 
     async def resolve(self, source: str) -> YouTubeVideo:
-        arguments = YouTubePlayArguments.model_validate({"source": source})
-        target = arguments.exact_url or f"ytsearch1:{arguments.source}"
+        arguments = MediaPrepareYouTubeArguments.model_validate({"query": source})
+        target = arguments.exact_url or f"ytsearch1:{arguments.query}"
         argv = [
             self._yt_dlp_bin,
             "--no-playlist",
@@ -344,26 +344,6 @@ def _default_process_group_signaler(pid: int, signal_number: int) -> None:
 
 
 @dataclass(frozen=True, slots=True)
-class PreparedPlayback:
-    playback_id: str
-    title: str
-    channel: str
-    webpage_url: str
-    status: Literal["prepared"] = "prepared"
-
-    def tool_result(self) -> dict[str, object]:
-        return {
-            "action": "media.youtube.play",
-            "playback_id": self.playback_id,
-            "title": self.title,
-            "channel": self.channel,
-            "webpage_url": self.webpage_url,
-            "status": self.status,
-            "end_session": True,
-        }
-
-
-@dataclass(frozen=True, slots=True)
 class LaunchedPlayback:
     playback_id: str
     title: str
@@ -378,14 +358,14 @@ class _OwnedPlayer:
     video: YouTubeVideo
     process: PlayerProcess
     ipc_path: Path
-    status: Literal["starting", "prepared", "playing"] = "starting"
+    status: Literal["starting", "playing"] = "starting"
     watcher: asyncio.Task[None] | None = None
     sampler: asyncio.Task[None] | None = None
     last_progress: PlaybackProgress | None = None
 
 
 class MediaPlaybackManager:
-    """Own one paused/playing mpv generation and its private IPC lifecycle."""
+    """Own one confirmed mpv generation and its private IPC lifecycle."""
 
     def __init__(
         self,
@@ -448,64 +428,6 @@ class MediaPlaybackManager:
     def active_ipc_path_for_testing(self) -> Path | None:
         active = self._active
         return active.ipc_path if active is not None else None
-
-    async def prepare(self, session_id: str, source: str) -> PreparedPlayback:
-        async with self._lock:
-            mpv_path = self._resolve_executable(self._mpv_bin, "mpv")
-            yt_dlp_path = self._resolve_executable(self._resolver.yt_dlp_bin, "yt-dlp")
-            video = await self._resolver.resolve(source)
-            if self._active is not None:
-                await self._stop_active_locked()
-
-            self._runtime_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            self._runtime_directory.chmod(0o700)
-            playback_id = self._playback_id_factory()
-            ipc_path = self._runtime_directory / f"{playback_id}.sock"
-            ipc_path.unlink(missing_ok=True)
-            argv = self._build_mpv_argv(
-                mpv_path,
-                yt_dlp_path,
-                self._resolver.browser_cookies,
-                ipc_path,
-                video.webpage_url,
-            )
-            try:
-                process = await self._process_factory(
-                    *argv,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-            except FileNotFoundError as exc:
-                raise MediaPlaybackError("mpv is not installed or is not executable") from exc
-            except OSError as exc:
-                raise MediaPlaybackError("mpv could not be started") from exc
-
-            player = _OwnedPlayer(
-                playback_id=playback_id,
-                session_id=session_id,
-                video=video,
-                process=process,
-                ipc_path=ipc_path,
-            )
-            self._active = player
-            try:
-                await self._wait_for_ipc(ipc_path, process, self._ipc_timeout_seconds)
-                if process.returncode is not None:
-                    raise MediaPlaybackError("mpv exited before playback was prepared")
-            except BaseException:
-                await self._stop_active_locked()
-                raise
-
-            player.status = "prepared"
-            player.watcher = asyncio.create_task(self._watch_player(player))
-            return PreparedPlayback(
-                playback_id=playback_id,
-                title=video.title,
-                channel=video.channel,
-                webpage_url=video.webpage_url,
-            )
 
     async def launch(
         self,
@@ -594,18 +516,6 @@ class MediaPlaybackManager:
                 subtitle=subtitle,
             )
 
-    async def commit(self, session_id: str, playback_id: str) -> None:
-        async with self._lock:
-            player = self._active
-            if (
-                player is None
-                or player.session_id != session_id
-                or player.playback_id != playback_id
-                or player.status != "prepared"
-            ):
-                raise MediaPlaybackError("stale or invalid prepared playback")
-            await self._commit_active_locked(player)
-
     def bind_completion_handler(self, handler: CompletionHandler) -> None:
         if self._completion_handler is not None:
             raise MediaPlaybackError("completion handler already bound")
@@ -616,27 +526,6 @@ class MediaPlaybackManager:
             raise MediaPlaybackError("progress handler already bound")
         self._progress_handler = handler
 
-    async def finalize_session(
-        self,
-        session_id: str,
-        *,
-        playback_id: str,
-        commit: bool,
-    ) -> None:
-        async with self._lock:
-            player = self._active
-            if (
-                player is None
-                or player.session_id != session_id
-                or player.playback_id != playback_id
-                or player.status != "prepared"
-            ):
-                return
-            if commit:
-                await self._commit_active_locked(player)
-                return
-            await self._stop_active_locked()
-
     async def stop_for_session(self, session_id: str, playback_id: str) -> None:
         async with self._lock:
             player = self._active
@@ -644,16 +533,6 @@ class MediaPlaybackManager:
                 player is not None
                 and player.session_id == session_id
                 and player.playback_id == playback_id
-            ):
-                await self._stop_active_locked()
-
-    async def abort_prepared_for_session(self, session_id: str) -> None:
-        async with self._lock:
-            player = self._active
-            if (
-                player is not None
-                and player.session_id == session_id
-                and player.status == "prepared"
             ):
                 await self._stop_active_locked()
 
@@ -667,42 +546,6 @@ class MediaPlaybackManager:
         if resolved is None:
             raise MediaPlaybackError(f"{display_name} is not installed or is not executable")
         return resolved
-
-    @staticmethod
-    def _build_mpv_argv(
-        mpv_path: str,
-        yt_dlp_path: str,
-        browser_cookies: str | None,
-        ipc_path: Path,
-        webpage_url: str,
-    ) -> tuple[str, ...]:
-        quoted_yt_dlp_path = f"%{len(yt_dlp_path.encode('utf-8'))}%{yt_dlp_path}"
-        argv = [
-            mpv_path,
-            "--no-config",
-            "--no-terminal",
-            "--really-quiet",
-            "--force-window=yes",
-            "--ontop",
-            "--geometry=640x360-32-32",
-            "--pause=yes",
-            "--keep-open=no",
-            "--idle=no",
-            f"--script-opts=ytdl_hook-ytdl_path={quoted_yt_dlp_path}",
-        ]
-        if browser_cookies is not None:
-            argv.append(
-                "--ytdl-raw-options-append="
-                f"cookies-from-browser={browser_cookies}"
-            )
-        argv.extend(
-            [
-                f"--input-ipc-server={ipc_path}",
-                "--",
-                webpage_url,
-            ]
-        )
-        return tuple(argv)
 
     @staticmethod
     def _build_confirmed_mpv_argv(
@@ -833,23 +676,6 @@ class MediaPlaybackManager:
             with contextlib.suppress(asyncio.CancelledError):
                 await sampler
         player.sampler = None
-
-    async def _commit_active_locked(self, player: _OwnedPlayer) -> None:
-        try:
-            await self._send_ipc(
-                player.ipc_path,
-                ["set_property", "fullscreen", True],
-                self._ipc_timeout_seconds,
-            )
-            await self._send_ipc(
-                player.ipc_path,
-                ["set_property", "pause", False],
-                self._ipc_timeout_seconds,
-            )
-        except BaseException:
-            await self._stop_active_locked()
-            raise
-        player.status = "playing"
 
     async def _stop_active_locked(self) -> None:
         player = self._active
