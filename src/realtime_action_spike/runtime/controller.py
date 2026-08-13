@@ -317,6 +317,7 @@ class VoiceSessionController:
         *,
         session_id: str,
         query: str,
+        replaces_pending_id: str | None = None,
     ) -> dict[str, object]:
         if not self.session_is_active(session_id):
             raise StaleControlMessage("media request is not from the originating session")
@@ -334,7 +335,11 @@ class VoiceSessionController:
             prompt=f"Play {video.title} by {video.channel}?",
             request_query=query,
         )
-        return await self._publish_pending_media(session_id, pending)
+        return await self._publish_pending_media(
+            session_id,
+            pending,
+            replaces_pending_id=replaces_pending_id,
+        )
 
     async def prepare_anime_media(
         self,
@@ -344,6 +349,7 @@ class VoiceSessionController:
         episode: int | None,
         episode_offset: int | None,
         audio_mode: Literal["auto", "sub", "dub"],
+        replaces_pending_id: str | None = None,
     ) -> dict[str, object]:
         if not self.session_is_active(session_id):
             raise StaleControlMessage("media request is not from the originating session")
@@ -406,17 +412,26 @@ class VoiceSessionController:
             canonical_series_id=resolved.series_id,
             available_episode_numbers=resolved.available_episode_numbers,
         )
-        return await self._publish_pending_media(session_id, pending)
+        return await self._publish_pending_media(
+            session_id,
+            pending,
+            replaces_pending_id=replaces_pending_id,
+        )
 
     async def _publish_pending_media(
         self,
         session_id: str,
         pending: PendingMedia,
+        *,
+        replaces_pending_id: str | None = None,
     ) -> dict[str, object]:
         async with self._lock:
             if not self.session_is_active(session_id):
                 raise StaleControlMessage("media session ended before preparation completed")
-            self._pending_media.create_or_replace(session_id, pending)
+            if replaces_pending_id is None:
+                self._pending_media.create_or_replace(session_id, pending)
+            else:
+                self._pending_media.replace_exact(session_id, replaces_pending_id, pending)
             display = pending.display_projection()
             message = MediaConfirmationMessage.model_validate(
                 {"session_id": session_id, **display}
@@ -489,7 +504,11 @@ class VoiceSessionController:
                 )
             ):
                 raise ValueError("episode and audio revisions require anime media")
-            result = await self.prepare_youtube_media(session_id=session_id, query=query)
+            result = await self.prepare_youtube_media(
+                session_id=session_id,
+                query=query,
+                replaces_pending_id=pending_id,
+            )
             return result
         current_episode = pending.episode.episode_number if pending.episode else 1
         target_episode = parsed_revision.episode or current_episode
@@ -504,6 +523,7 @@ class VoiceSessionController:
             episode=target_episode,
             episode_offset=None,
             audio_mode=mode,
+            replaces_pending_id=pending_id,
         )
 
     async def shutdown_task_events(self) -> None:

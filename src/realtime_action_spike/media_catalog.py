@@ -230,6 +230,20 @@ class PendingMediaCatalog:
         with self._lock:
             self._by_session[session_id] = pending
 
+    def replace_exact(
+        self,
+        session_id: str,
+        current_pending_id: str,
+        replacement: PendingMedia,
+    ) -> None:
+        session_id = _safe_id(session_id, "session id")
+        _safe_id(current_pending_id, "pending id")
+        with self._lock:
+            current = self._by_session.get(session_id)
+            if current is None or current.pending_id != current_pending_id:
+                raise StalePendingMediaError("stale or foreign pending media generation")
+            self._by_session[session_id] = replacement
+
     def get_exact(self, session_id: str, pending_id: str) -> PendingMedia:
         session_id = _safe_id(session_id, "session id")
         _safe_id(pending_id, "pending id")

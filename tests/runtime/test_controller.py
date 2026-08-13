@@ -163,6 +163,19 @@ class RecordingYouTubeResolver:
         )
 
 
+class BlockingSecondYouTubeResolver(RecordingYouTubeResolver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.second_started = asyncio.Event()
+        self.release_second = asyncio.Event()
+
+    async def resolve(self, source: str) -> YouTubeVideo:
+        if self.calls:
+            self.second_started.set()
+            await self.release_second.wait()
+        return await super().resolve(source)
+
+
 class RecordingAnimeAdapter:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -472,6 +485,57 @@ async def test_anime_revise_replaces_generation_and_reject_never_launches() -> N
         "status": "cancelled",
         "pending_id": "pending-anime-03",
     }
+
+
+@pytest.mark.asyncio
+async def test_late_revision_cannot_replace_an_already_accepted_generation() -> None:
+    resolver = BlockingSecondYouTubeResolver()
+    media = RecordingMediaManager()
+    controller = VoiceSessionController(
+        DeterministicLauncher(),
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-revision-race"])),
+        session_id_factory=SequenceFactory(["local-revision-race"]),
+        pending_id_factory=SequenceFactory(["pending-race-01", "pending-race-02"]),
+        media_manager=media,  # type: ignore[arg-type]
+        youtube_resolver=resolver,  # type: ignore[arg-type]
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+    assert session_id == "local-revision-race"
+    first = await controller.prepare_youtube_media(session_id=session_id, query="first")
+    await controller.wait_for_outbound_message(session_id)
+
+    revision_task = asyncio.create_task(
+        controller.decide_media(
+            session_id=session_id,
+            pending_id=str(first["pending_id"]),
+            action="revise",
+            revision={"query": "replacement"},
+        )
+    )
+    await resolver.second_started.wait()
+    accepted = await controller.decide_media(
+        session_id=session_id,
+        pending_id=str(first["pending_id"]),
+        action="accept",
+        revision=None,
+    )
+    resolver.release_second.set()
+
+    assert accepted["status"] == "handoff_pending"
+    with pytest.raises(ValueError, match="stale"):
+        await revision_task
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(controller.wait_for_outbound_message(session_id), timeout=0.01)
+    await controller.process_control_message(
+        session_id,
+        MediaReadyMessage(
+            session_id=session_id,
+            playback_id="pending-race-01",
+            history=[],
+        ).model_dump_json(),
+    )
+    assert len(media.launch_calls) == 1
 
 
 @pytest.mark.asyncio
