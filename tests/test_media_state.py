@@ -144,6 +144,37 @@ def test_mismatched_stored_series_id_is_discarded(tmp_path: Path) -> None:
     assert AnimeProgressStore(state_path).get("frieren") is None
 
 
+def test_all_skips_corrupted_noncanonical_progress_keys(tmp_path: Path) -> None:
+    state_path = tmp_path / "media_state.json"
+    valid = {
+        "series_id": "frieren",
+        "series_title": "Frieren",
+        "last_episode": 1,
+        "position_seconds": 120,
+        "duration_seconds": 1200,
+        "completed": False,
+        "last_audio_mode_used": "sub",
+        "updated_at": iso_now(),
+    }
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "audio_mode": "sub",
+                "progress": {
+                    "bad key!": {**valid, "series_id": "bad key!"},
+                    "frieren": valid,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert [progress.series_id for progress in AnimeProgressStore(state_path).all()] == [
+        "frieren"
+    ]
+
+
 def test_progress_constructor_validates_fields_and_normalizes_position() -> None:
     progress = AnimeProgress(
         series_id="frieren",

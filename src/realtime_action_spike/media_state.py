@@ -157,7 +157,13 @@ class AnimeProgressStore:
         for series_id in sorted(progress_map):
             if not isinstance(series_id, str):
                 continue
-            progress = self.get(series_id)
+            try:
+                canonical = _canonical_series_id(series_id)
+            except ValueError:
+                continue
+            if canonical != series_id:
+                continue
+            progress = self.get(canonical)
             if progress is not None:
                 items.append(progress)
         return items
