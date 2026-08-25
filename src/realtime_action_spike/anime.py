@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -100,6 +101,94 @@ class AnimeResolution:
     poster_url: str | None
     stream_url: str
     available_episode_numbers: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AnimeChoice:
+    """One bounded display-only search candidate; never carries a stream locator."""
+
+    series_id: str
+    title: str
+
+    def __post_init__(self) -> None:
+        if not _SERIES_ID_RE.fullmatch(self.series_id):
+            raise AnimeSourceError("invalid anime series id")
+        if (
+            not isinstance(self.title, str)
+            or not self.title
+            or len(self.title) > 300
+            or _CONTROL_RE.search(self.title)
+        ):
+            raise AnimeSourceError("invalid anime title")
+
+
+@dataclass(frozen=True, slots=True)
+class RankedResolution:
+    kind: Literal["resolved", "choices"]
+    resolution: AnimeResolution | None
+    choices: tuple[AnimeChoice, ...]
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"resolved", "choices"}:
+            raise AnimeSourceError("invalid ranked resolution kind")
+        if self.kind == "resolved":
+            if not isinstance(self.resolution, AnimeResolution) or self.choices:
+                raise AnimeSourceError("invalid resolved ranked outcome")
+            return
+        if self.resolution is not None or not self.choices:
+            raise AnimeSourceError("invalid choices ranked outcome")
+
+
+def _normalized_tokens(value: str) -> tuple[str, ...]:
+    decomposed = unicodedata.normalize("NFKD", value).casefold()
+    pieces = (
+        char if char.isalnum() else " "
+        for char in decomposed
+        if not unicodedata.combining(char)
+    )
+    return tuple("".join(pieces).split())
+
+
+def _contains_contiguous_span(
+    haystack: tuple[str, ...],
+    needle: tuple[str, ...],
+) -> bool:
+    if not needle or len(needle) > len(haystack):
+        return False
+    window = len(needle)
+    for index in range(len(haystack) - window + 1):
+        if haystack[index : index + window] == needle:
+            return True
+    return False
+
+
+_EXACT_SCORE = 1.0
+_CONTAINMENT_BASE = 0.92
+_CONTAINMENT_SPAN = 0.06
+_JACCARD_SCALE = 0.78
+
+
+def _title_fit_score(query: str, candidate_title: str) -> float:
+    """Fixed deterministic fit score: exact match, then containment, then token overlap."""
+    query_tokens = _normalized_tokens(query)
+    candidate_tokens = _normalized_tokens(candidate_title)
+    if not query_tokens or not candidate_tokens:
+        return 0.0
+    if query_tokens == candidate_tokens:
+        return _EXACT_SCORE
+    if _contains_contiguous_span(candidate_tokens, query_tokens):
+        coverage = len(query_tokens) / len(candidate_tokens)
+        return min(_CONTAINMENT_BASE + _CONTAINMENT_SPAN * coverage, 0.999999)
+    query_set = set(query_tokens)
+    candidate_set = set(candidate_tokens)
+    union = len(query_set | candidate_set)
+    if not union:
+        return 0.0
+    return round(_JACCARD_SCALE * (len(query_set & candidate_set) / union), 6)
+
+
+_CLEAR_WIN_MARGIN = 0.15
+_MAX_CHOICES = 5
 
 
 class _SearchParser(HTMLParser):
@@ -524,6 +613,112 @@ class AnimeSourceAdapter:
 
         candidates = parse_search_html(await self._transport.search(normalized_query))
         selected = self._select_candidate(normalized_query, candidates)
+        return await self._resolve_candidate(
+            selected,
+            normalized_query,
+            episode=episode,
+            audio_mode=audio_mode,
+        )
+
+    async def resolve_candidates(
+        self,
+        query: str,
+        *,
+        limit: int = _MAX_CHOICES,
+    ) -> tuple[AnimeChoice, ...]:
+        """Rank search candidates deterministically without resolving any stream."""
+        normalized_query = " ".join(query.split())
+        if (
+            not normalized_query
+            or len(normalized_query) > 300
+            or _CONTROL_RE.search(normalized_query)
+        ):
+            raise AnimeSourceError("invalid anime search query")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= _MAX_CHOICES:
+            raise AnimeSourceError(f"invalid candidate limit {limit}")
+        candidates = parse_search_html(await self._transport.search(normalized_query))
+        scored = [
+            (_title_fit_score(normalized_query, item.title), index, item)
+            for index, item in enumerate(candidates)
+        ]
+        scored.sort(key=lambda entry: (-entry[0], entry[1]))
+        return tuple(
+            AnimeChoice(series_id=item.series_id, title=item.title)
+            for _score, _index, item in scored[:limit]
+        )
+
+    async def resolve_or_rank(
+        self,
+        query: str,
+        *,
+        episode: int = 1,
+        audio_mode: Literal["auto", "sub", "dub"] = "auto",
+    ) -> RankedResolution:
+        """Resolve a clear winner directly; otherwise return ranked choices."""
+        normalized_query = " ".join(query.split())
+        if (
+            not normalized_query
+            or len(normalized_query) > 300
+            or _CONTROL_RE.search(normalized_query)
+        ):
+            raise AnimeSourceError("invalid anime search query")
+        if isinstance(episode, bool) or not isinstance(episode, int) or episode < 1:
+            raise MissingAnimeEpisodeError(episode)
+        if audio_mode not in {"auto", "sub", "dub"}:
+            raise AnimeSourceError("invalid anime audio mode")
+
+        candidates = parse_search_html(await self._transport.search(normalized_query))
+        if len(candidates) == 1:
+            resolved = await self._resolve_candidate(
+                candidates[0],
+                normalized_query,
+                episode=episode,
+                audio_mode=audio_mode,
+            )
+            return RankedResolution(kind="resolved", resolution=resolved, choices=())
+
+        exact = tuple(
+            item
+            for item in candidates
+            if _title_fit_score(normalized_query, item.title) >= _EXACT_SCORE
+        )
+        if len(exact) == 1:
+            resolved = await self._resolve_candidate(
+                exact[0],
+                normalized_query,
+                episode=episode,
+                audio_mode=audio_mode,
+            )
+            return RankedResolution(kind="resolved", resolution=resolved, choices=())
+
+        choices = await self.resolve_candidates(normalized_query)
+        top_score = _title_fit_score(normalized_query, choices[0].title)
+        runner_up = (
+            _title_fit_score(normalized_query, choices[1].title)
+            if len(choices) > 1
+            else 0.0
+        )
+        if top_score >= _EXACT_SCORE or (top_score - runner_up) >= _CLEAR_WIN_MARGIN:
+            winner_id = choices[0].series_id
+            winner = next(item for item in candidates if item.series_id == winner_id)
+            resolved = await self._resolve_candidate(
+                winner,
+                normalized_query,
+                episode=episode,
+                audio_mode=audio_mode,
+            )
+            return RankedResolution(kind="resolved", resolution=resolved, choices=())
+        return RankedResolution(kind="choices", resolution=None, choices=choices)
+
+    async def _resolve_candidate(
+        self,
+        selected: AnimeCandidate,
+        query: str,
+        *,
+        episode: int,
+        audio_mode: Literal["auto", "sub", "dub"],
+    ) -> AnimeResolution:
+        del query  # the caller already validated and normalized it
         episodes = parse_episode_json(await self._transport.episodes(selected.numeric_id))
         selected_episode = next((item for item in episodes if item.number == episode), None)
         if selected_episode is None:

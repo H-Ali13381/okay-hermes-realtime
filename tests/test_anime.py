@@ -9,6 +9,7 @@ import pytest
 
 from realtime_action_spike.anime import (
     AnimeAmbiguityError,
+    AnimeChoice,
     AnimeSourceAdapter,
     AnimeSourceError,
     CurlAnimeTransport,
@@ -458,3 +459,115 @@ async def test_adapter_types_an_endpoint_with_no_supported_language_as_unavailab
 
     assert caught.value.requested_mode == "sub"
     assert caught.value.available_modes == ()
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidates_ranks_exact_match_first() -> None:
+    transport = FixtureTransport()
+    adapter = AnimeSourceAdapter(transport=transport, preference_provider=lambda: "sub")
+
+    choices = await adapter.resolve_candidates("Cowboy Bebop")
+
+    assert [(item.series_id, item.title) for item in choices] == [
+        ("cowboy-bebop-1065", "Cowboy Bebop"),
+        ("cowboy-bebop-the-movie-1066", "Cowboy Bebop: The Movie"),
+    ]
+    assert transport.calls == [("search", "Cowboy Bebop")]
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidates_partial_query_keeps_source_order_under_equal_scores() -> None:
+    adapter = AnimeSourceAdapter(transport=FixtureTransport(), preference_provider=lambda: "sub")
+
+    choices = await adapter.resolve_candidates("cowboy")
+
+    assert [item.title for item in choices] == ["Cowboy Bebop", "Cowboy Bebop: The Movie"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidates_caps_limit_at_five_and_rejects_invalid_bounds() -> None:
+    many = FixtureTransport(search=(
+        b"".join(
+            f'<a href="/anime/series-{index}-{index}"><img alt="Series {index}" '
+            f'src="https://cdn.xlsbox.com/poster/small/1/{index}.jpg"></a>'.encode()
+            for index in range(1, 9)
+        )
+    ))
+    adapter = AnimeSourceAdapter(transport=many, preference_provider=lambda: "sub")
+
+    choices = await adapter.resolve_candidates("series")
+    assert len(choices) == 5
+
+    with pytest.raises(AnimeSourceError, match="limit"):
+        await adapter.resolve_candidates("series", limit=6)
+    with pytest.raises(AnimeSourceError, match="limit"):
+        await adapter.resolve_candidates("series", limit=0)
+
+
+def test_anime_choice_is_bounded_and_immutable() -> None:
+    choice = AnimeChoice(series_id="cowboy-bebop-1065", title="Cowboy Bebop")
+    assert choice.series_id == "cowboy-bebop-1065"
+
+    with pytest.raises(FrozenInstanceError):
+        choice.title = "changed"  # type: ignore[misc]
+
+    with pytest.raises(AnimeSourceError):
+        AnimeChoice(series_id="not-a-valid-id", title="X")
+    with pytest.raises(AnimeSourceError):
+        AnimeChoice(series_id="cowboy-bebop-1065", title="")
+
+
+@pytest.mark.asyncio
+async def test_resolve_or_rank_returns_resolution_for_exact_unique_match() -> None:
+    adapter = AnimeSourceAdapter(
+        transport=FixtureTransport(),
+        preference_provider=lambda: "sub",
+    )
+
+    result = await adapter.resolve_or_rank("Cowboy Bebop", episode=2, audio_mode="auto")
+
+    assert result.kind == "resolved"
+    assert result.resolution is not None
+    assert result.resolution.series_id == "cowboy-bebop-1065"
+    assert result.resolution.episode == 2
+    assert result.choices == ()
+
+
+@pytest.mark.asyncio
+async def test_resolve_or_rank_returns_choices_instead_of_raising() -> None:
+    adapter = AnimeSourceAdapter(
+        transport=FixtureTransport(),
+        preference_provider=lambda: "sub",
+    )
+
+    result = await adapter.resolve_or_rank("cowboy", episode=1, audio_mode="auto")
+
+    assert result.kind == "choices"
+    assert result.resolution is None
+    assert [item.title for item in result.choices] == [
+        "Cowboy Bebop",
+        "Cowboy Bebop: The Movie",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_or_rank_single_candidate_resolves_directly() -> None:
+    single = FixtureTransport(search=(
+        b'<a href="/anime/cowboy-bebop-1065"><img alt="Cowboy Bebop" '
+        b'src="https://cdn.xlsbox.com/poster/small/1782735600/1065.jpg"></a>'
+    ))
+    adapter = AnimeSourceAdapter(transport=single, preference_provider=lambda: "sub")
+
+    result = await adapter.resolve_or_rank("Cowboy Bebop", episode=1, audio_mode="sub")
+
+    assert result.kind == "resolved"
+    assert result.resolution is not None
+    assert result.resolution.audio_mode == "sub"
+
+
+@pytest.mark.asyncio
+async def test_resolve_still_raises_ambiguity_for_legacy_callers() -> None:
+    adapter = AnimeSourceAdapter(transport=FixtureTransport(), preference_provider=lambda: "sub")
+
+    with pytest.raises(AnimeAmbiguityError):
+        await adapter.resolve("cowboy", episode=1, audio_mode="auto")
