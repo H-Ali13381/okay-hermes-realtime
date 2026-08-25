@@ -315,6 +315,61 @@ class MediaConfirmationMessage(_StrictBaseModel):
         return value
 
 
+class AnimeChoiceDisplay(_StrictBaseModel):
+    position: int = Field(ge=1, le=5)
+    series_id: str = Field(min_length=3, max_length=120, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*-\d+$")
+    title: str = Field(min_length=1, max_length=300)
+
+
+class MediaChoicesMessage(_StrictBaseModel):
+    type: Literal["media_choices"] = "media_choices"
+    session_id: str
+    query: str = Field(min_length=1, max_length=300)
+    pending_ids: tuple[str, ...] = Field(min_length=2, max_length=5)
+    choices: tuple[AnimeChoiceDisplay, ...] = Field(min_length=2, max_length=5)
+
+    @field_validator("pending_ids", "choices", mode="before")
+    @classmethod
+    def _coerce_sequences(cls, value: object) -> object:
+        if isinstance(value, list):
+            return tuple(value)
+        return value
+
+    @field_validator("session_id")
+    @classmethod
+    def _validate_session_id(cls, value: str) -> str:
+        return _validate_session_id(value)
+
+    @field_validator("query", mode="before")
+    @classmethod
+    def _normalize_query(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return " ".join(value.split())
+        return value
+
+    @field_validator("pending_ids")
+    @classmethod
+    def _validate_pending_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        for item in value:
+            _validate_playback_id(item)
+        return value
+
+    @field_validator("choices")
+    @classmethod
+    def _validate_choices_alignment(
+        cls,
+        value: tuple[AnimeChoiceDisplay, ...],
+        info: Any,
+    ) -> tuple[AnimeChoiceDisplay, ...]:
+        pending_ids = info.data.get("pending_ids")
+        if pending_ids is not None and len(pending_ids) != len(value):
+            raise ValueError("pending_ids and choices must align one-to-one")
+        for index, choice in enumerate(value, start=1):
+            if choice.position != index:
+                raise ValueError("choice positions must ascend from 1")
+        return value
+
+
 class TaskEventMessage(_StrictBaseModel):
     """Controller-to-browser relay for an exact tracked Kanban event."""
 
@@ -367,6 +422,7 @@ LoopbackMessage = Annotated[
     | MediaFinishedMessage
     | MediaResumeCompleteMessage
     | MediaConfirmationMessage
+    | MediaChoicesMessage
     | TaskEventMessage,
     Field(discriminator="type"),
 ]

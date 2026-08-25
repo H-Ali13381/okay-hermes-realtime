@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from realtime_action_spike.anime import AnimeResolution
+from realtime_action_spike.anime import AnimeResolution, RankedResolution
 from realtime_action_spike.capabilities import HandoffRecord
 from realtime_action_spike.media import (
     LaunchedPlayback,
@@ -195,6 +195,10 @@ class RecordingAnimeAdapter:
             stream_url=f"https://hls.anidb.app/stream/example/ep-{episode}.m3u8",
             available_episode_numbers=(1, 2, 3, 4),
         )
+
+    async def resolve_or_rank(self, query: str, **kwargs: object):
+        resolution = await self.resolve(query, **kwargs)
+        return RankedResolution(kind="resolved", resolution=resolution, choices=())
 
 
 class RecordingCrunchyrollLoginManager:

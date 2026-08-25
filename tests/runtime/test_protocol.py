@@ -10,6 +10,7 @@ from realtime_action_spike.runtime.protocol import (
     ContinuationItem,
     LoopbackMessage,
     MediaCancelMessage,
+    MediaChoicesMessage,
     MediaConfirmationMessage,
     MediaFinishedMessage,
     MediaReadyMessage,
@@ -874,6 +875,79 @@ def test_media_confirmation_rejects_private_locator_and_unsafe_thumbnail() -> No
 
     with pytest.raises((ValidationError, ValueError)):
         parse_loopback_message(payload)
+
+
+def test_media_choices_message_is_strict_bounded_and_round_trips() -> None:
+    message = MediaChoicesMessage.model_validate({
+        "session_id": "local-session-01",
+        "query": "cowboy",
+        "pending_ids": ["pendingaaaaaaaaaaaaaaaa1", "pendingbbbbbbbbbbbbbbbb2"],
+        "choices": [
+            {"position": 1, "series_id": "cowboy-bebop-1065", "title": "Cowboy Bebop"},
+            {
+                "position": 2,
+                "series_id": "cowboy-bebop-the-movie-1066",
+                "title": "Cowboy Bebop: The Movie",
+            },
+        ],
+    })
+    assert message.type == "media_choices"
+
+    encoded = encode_loopback_message(message)
+    parsed = parse_loopback_message(encoded, expected_session_id="local-session-01")
+    assert parsed == message
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # extra key
+        lambda: {
+            "session_id": "local-session-01",
+            "query": "q",
+            "pending_ids": ["pendingaaaaaaaaaaaaaaaa1", "pendingbbbbbbbbbbbbbbbb2"],
+            "choices": [
+                {"position": 1, "series_id": "x-1", "title": "X"},
+                {"position": 2, "series_id": "y-2", "title": "Y"},
+            ],
+            "extra": True,
+        },
+        # single choice is not a choice set
+        lambda: {
+            "session_id": "local-session-01",
+            "query": "q",
+            "pending_ids": ["pendingaaaaaaaaaaaaaaaa1"],
+            "choices": [{"position": 1, "series_id": "x-1", "title": "X"}],
+        },
+        # positions must ascend from 1
+        lambda: {
+            "session_id": "local-session-01",
+            "query": "q",
+            "pending_ids": ["pendingaaaaaaaaaaaaaaaa1", "pendingbbbbbbbbbbbbbbbb2"],
+            "choices": [
+                {"position": 2, "series_id": "x-2", "title": "X"},
+                {"position": 3, "series_id": "y-3", "title": "Y"},
+            ],
+        },
+        # pending ids and choices must align one-to-one
+        lambda: {
+            "session_id": "local-session-01",
+            "query": "q",
+            "pending_ids": [
+                "pendingaaaaaaaaaaaaaaaa1",
+                "pendingbbbbbbbbbbbbbbbb2",
+                "pendingcccccccccccccccc3",
+            ],
+            "choices": [
+                {"position": 1, "series_id": "x-1", "title": "X"},
+                {"position": 2, "series_id": "y-2", "title": "Y"},
+            ],
+        },
+    ],
+)
+def test_media_choices_rejects_invalid_payloads(payload) -> None:
+    with pytest.raises(ValidationError):
+        MediaChoicesMessage.model_validate({"type": "media_choices", **payload()})
 
 
 @pytest.mark.parametrize(
