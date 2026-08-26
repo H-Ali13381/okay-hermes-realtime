@@ -38,8 +38,14 @@ class SeasonTwoAdapter:
 
             return RankedResolution(kind="resolved", resolution=resolution, choices=())
         choices = (
-            AnimeChoice(series_id="frieren-1663", title="Frieren: Beyond Journey's End"),
-            AnimeChoice(series_id="frieren-s2-1665", title="Frieren: Beyond Journey's End Season 2"),
+            AnimeChoice(
+                series_id="frieren-1663",
+                title="Frieren: Beyond Journey's End",
+            ),
+            AnimeChoice(
+                series_id="frieren-s2-1665",
+                title="Frieren: Beyond Journey's End Season 2",
+            ),
         )
         from realtime_action_spike.anime import RankedResolution
 
