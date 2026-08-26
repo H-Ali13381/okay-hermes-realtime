@@ -256,3 +256,11 @@ class MediaDecisionArguments(StrictArguments):
         elif self.revision is not None:
             raise ValueError("revision is only allowed when action is revise")
         return self
+
+
+class MediaChooseArguments(StrictArguments):
+    position: int = Field(
+        ge=1,
+        le=5,
+        description="The displayed number of the anime choice to play.",
+    )

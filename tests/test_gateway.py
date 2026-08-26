@@ -89,6 +89,7 @@ class ActiveSessionController:
         self.registrations: list[tuple[str, object]] = []
         self.permission_resolutions: list[dict[str, object]] = []
         self.media_preparations: list[dict[str, object]] = []
+        self.media_choices: list[dict[str, object]] = []
         self.media_decisions: list[dict[str, object]] = []
 
     @property
@@ -155,6 +156,16 @@ class ActiveSessionController:
             "status": "playing",
             "pending_id": kwargs["pending_id"],
             "media_handoff": True,
+        }
+
+    async def choose_anime_media(self, **kwargs: object) -> dict[str, object]:
+        self.media_choices.append(kwargs)
+        if self.media_error is not None:
+            raise MediaPlaybackError(self.media_error)
+        return {
+            "status": "awaiting_confirmation",
+            "pending_id": "pending-chosen-01",
+            "prompt": "Play Cowboy Bebop: The Movie, Episode 1 · Subbed?",
         }
 
 
@@ -310,7 +321,7 @@ def test_session_configuration_uses_fast_natural_voice_defaults() -> None:
     }
     assert session["audio"]["input"]["transcription"] == {"model": "gpt-4o-mini-transcribe"}
     assert session["tool_choice"] == "auto"
-    assert len(session["tools"]) == 9
+    assert len(session["tools"]) == 10
     assert "Do not claim an action succeeded before its tool result" in session["instructions"]
     assert "resolve_heavy_agent_block" in session["instructions"]
     assert "Never infer approval" in session["instructions"]
@@ -334,6 +345,7 @@ def test_health_reports_model_and_missing_key_without_secret_material() -> None:
             "resolve_heavy_agent_block",
             "media_prepare_youtube",
             "media_prepare_anime",
+            "media_choose",
             "media_prepare_crunchyroll",
             "media_decide",
         ],
@@ -764,6 +776,79 @@ def test_anime_prepare_and_compound_revision_are_typed() -> None:
     assert decision["action"] == "revise"
     assert decision["revision"].episode_offset == 1  # type: ignore[union-attr]
     assert decision["revision"].audio_mode == "dub"  # type: ignore[union-attr]
+
+
+def test_media_choose_dispatches_position_to_controller() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_choose"},
+        )
+    )
+    controller = ActiveSessionController(active_session_id="local-session-1234")
+    client = TestClient(
+        create_app(settings(), upstream_client=upstream, controller=controller)  # type: ignore[arg-type]
+    )
+    session = client.post(
+        "/session?local_session_id=local-session-1234",
+        content="v=0\r\nmock-offer",
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE, "Content-Type": "application/sdp"},
+    )
+    scope = session.headers["x-okay-hermes-execution-scope"]
+
+    response = client.post(
+        "/execute",
+        json={
+            "scope": scope,
+            "call_id": "call_choose_01",
+            "name": "media_choose",
+            "arguments": {"position": 2},
+        },
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["result"]["status"] == "awaiting_confirmation"
+    assert controller.media_choices == [
+        {"session_id": "local-session-1234", "position": 2},
+    ]
+
+
+def test_media_choose_rejects_out_of_range_positions_before_dispatch() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_choose_bad"},
+        )
+    )
+    controller = ActiveSessionController(active_session_id="local-session-1234")
+    client = TestClient(
+        create_app(settings(), upstream_client=upstream, controller=controller)  # type: ignore[arg-type]
+    )
+    session = client.post(
+        "/session?local_session_id=local-session-1234",
+        content="v=0\r\nmock-offer",
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE, "Content-Type": "application/sdp"},
+    )
+    scope = session.headers["x-okay-hermes-execution-scope"]
+
+    response = client.post(
+        "/execute",
+        json={
+            "scope": scope,
+            "call_id": "call_choose_bad_01",
+            "name": "media_choose",
+            "arguments": {"position": 12},
+        },
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
+    )
+
+    assert response.status_code == 400
+    assert controller.media_choices == []
 
 
 def test_explicit_crunchyroll_request_opens_official_login_without_unofficial_fallback() -> None:

@@ -23,6 +23,7 @@ from .capabilities import (
     CapabilityBroker,
     UnknownCapabilityError,
     latest_handoff,
+    parse_media_choose_arguments,
     parse_media_decision_arguments,
     parse_media_prepare_anime_arguments,
     parse_media_prepare_crunchyroll_arguments,
@@ -404,6 +405,18 @@ def create_app(
                     "capability": execution_request.name,
                     "execution": "local",
                     "result": anime_result,
+                }
+            elif execution_request.name == "media_choose":
+                chosen = parse_media_choose_arguments(execution_request.arguments)
+                chosen_result = await _controller.choose_anime_media(
+                    session_id=active_session_id,
+                    position=chosen.position,
+                )
+                result = {
+                    "ok": True,
+                    "capability": execution_request.name,
+                    "execution": "local",
+                    "result": chosen_result,
                 }
             elif execution_request.name == "media_prepare_crunchyroll":
                 crunchyroll = parse_media_prepare_crunchyroll_arguments(execution_request.arguments)

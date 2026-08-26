@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import Field, ValidationError, field_validator
 
 from .contracts import (
+    MediaChooseArguments,
     MediaDecisionArguments,
     MediaPrepareAnimeArguments,
     MediaPrepareCrunchyrollArguments,
@@ -496,6 +497,17 @@ CAPABILITIES: tuple[CapabilityDefinition, ...] = (
         handler=_media_action_requires_live_session,
     ),
     CapabilityDefinition(
+        name="media_choose",
+        description=(
+            "Select one displayed anime choice by its displayed number after media_prepare_anime "
+            "returned awaiting_choice. Use only a number that was displayed to the user. Requires "
+            "the originating live session."
+        ),
+        arguments_model=MediaChooseArguments,
+        execution="local",
+        handler=_media_action_requires_live_session,
+    ),
+    CapabilityDefinition(
         name="media_prepare_crunchyroll",
         description=(
             "Use only when the user explicitly asks for Crunchyroll. Open the official "
@@ -601,6 +613,14 @@ def parse_media_prepare_anime_arguments(
 ) -> MediaPrepareAnimeArguments:
     parsed = _parse_typed_arguments(arguments, MediaPrepareAnimeArguments)
     assert isinstance(parsed, MediaPrepareAnimeArguments)
+    return parsed
+
+
+def parse_media_choose_arguments(
+    arguments: str | Mapping[str, Any],
+) -> MediaChooseArguments:
+    parsed = _parse_typed_arguments(arguments, MediaChooseArguments)
+    assert isinstance(parsed, MediaChooseArguments)
     return parsed
 
 
