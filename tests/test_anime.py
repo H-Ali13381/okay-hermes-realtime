@@ -418,11 +418,13 @@ async def test_adapter_returns_typed_ambiguity_instead_of_guessing() -> None:
 
 
 @pytest.mark.asyncio
-async def test_adapter_reports_missing_episode() -> None:
+async def test_adapter_falls_back_to_first_episode_when_numbering_skips_request() -> None:
     adapter = AnimeSourceAdapter(transport=FixtureTransport(), preference_provider=lambda: "sub")
 
-    with pytest.raises(MissingAnimeEpisodeError, match="episode 3"):
-        await adapter.resolve("Cowboy Bebop", episode=3, audio_mode="auto")
+    result = await adapter.resolve("Cowboy Bebop", episode=99, audio_mode="auto")
+
+    assert result.episode == 1
+    assert result.available_episode_numbers == (1, 2)
 
 
 @pytest.mark.asyncio

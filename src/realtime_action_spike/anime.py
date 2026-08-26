@@ -720,13 +720,45 @@ class AnimeSourceAdapter:
     ) -> AnimeResolution:
         del query  # the caller already validated and normalized it
         episodes = parse_episode_json(await self._transport.episodes(selected.numeric_id))
+        available_numbers = tuple(item.number for item in episodes)
         selected_episode = next((item for item in episodes if item.number == episode), None)
         if selected_episode is None:
-            raise MissingAnimeEpisodeError(episode)
+            # Series whose numbering does not include the requested episode (e.g. a
+            # season continuing at 29): resolve the earliest available episode so the
+            # controller's resume logic can still produce a valid proposal.
+            if not episodes:
+                raise MissingAnimeEpisodeError(episode)
+            resolved_mode = self._preference_provider() if audio_mode == "auto" else audio_mode
+            if resolved_mode not in {"sub", "dub"}:
+                raise AnimeSourceError("stored anime audio preference is invalid")
+            return await self._resolve_language_and_stream(
+                selected,
+                episodes[0],
+                episode=episodes[0].number,
+                resolved_mode=resolved_mode,
+                available_numbers=available_numbers,
+            )
 
         resolved_mode = self._preference_provider() if audio_mode == "auto" else audio_mode
         if resolved_mode not in {"sub", "dub"}:
             raise AnimeSourceError("stored anime audio preference is invalid")
+        return await self._resolve_language_and_stream(
+            selected,
+            selected_episode,
+            episode=episode,
+            resolved_mode=resolved_mode,
+            available_numbers=available_numbers,
+        )
+
+    async def _resolve_language_and_stream(
+        self,
+        selected: AnimeCandidate,
+        selected_episode: AnimeEpisode,
+        *,
+        episode: int,
+        resolved_mode: Literal["sub", "dub"],
+        available_numbers: tuple[int, ...],
+    ) -> AnimeResolution:
         language_code = "jpn" if resolved_mode == "sub" else "eng"
         language_payload = await self._transport.languages(selected_episode.episode_id)
         languages = parse_languages_json(language_payload)
@@ -756,7 +788,7 @@ class AnimeSourceAdapter:
             subtitle=f"Episode {episode} · {label}",
             poster_url=selected.poster_url,
             stream_url=stream_url,
-            available_episode_numbers=tuple(item.number for item in episodes),
+            available_episode_numbers=available_numbers,
         )
 
     @staticmethod
