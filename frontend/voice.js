@@ -394,6 +394,7 @@ function openControllerSocket() {
 }
 
 function setStatus(state, text) {
+  if (!connectionStatus || !voiceCard) return;
   connectionStatus.dataset.state = state;
   statusText.textContent = text;
   voiceCard.dataset.active = String(
@@ -402,12 +403,14 @@ function setStatus(state, text) {
 }
 
 function showError(message) {
+  if (!errorBanner) return;
   errorBanner.textContent = message;
   errorBanner.dataset.visible = "true";
   setStatus("error", "Connection error");
 }
 
 function clearError() {
+  if (!errorBanner) return;
   errorBanner.textContent = "";
   errorBanner.dataset.visible = "false";
 }
