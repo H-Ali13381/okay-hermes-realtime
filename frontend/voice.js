@@ -102,6 +102,7 @@ function hideMediaConfirmation(pendingId = null) {
   if (!mediaConfirmationState) return;
   if (pendingId && !mediaConfirmationState.clearExact(pendingId)) return;
   if (!pendingId) mediaConfirmationState.clear();
+  if (!mediaConfirmation) return;
   mediaConfirmation.dataset.visible = "false";
   mediaThumbnail.hidden = true;
   mediaThumbnail.removeAttribute("src");
@@ -116,6 +117,7 @@ function hideMediaChoices() {
 
 function showMediaChoices(event) {
   if (!localSessionId) throw new Error("Media choices require a local session");
+  if (!mediaConfirmation || !mediaChoiceList) return;
   const parsed = parseMediaChoices(event, localSessionId);
   mediaBadge.textContent = "Anime · pick one";
   mediaTitle.textContent = parsed.query;
@@ -138,6 +140,7 @@ function showMediaChoices(event) {
 
 function showMediaConfirmation(event) {
   if (!mediaConfirmationState) throw new Error("Media confirmation requires a local session");
+  if (!mediaConfirmation) return;
   const state = mediaConfirmationState.replace(event);
   mediaBadge.textContent = state.badge;
   mediaTitle.textContent = state.title;
