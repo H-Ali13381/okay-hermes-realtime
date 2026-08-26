@@ -13,7 +13,6 @@ from realtime_action_spike.anime import (
     AnimeSourceAdapter,
     AnimeSourceError,
     CurlAnimeTransport,
-    MissingAnimeEpisodeError,
     MissingAnimeLanguageError,
     parse_embed_html,
     parse_episode_json,

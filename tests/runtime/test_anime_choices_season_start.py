@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import pytest
+from test_anime_choices import make_controller
 
 from realtime_action_spike.anime import AnimeChoice
-from test_anime_choices import make_controller
 
 
 class SeasonTwoAdapter:
