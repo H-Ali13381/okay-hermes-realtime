@@ -309,6 +309,20 @@ button {
   line-height: 1.4;
 }
 
+.media-choice-list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 4px;
+}
+
+.media-choice-list li {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
 .media-natural-reply {
   margin-top: 4px;
   color: var(--quiet);

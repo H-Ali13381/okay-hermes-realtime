@@ -163,3 +163,49 @@ export class MediaConfirmationState {
     this.current = null;
   }
 }
+
+const CHOICES_ROOT_KEYS = new Set(["type", "session_id", "query", "pending_ids", "choices"]);
+const CHOICE_KEYS = new Set(["position", "series_id", "title"]);
+const SERIES_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*-\d+$/u;
+
+export function parseMediaChoices(event, expectedSessionId) {
+  assertExactKeys(event, CHOICES_ROOT_KEYS, "choices message");
+  if (event.type !== "media_choices") {
+    throw new Error("Invalid media choices type");
+  }
+  if (event.session_id !== expectedSessionId || !SAFE_ID.test(event.session_id || "")) {
+    throw new Error("Invalid media choices session");
+  }
+  const query = boundedText(event.query, "choices query");
+  if (!Array.isArray(event.pending_ids) || !Array.isArray(event.choices)) {
+    throw new Error("Invalid media choices payload");
+  }
+  if (
+    event.pending_ids.length < 2
+    || event.pending_ids.length > 5
+    || event.pending_ids.length !== event.choices.length
+  ) {
+    throw new Error("Invalid media choices count");
+  }
+  for (const pendingId of event.pending_ids) {
+    if (!SAFE_ID.test(pendingId || "")) throw new Error("Invalid media choices pending id");
+  }
+  const seenPositions = new Set();
+  const choices = event.choices.map((choice, index) => {
+    assertExactKeys(choice, CHOICE_KEYS, "choice");
+    if (!Number.isInteger(choice.position)) throw new Error("Invalid media choice position");
+    if (choice.position !== index + 1) {
+      throw new Error("Invalid media choice ordering");
+    }
+    if (!SERIES_ID.test(choice.series_id || "")) {
+      throw new Error("Invalid media choice series id");
+    }
+    seenPositions.add(choice.position);
+    return Object.freeze({
+      position: choice.position,
+      seriesId: choice.series_id,
+      title: boundedText(choice.title, "choice title"),
+    });
+  });
+  return Object.freeze({ query, pendingIds: [...event.pending_ids], choices });
+}

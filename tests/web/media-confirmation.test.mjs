@@ -83,3 +83,57 @@ test("null artwork degrades to a text-only card", () => {
 
   assert.equal(parsed.thumbnailUrl, null);
 });
+
+import { parseMediaChoices } from "../../frontend/media-confirmation.js";
+
+function choicesEvent(overrides = {}) {
+  return {
+    type: "media_choices",
+    session_id: "local-session-1234",
+    query: "cowboy",
+    pending_ids: ["pending-aaaaaaaaaaaaaa1", "pending-bbbbbbbbbbbbbb2"],
+    choices: [
+      { position: 1, series_id: "cowboy-bebop-1065", title: "Cowboy Bebop" },
+      {
+        position: 2,
+        series_id: "cowboy-bebop-the-movie-1066",
+        title: "Cowboy Bebop: The Movie",
+      },
+    ],
+    ...overrides,
+  };
+}
+
+test("parses strict bounded media choices", () => {
+  const parsed = parseMediaChoices(choicesEvent(), "local-session-1234");
+
+  assert.equal(parsed.query, "cowboy");
+  assert.equal(parsed.choices.length, 2);
+  assert.equal(parsed.choices[0].position, 1);
+  assert.equal(parsed.choices[1].title, "Cowboy Bebop: The Movie");
+});
+
+test("rejects foreign sessions and malformed choice sets", () => {
+  assert.throws(() => parseMediaChoices(choicesEvent(), "other-session-id-01"));
+  assert.throws(() => parseMediaChoices({ type: "media_choices" }, "local-session-1234"));
+  assert.throws(() =>
+    parseMediaChoices(
+      choicesEvent({
+        choices: [{ position: 2, series_id: "x-2", title: "X" }],
+        pending_ids: ["pending-aaaaaaaaaaaaaa1"],
+      }),
+      "local-session-1234",
+    ),
+  );
+  assert.throws(() =>
+    parseMediaChoices(
+      choicesEvent({
+        choices: [
+          { position: 1, series_id: "x-1", title: "X", extra: true },
+          { position: 2, series_id: "y-2", title: "Y" },
+        ],
+      }),
+      "local-session-1234",
+    ),
+  );
+});

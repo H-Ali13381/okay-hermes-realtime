@@ -1,7 +1,7 @@
 "use strict";
 
 import { canApplyRemoteAnswer } from "./peer-lifecycle.js";
-import { MediaConfirmationState } from "./media-confirmation.js";
+import { MediaConfirmationState, parseMediaChoices } from "./media-confirmation.js";
 import { MediaContinuity } from "./media-continuity.js";
 import { TaskTurnScheduler } from "./task-turn-scheduler.js";
 
@@ -28,6 +28,7 @@ const mediaBadge = document.getElementById("media-badge");
 const mediaTitle = document.getElementById("media-title");
 const mediaSubtitle = document.getElementById("media-subtitle");
 const mediaPrompt = document.getElementById("media-prompt");
+const mediaChoiceList = document.getElementById("media-choice-list");
 
 const initialUrl = new URL(window.location.href);
 const searchParams = new URLSearchParams(window.location.search);
@@ -104,6 +105,35 @@ function hideMediaConfirmation(pendingId = null) {
   mediaConfirmation.dataset.visible = "false";
   mediaThumbnail.hidden = true;
   mediaThumbnail.removeAttribute("src");
+  hideMediaChoices();
+}
+
+function hideMediaChoices() {
+  if (!mediaChoiceList) return;
+  mediaChoiceList.hidden = true;
+  mediaChoiceList.replaceChildren();
+}
+
+function showMediaChoices(event) {
+  if (!localSessionId) throw new Error("Media choices require a local session");
+  const parsed = parseMediaChoices(event, localSessionId);
+  mediaBadge.textContent = "Anime · pick one";
+  mediaTitle.textContent = parsed.query;
+  mediaSubtitle.textContent = "";
+  mediaPrompt.textContent = "Say the number of the one you want.";
+  mediaThumbnail.hidden = true;
+  mediaThumbnail.removeAttribute("src");
+  if (mediaChoiceList) {
+    const items = document.createDocumentFragment();
+    for (const choice of parsed.choices) {
+      const row = document.createElement("li");
+      row.textContent = `${choice.position}. ${choice.title}`;
+      items.appendChild(row);
+    }
+    mediaChoiceList.replaceChildren(items);
+    mediaChoiceList.hidden = false;
+  }
+  mediaConfirmation.dataset.visible = "true";
 }
 
 function showMediaConfirmation(event) {
@@ -120,6 +150,7 @@ function showMediaConfirmation(event) {
     mediaThumbnail.hidden = true;
     mediaThumbnail.removeAttribute("src");
   }
+  hideMediaChoices();
   mediaConfirmation.dataset.visible = "true";
 }
 
@@ -315,6 +346,10 @@ function openControllerSocket() {
       }
       if (event.type === "media_confirmation") {
         showMediaConfirmation(event);
+        return;
+      }
+      if (event.type === "media_choices") {
+        showMediaChoices(event);
         return;
       }
       if (event.type === "media_finished") {
