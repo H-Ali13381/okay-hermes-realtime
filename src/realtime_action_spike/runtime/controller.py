@@ -461,32 +461,20 @@ class VoiceSessionController:
         stored = self._anime_choices.get(session_id)
         if stored is None:
             raise ValueError("no ranked anime choices are active for this session")
-        query, entries = stored
+        _query, entries = stored
         if not 1 <= position <= len(entries):
             raise ValueError(f"position {position} is not a displayed choice")
         choice = entries[position - 1]
-        pending = await self._build_choice_pending(query, choice)
-        async with self._lock:
-            if not self.session_is_active(session_id):
-                raise StaleControlMessage("session ended before the choice was consumed")
-            self._anime_choices.pop(session_id, None)
-            self._pending_media.create_or_replace(session_id, pending)
-            display = pending.display_projection()
-            message = MediaConfirmationMessage.model_validate({"session_id": session_id, **display})
-            queue = self._outbound_messages[session_id]
-            if queue.full():
-                queue.get_nowait()
-            queue.put_nowait(message)
-            self._require_active_session(session_id).trace.record(
-                "media_confirmation_prepared",
-                source="controller",
-                data={"pending_id": pending.pending_id, "source": pending.source},
-            )
-        return {
-            "status": "awaiting_confirmation",
-            "pending_id": pending.pending_id,
-            "prompt": pending.prompt,
-        }
+        # The exact displayed title re-enters the normal resolution path, so episode
+        # defaults, resume handling, and audio preference reuse the proven flow.
+        self._anime_choices.pop(session_id, None)
+        return await self.prepare_anime_media(
+            session_id=session_id,
+            query=choice.title,
+            episode=None,
+            episode_offset=None,
+            audio_mode="auto",
+        )
 
     async def _publish_anime_choices(
         self,
@@ -531,39 +519,6 @@ class VoiceSessionController:
             "query": query,
             "choice_count": len(bounded),
         }
-
-    async def _build_choice_pending(self, query: str, choice: AnimeChoice) -> PendingMedia:
-        effective_audio_mode = await asyncio.to_thread(
-            self._media_preference_store.get_audio_mode,
-        )
-        resolver = getattr(self._anime_adapter, "resolve_choice", None)
-        if callable(resolver):
-            resolved = await resolver(choice, query, episode=1, audio_mode=effective_audio_mode)
-        else:
-            resolved = await self._anime_adapter.resolve(
-                choice.title,
-                episode=1,
-                audio_mode=effective_audio_mode,
-            )
-        return PendingMedia(
-            pending_id=self._pending_id_factory(),
-            source="anime",
-            title=resolved.series_title,
-            subtitle=resolved.subtitle,
-            thumbnail_url=resolved.poster_url,
-            playback_locator=DirectStreamLocator(stream_url=resolved.stream_url),
-            prompt=f"Play {resolved.series_title}, {resolved.subtitle}?",
-            episode=PendingEpisodeMetadata(
-                series_title=resolved.series_title,
-                season_number=None,
-                episode_number=resolved.episode,
-            ),
-            audio_mode=resolved.audio_mode,
-            resume=None,
-            request_query=query,
-            canonical_series_id=resolved.series_id,
-            available_episode_numbers=resolved.available_episode_numbers,
-        )
 
     async def prepare_crunchyroll_media(
         self,

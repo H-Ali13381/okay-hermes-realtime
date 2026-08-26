@@ -24,38 +24,40 @@ CHOICES = (
 
 
 class ChoicesAnimeAdapter:
-    """Always returns the ranked choice set; never resolves on its own."""
+    """Ranks a choice set; resolving the exact displayed title succeeds."""
 
     def __init__(self, choices: tuple[AnimeChoice, ...] = CHOICES) -> None:
         self._choices = choices
-        self.resolved_series_ids: list[str] = []
+        self.resolved_queries: list[str] = []
 
     async def resolve(self, query: str, **kwargs: object) -> AnimeResolution:
-        raise AssertionError("ambiguous request must not resolve a stream")
-
-    async def resolve_or_rank(self, query: str, **kwargs: object) -> RankedResolution:
-        return RankedResolution(kind="choices", resolution=None, choices=self._choices)
-
-    async def resolve_choice(
-        self,
-        choice: AnimeChoice,
-        query: str,
-        *,
-        episode: int,
-        audio_mode: str,
-    ) -> AnimeResolution:
-        self.resolved_series_ids.append(choice.series_id)
-        resolved_mode = "sub" if audio_mode == "auto" else audio_mode
+        self.resolved_queries.append(query)
+        episode = int(kwargs.get("episode", 1))  # type: ignore[arg-type]
+        mode = kwargs.get("audio_mode", "auto")
+        resolved_mode = "sub" if mode == "auto" else str(mode)
+        matched = next((c for c in CHOICES if c.title.casefold() == query.casefold()), None)
+        if matched is None:
+            raise AssertionError(f"unexpected resolution query: {query}")
         return AnimeResolution(
-            series_id=choice.series_id,
-            series_title=choice.title,
+            series_id=matched.series_id,
+            series_title=matched.title,
             episode=episode,
             audio_mode=resolved_mode,  # type: ignore[arg-type]
             subtitle=f"Episode {episode} · {'Subbed' if resolved_mode == 'sub' else 'Dubbed'}",
             poster_url=None,
-            stream_url=f"https://hls.anidb.app/stream/example/{choice.series_id}/ep-{episode}.m3u8",
+            stream_url=f"https://hls.anidb.app/stream/example/{matched.series_id}/ep-{episode}.m3u8",
             available_episode_numbers=(1, 2),
         )
+
+    async def resolve_or_rank(self, query: str, **kwargs: object) -> RankedResolution:
+        exact = tuple(c for c in self._choices if c.title.casefold() == query.casefold())
+        if len(exact) == 1:
+            return RankedResolution(
+                kind="resolved",
+                resolution=await self.resolve(query, **kwargs),
+                choices=(),
+            )
+        return RankedResolution(kind="choices", resolution=None, choices=self._choices)
 
 
 class ResolvingAnimeAdapter(ChoicesAnimeAdapter):
@@ -118,7 +120,7 @@ async def test_ambiguous_anime_prepares_choices_and_resolves_selected_once() -> 
     assert chosen["pending_id"] == "pending-sel-1"
     assert confirmation.type == "media_confirmation"
     assert confirmation.title == "Cowboy Bebop: The Movie"
-    assert adapter.resolved_series_ids == ["cowboy-bebop-the-movie-1066"]
+    assert adapter.resolved_queries == ["Cowboy Bebop: The Movie"]
 
     accepted = await controller.decide_media(
         session_id=session_id,
@@ -150,7 +152,7 @@ async def test_clear_winner_resolves_directly_without_choices() -> None:
 
     assert result["status"] == "awaiting_confirmation"
     assert outbound.type == "media_confirmation"
-    assert adapter.resolved_series_ids == []
+    assert adapter.resolved_queries == []
 
 
 @pytest.mark.asyncio
