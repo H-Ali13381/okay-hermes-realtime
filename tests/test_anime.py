@@ -536,8 +536,9 @@ async def test_resolve_or_rank_returns_resolution_for_exact_unique_match() -> No
 
 @pytest.mark.asyncio
 async def test_resolve_or_rank_returns_choices_instead_of_raising() -> None:
+    transport = FixtureTransport()
     adapter = AnimeSourceAdapter(
-        transport=FixtureTransport(),
+        transport=transport,
         preference_provider=lambda: "sub",
     )
 
@@ -549,6 +550,7 @@ async def test_resolve_or_rank_returns_choices_instead_of_raising() -> None:
         "Cowboy Bebop",
         "Cowboy Bebop: The Movie",
     ]
+    assert [call for call in transport.calls if call[0] == "search"] == [("search", "cowboy")]
 
 
 @pytest.mark.asyncio

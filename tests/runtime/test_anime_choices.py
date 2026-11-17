@@ -109,6 +109,12 @@ async def test_ambiguous_anime_prepares_choices_and_resolves_selected_once() -> 
 
     assert result["status"] == "awaiting_choice"
     assert result["choice_count"] == 2
+    assert result["choices"] == [
+        {"position": 1, "title": "Cowboy Bebop"},
+        {"position": 2, "title": "Cowboy Bebop: The Movie"},
+    ]
+    assert "series_id" not in str(result)
+    assert "pending_id" not in str(result)
     assert outbound.type == "media_choices"
     assert [choice.position for choice in outbound.choices] == [1, 2]
     assert outbound.choices[1].title == "Cowboy Bebop: The Movie"

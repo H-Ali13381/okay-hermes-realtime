@@ -191,6 +191,23 @@ _CLEAR_WIN_MARGIN = 0.15
 _MAX_CHOICES = 5
 
 
+def _rank_candidates(
+    query: str,
+    candidates: Sequence[AnimeCandidate],
+    limit: int = _MAX_CHOICES,
+) -> tuple[AnimeChoice, ...]:
+    """Rank already-fetched search results; never performs another source request."""
+    scored = [
+        (_title_fit_score(query, item.title), index, item)
+        for index, item in enumerate(candidates)
+    ]
+    scored.sort(key=lambda entry: (-entry[0], entry[1]))
+    return tuple(
+        AnimeChoice(series_id=item.series_id, title=item.title)
+        for _score, _index, item in scored[:limit]
+    )
+
+
 class _SearchParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -637,15 +654,7 @@ class AnimeSourceAdapter:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= _MAX_CHOICES:
             raise AnimeSourceError(f"invalid candidate limit {limit}")
         candidates = parse_search_html(await self._transport.search(normalized_query))
-        scored = [
-            (_title_fit_score(normalized_query, item.title), index, item)
-            for index, item in enumerate(candidates)
-        ]
-        scored.sort(key=lambda entry: (-entry[0], entry[1]))
-        return tuple(
-            AnimeChoice(series_id=item.series_id, title=item.title)
-            for _score, _index, item in scored[:limit]
-        )
+        return _rank_candidates(normalized_query, candidates, limit)
 
     async def resolve_or_rank(
         self,
@@ -691,7 +700,7 @@ class AnimeSourceAdapter:
             )
             return RankedResolution(kind="resolved", resolution=resolved, choices=())
 
-        choices = await self.resolve_candidates(normalized_query)
+        choices = _rank_candidates(normalized_query, candidates)
         top_score = _title_fit_score(normalized_query, choices[0].title)
         runner_up = (
             _title_fit_score(normalized_query, choices[1].title)

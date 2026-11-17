@@ -23,6 +23,8 @@ def test_default_instructions_define_voice_to_hermes_routing_policy() -> None:
     assert "media_prepare_anime" in instructions
     assert "media_choose" in instructions
     assert "awaiting_choice" in instructions
+    assert "its result lists the exact numbered choices" in instructions
+    assert "say those option numbers and titles once" in instructions
     assert "media_prepare_crunchyroll" in instructions
     assert "explicitly asks for crunchyroll" in instructions
     assert "do not silently use media_prepare_anime" in instructions

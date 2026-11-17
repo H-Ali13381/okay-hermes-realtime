@@ -518,6 +518,10 @@ class VoiceSessionController:
             "status": "awaiting_choice",
             "query": query,
             "choice_count": len(bounded),
+            "choices": [
+                {"position": choice.position, "title": choice.title}
+                for choice in message.choices
+            ],
         }
 
     async def prepare_crunchyroll_media(
