@@ -36,6 +36,7 @@ from .media import MediaPlaybackError, MediaPlaybackManager, YouTubeResolver
 from .runtime.browser import NoopBrowserHandle
 from .runtime.controller import StaleControlMessage, VoiceSessionController
 from .runtime.protocol import StopMessage
+from .runtime.timing import JsonValue
 from .runtime.tokens import LaunchTokenStore
 
 OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
@@ -70,6 +71,51 @@ def _execution_fingerprint(execution_request: ExecutionRequest) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical_request.encode()).hexdigest()
+
+
+def _bounded_trace_text(value: object, limit: int = 240) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return text[:limit]
+
+
+def _tool_dispatch_trace_data(execution_request: ExecutionRequest) -> dict[str, JsonValue]:
+    arguments = execution_request.arguments
+    if isinstance(arguments, dict):
+        argument_summary: JsonValue = {
+            key: _bounded_trace_text(value, 120)
+            for key, value in list(arguments.items())[:8]
+        }
+    else:
+        argument_summary = _bounded_trace_text(arguments)
+    return {
+        "call_id": execution_request.call_id,
+        "tool_name": execution_request.name,
+        "arguments": argument_summary,
+    }
+
+
+def _tool_result_trace_data(body: dict[str, Any]) -> dict[str, JsonValue]:
+    error_value = body.get("error")
+    error: dict[str, Any] = error_value if isinstance(error_value, dict) else {}
+    result_value = body.get("result")
+    payload: dict[str, Any] = result_value if isinstance(result_value, dict) else {}
+    data: dict[str, JsonValue] = {
+        "ok": body.get("ok") is True,
+        "error_type": _bounded_trace_text(error.get("type", "")),
+        "message": _bounded_trace_text(error.get("message", "")),
+        "status": _bounded_trace_text(payload.get("status", "")),
+    }
+    choices = payload.get("choices")
+    if isinstance(choices, list):
+        data["choice_count"] = len(choices)
+        data["choice_titles"] = [
+            _bounded_trace_text(
+                item.get("title", "") if isinstance(item, dict) else "",
+                120,
+            )
+            for item in choices[:5]
+        ]
+    return data
 
 
 class AsyncPostClient(Protocol):
@@ -382,6 +428,12 @@ def create_app(
                 },
             )
 
+        _controller.record_tool_lifecycle(
+            active_session_id,
+            "realtime_tool_dispatched",
+            data=_tool_dispatch_trace_data(execution_request),
+        )
+
         try:
             if execution_request.name == "media_prepare_youtube":
                 youtube = parse_media_prepare_youtube_arguments(execution_request.arguments)
@@ -510,6 +562,11 @@ def create_app(
             body = {"call_id": execution_request.call_id, **result}
 
         body_json = json.dumps(body, separators=(",", ":"))
+        _controller.record_tool_lifecycle(
+            active_session_id,
+            "realtime_tool_result",
+            data=_tool_result_trace_data(body),
+        )
         execution_results_by_call_id[execution_request.call_id] = (
             fingerprint,
             status_code,

@@ -91,6 +91,7 @@ class ActiveSessionController:
         self.media_preparations: list[dict[str, object]] = []
         self.media_choices: list[dict[str, object]] = []
         self.media_decisions: list[dict[str, object]] = []
+        self.tool_lifecycle: list[tuple[str, str, dict[str, object]]] = []
 
     @property
     def status(self) -> str:
@@ -99,6 +100,15 @@ class ActiveSessionController:
     @property
     def media_status(self) -> dict[str, object]:
         return {"status": "idle"}
+
+    def record_tool_lifecycle(
+        self,
+        session_id: str,
+        name: str,
+        *,
+        data: dict[str, object],
+    ) -> None:
+        self.tool_lifecycle.append((session_id, name, data))
 
     def register_handoff(self, session_id: str, record: object) -> bool:
         self.registrations.append((session_id, record))
@@ -578,6 +588,12 @@ def test_bound_session_issues_scope_and_execute_replays_identical_call() -> None
 
     assert first.status_code == 200
     assert first.json()["ok"] is True
+    assert [name for _session, name, _data in controller.tool_lifecycle] == [
+        "realtime_tool_dispatched",
+        "realtime_tool_result",
+    ]
+    assert controller.tool_lifecycle[0][2]["tool_name"] == "assistant_get_current_time"
+    assert controller.tool_lifecycle[1][2]["ok"] is True
     assert replay.status_code == 200
     assert replay.content == first.content
     assert conflict.status_code == 409

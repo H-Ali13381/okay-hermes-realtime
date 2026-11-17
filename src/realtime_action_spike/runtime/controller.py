@@ -281,6 +281,22 @@ class VoiceSessionController:
             in {SessionPhase.LAUNCHING, SessionPhase.CONNECTING, SessionPhase.LIVE}
         )
 
+    def record_tool_lifecycle(
+        self,
+        session_id: str,
+        name: str,
+        *,
+        data: dict[str, JsonValue],
+    ) -> None:
+        """Record bounded tool diagnostics without affecting execution."""
+        if not self.session_is_active(session_id):
+            return
+        self._require_active_session(session_id).trace.record(
+            name,
+            source="controller",
+            data=data,
+        )
+
     async def publish_task_event(
         self,
         session_id: str,
