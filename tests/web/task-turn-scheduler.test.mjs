@@ -155,6 +155,23 @@ test("function-call continuations keep task events for the tool-result response"
   assert.match(sent[0].response.instructions, /"event_id":20/);
 });
 
+test("a pending tool execution blocks premature response creation", () => {
+  const { scheduler, sent } = harness();
+
+  scheduler.requestResponse();
+  scheduler.onResponseCreated();
+  sent.length = 0;
+  scheduler.onToolExecutionStarted("call-1");
+  scheduler.onTaskEvent(taskEvent({ event_id: 21 }));
+  scheduler.onResponseDone({ status: "completed", deferContinuation: true });
+
+  assert.deepEqual(sent, []);
+  scheduler.onToolExecutionFinished("call-1");
+  scheduler.requestResponse();
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].response.instructions, /"event_id":21/);
+});
+
 test("a tool-result continuation cannot consume pending media as user acceptance", () => {
   const { scheduler, sent } = harness(true, () => (
     "Interpret the latest user reply for pending media proposal pending-anime-01 and call media_decide."

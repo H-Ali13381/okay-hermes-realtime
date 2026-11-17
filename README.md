@@ -113,6 +113,19 @@ Environment overrides (set in `~/.config/okay-hermes-realtime/config.env`):
 
 The controller resolves the Hermes binary through these overrides, PATH, and absolute fallback paths, because systemd units do not inherit the user shell PATH. Missing binary or timeout surfaces as a controlled tool error, never a gateway 500.
 
+## Provider contracts
+
+`VOICE_PROVIDER` selects the voice provider when the controller starts and is fixed for the whole session; it never switches mid-conversation. Registered contracts are explicit:
+
+| Provider | Transport | Model default | Build status |
+|---|---|---|---|
+| `openai` | Browser WebRTC Realtime | `gpt-realtime-2.1` | active |
+| `gemini` | Gemini Live WebSocket | `gemini-3.8-live` | contract-only |
+
+The Gemini contract is registered so configuration and health output are explicit, but its WebSocket transport is not wired into this build. Selecting it makes `/session` fail with a clear 503 instead of silently using OpenAI or exposing a provider key to the page.
+
+Tool dispatch remains low latency: execution starts when complete tool arguments arrive, not when the whole model response finishes.
+
 ## Operation
 
 ```bash
@@ -206,7 +219,7 @@ This is a single short sample, not a benchmark. Brave dominates residency, and C
 
 ## Limitations
 
-- OpenAI Realtime only. There is no provider abstraction and none is planned here.
+- OpenAI Realtime is the only transport-active provider. Gemini Live is a registered contract only; its transport requires a separate architecture-approved adapter.
 - Single user, loopback-only.
 - Requires Brave for the voice page and an ONNX wake-word model for activation.
 - Handoff is asynchronous. Automatic voice delivery requires the originating session to remain open; ended sessions receive only the optional native desktop notification.

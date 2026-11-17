@@ -673,12 +673,30 @@ function sendRealtimeEvent(event, channel = dataChannel) {
   channel.send(JSON.stringify(event));
 }
 
+function reportRealtimeResultDeliveryFailure(error) {
+  const message = error?.message || String(error);
+  showError(`Could not return the tool result to Realtime: ${message}`);
+  setStatus("connected", "Connected — tool result not delivered");
+}
+
+function isCurrentRealtimeSession(sessionContext) {
+  return Boolean(
+    sessionContext
+    && peerConnection === sessionContext.pc
+    && dataChannel === sessionContext.dc
+    && executionScope === sessionContext.scope
+  );
+}
+
 function executeFunctionCall(item, sessionContext) {
   const callId = item.call_id;
   if (!callId) return Promise.resolve();
   const existing = functionCallExecutions.get(callId);
   if (existing) return existing;
-  const execution = runFunctionCall(item, sessionContext);
+  taskTurnScheduler.onToolExecutionStarted(callId);
+  const execution = runFunctionCall(item, sessionContext).finally(() => {
+    taskTurnScheduler.onToolExecutionFinished(callId);
+  });
   functionCallExecutions.set(callId, execution);
   return execution;
 }
@@ -717,11 +735,7 @@ async function runFunctionCall(item, sessionContext) {
     };
   }
 
-  if (
-    peerConnection !== sessionContext.pc ||
-    dataChannel !== sessionContext.dc ||
-    executionScope !== sessionContext.scope
-  ) {
+  if (!isCurrentRealtimeSession(sessionContext)) {
     return;
   }
 
@@ -735,39 +749,54 @@ async function runFunctionCall(item, sessionContext) {
   if (!output.ok) {
     setStatus("connected", "Connected — tools unavailable");
   }
-  sendRealtimeEvent(
-    {
-      type: "conversation.item.create",
-      item: {
-        type: "function_call_output",
-        call_id: callId,
-        output: JSON.stringify(output),
-      },
-    },
-    sessionContext.dc
-  );
-  if (output.ok && output.result?.end_session) {
-    // Lock VAD before the farewell so user speech cannot cancel it, and so the
-    // provider does not auto-create responses from ambient audio while we are
-    // closing. Then request the farewell explicitly.
+  try {
     sendRealtimeEvent(
       {
-        type: "session.update",
-        session: {
-          type: "realtime",
-          audio: {
-            input: {
-              turn_detection: {
-                type: "semantic_vad",
-                create_response: false,
-                interrupt_response: false,
-              },
-            },
-          },
+        type: "conversation.item.create",
+        item: {
+          type: "function_call_output",
+          call_id: callId,
+          output: JSON.stringify(output),
         },
       },
       sessionContext.dc
     );
+  } catch (error) {
+    const message = error?.message || String(error);
+    reportRealtimeResultDeliveryFailure(error);
+    return {
+      ok: false,
+      call_id: callId,
+      error: { type: "result_delivery_failed", message },
+    };
+  }
+  if (output.ok && output.result?.end_session) {
+    // Lock VAD before the farewell so user speech cannot cancel it, and so the
+    // provider does not auto-create responses from ambient audio while we are
+    // closing. Then request the farewell explicitly.
+    try {
+      sendRealtimeEvent(
+        {
+          type: "session.update",
+          session: {
+            type: "realtime",
+            audio: {
+              input: {
+                turn_detection: {
+                  type: "semantic_vad",
+                  create_response: false,
+                  interrupt_response: false,
+                },
+              },
+            },
+          },
+        },
+        sessionContext.dc
+      );
+    } catch (error) {
+      reportRealtimeResultDeliveryFailure(error);
+      return output;
+    }
     disconnectAfterResponse = true;
     // Bounded fallback: if output_audio_buffer.stopped never arrives (cancel,
     // provider error, transport stall), still close so wakeword re-arms.
@@ -788,6 +817,7 @@ async function runFunctionCall(item, sessionContext) {
 }
 
 async function handleRealtimeEvent(event, sessionContext) {
+  if (sessionContext && !isCurrentRealtimeSession(sessionContext)) return;
   appendEvent(event);
   if (event.type === "session.updated") {
     taskTurnScheduler.onChannelReady();
@@ -863,6 +893,7 @@ async function handleRealtimeEvent(event, sessionContext) {
     });
     if (functionCalls.length > 0) {
       await Promise.all(functionCalls.map((item) => executeFunctionCall(item, sessionContext)));
+      if (!isCurrentRealtimeSession(sessionContext)) return;
       taskTurnScheduler.requestResponse();
     } else if (disconnectAfterResponse) {
       const status = event.response?.status;

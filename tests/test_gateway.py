@@ -309,7 +309,7 @@ def test_session_configuration_uses_fast_natural_voice_defaults() -> None:
     session = build_realtime_session(settings())
 
     assert session["type"] == "realtime"
-    assert session["model"] == "gpt-realtime-2.1-mini"
+    assert session["model"] == "gpt-realtime-2.1"
     assert session["reasoning"] == {"effort": "minimal"}
     assert session["output_modalities"] == ["audio"]
     assert session["audio"]["output"]["voice"] == "marin"
@@ -336,7 +336,10 @@ def test_health_reports_model_and_missing_key_without_secret_material() -> None:
     assert response.json() == {
         "status": "ok",
         "api_key_configured": False,
-        "model": "gpt-realtime-2.1-mini",
+        "provider": "openai",
+        "provider_model": "gpt-realtime-2.1",
+        "provider_availability": "active",
+        "model": "gpt-realtime-2.1",
         "capabilities": [
             "assistant_get_current_time",
             "voice_end_session",
@@ -409,7 +412,7 @@ def test_session_endpoint_relays_sdp_and_server_owned_configuration() -> None:
     assert call["headers"]["OpenAI-Safety-Identifier"]
     assert call["files"]["sdp"] == (None, "v=0\r\nmock-offer", "application/sdp")
     session_json = call["files"]["session"][1]
-    assert json.loads(session_json)["model"] == "gpt-realtime-2.1-mini"
+    assert json.loads(session_json)["model"] == "gpt-realtime-2.1"
 
 
 def test_session_endpoint_rejects_stale_query_binding_before_upstream() -> None:

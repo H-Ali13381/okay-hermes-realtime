@@ -39,8 +39,17 @@ export class TaskTurnScheduler {
     this.responseCreatePending = false;
     this.responseRequested = false;
     this.userAudioTurnCommitted = false;
+    this.pendingToolExecutions = new Set();
     this.pendingEvents = new Map();
     this.inFlightEvents = new Map();
+  }
+
+  onToolExecutionStarted(callId) {
+    this.pendingToolExecutions.add(callId);
+  }
+
+  onToolExecutionFinished(callId) {
+    this.pendingToolExecutions.delete(callId);
   }
 
   onChannelReady() {
@@ -110,6 +119,7 @@ export class TaskTurnScheduler {
       || this.awaitingCommit
       || this.assistantResponding
       || this.responseCreatePending
+      || this.pendingToolExecutions.size > 0
       || !this.isReady()
     ) {
       return false;

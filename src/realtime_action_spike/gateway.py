@@ -213,6 +213,7 @@ def create_app(
     controller: VoiceSessionController | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
+    voice_provider = settings.provider_contract
     broker = broker or CapabilityBroker()
     web_root = Path(__file__).resolve().parent / "web"
     index_html = web_root / "index.html"
@@ -310,6 +311,9 @@ def create_app(
         return {
             "status": "ok",
             "api_key_configured": settings.api_key_value() is not None,
+            "provider": voice_provider.id,
+            "provider_model": settings.provider_model,
+            "provider_availability": voice_provider.availability,
             "model": settings.realtime_model,
             "capabilities": [capability.name for capability in CAPABILITIES],
             "controller_status": _controller.status,
@@ -516,6 +520,11 @@ def create_app(
     @app.post("/session")
     async def create_realtime_session(request: Request) -> Response:
         nonlocal active_execution_scope, active_session_id, latest_session_attempt
+        if voice_provider.availability != "active":
+            raise HTTPException(
+                status_code=503,
+                detail=f"{voice_provider.display_name} transport is contract-only in this build",
+            )
         if settings.api_key_value() is None:
             raise HTTPException(
                 status_code=503,

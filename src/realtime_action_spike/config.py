@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from .capabilities import build_openai_tools
+from .providers import UnknownVoiceProviderError, VoiceProviderContract, get_provider_contract
 
 DEFAULT_BRAVE_BIN = "brave-origin"
 
@@ -77,9 +78,12 @@ class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     openai_api_key: SecretStr | None = None
-    realtime_model: str = "gpt-realtime-2.1-mini"
+    voice_provider: str = "openai"
+    realtime_model: str = "gpt-realtime-2.1"
     realtime_voice: str = "marin"
     realtime_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] = "minimal"
+    gemini_api_key: SecretStr | None = None
+    gemini_model: str = "gemini-3.8-live"
     gateway_host: str = "127.0.0.1"
     gateway_port: int = Field(default=8765, ge=1, le=65_535)
 
@@ -115,6 +119,14 @@ class Settings(BaseModel):
                 return data
         return data
 
+    @field_validator("voice_provider")
+    @classmethod
+    def _validate_voice_provider(cls, value: str) -> str:
+        try:
+            return get_provider_contract(value).id
+        except UnknownVoiceProviderError as exc:
+            raise ValueError(str(exc)) from exc
+
     @property
     def resolved_activation_socket_path(self) -> str:
         if self.activation_socket_path:
@@ -146,9 +158,12 @@ class Settings(BaseModel):
         return cls.model_validate(
             {
                 "openai_api_key": key,
-                "realtime_model": os.getenv("REALTIME_MODEL", "gpt-realtime-2.1-mini"),
+                "voice_provider": os.getenv("VOICE_PROVIDER", "openai"),
+                "realtime_model": os.getenv("REALTIME_MODEL", "gpt-realtime-2.1"),
                 "realtime_voice": os.getenv("REALTIME_VOICE", "marin"),
                 "realtime_reasoning_effort": os.getenv("REALTIME_REASONING_EFFORT", "minimal"),
+                "gemini_api_key": os.getenv("GEMINI_API_KEY") or None,
+                "gemini_model": os.getenv("GEMINI_MODEL", "gemini-3.8-live"),
                 "gateway_host": os.getenv("GATEWAY_HOST", "127.0.0.1"),
                 "gateway_port": os.getenv("GATEWAY_PORT", "8765"),
                 "activation_socket_path": activation_socket_path,
@@ -178,6 +193,16 @@ class Settings(BaseModel):
         if self.openai_api_key is None:
             return None
         return self.openai_api_key.get_secret_value()
+
+    @property
+    def provider_contract(self) -> VoiceProviderContract:
+        return get_provider_contract(self.voice_provider)
+
+    @property
+    def provider_model(self) -> str:
+        if self.voice_provider == "gemini":
+            return self.gemini_model
+        return self.realtime_model
 
 
 def build_realtime_session(settings: Settings) -> dict[str, object]:

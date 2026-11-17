@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -153,7 +154,7 @@ def test_end_session_update_preserves_required_realtime_session_type() -> None:
     )
 
     assert 'type: "session.update"' in end_session_block
-    assert 'session: {\n          type: "realtime",' in end_session_block
+    assert re.search(r'session:\s*\{\s*type:\s*"realtime",', end_session_block)
 
 
 def test_task_events_use_manual_non_interrupting_realtime_turns() -> None:

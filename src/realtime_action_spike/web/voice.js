@@ -278,8 +278,15 @@ var TaskTurnScheduler = class {
     this.responseCreatePending = false;
     this.responseRequested = false;
     this.userAudioTurnCommitted = false;
+    this.pendingToolExecutions = /* @__PURE__ */ new Set();
     this.pendingEvents = /* @__PURE__ */ new Map();
     this.inFlightEvents = /* @__PURE__ */ new Map();
+  }
+  onToolExecutionStarted(callId) {
+    this.pendingToolExecutions.add(callId);
+  }
+  onToolExecutionFinished(callId) {
+    this.pendingToolExecutions.delete(callId);
   }
   onChannelReady() {
     this.maybeCreateResponse();
@@ -332,7 +339,7 @@ var TaskTurnScheduler = class {
     this.maybeCreateResponse();
   }
   maybeCreateResponse() {
-    if (!this.responseRequested || this.userSpeaking || this.awaitingCommit || this.assistantResponding || this.responseCreatePending || !this.isReady()) {
+    if (!this.responseRequested || this.userSpeaking || this.awaitingCommit || this.assistantResponding || this.responseCreatePending || this.pendingToolExecutions.size > 0 || !this.isReady()) {
       return false;
     }
     this.inFlightEvents = new Map(this.pendingEvents);
@@ -448,6 +455,7 @@ function hideMediaConfirmation(pendingId = null) {
   if (!mediaConfirmationState) return;
   if (pendingId && !mediaConfirmationState.clearExact(pendingId)) return;
   if (!pendingId) mediaConfirmationState.clear();
+  if (!mediaConfirmation) return;
   mediaConfirmation.dataset.visible = "false";
   mediaThumbnail.hidden = true;
   mediaThumbnail.removeAttribute("src");
@@ -460,6 +468,7 @@ function hideMediaChoices() {
 }
 function showMediaChoices(event) {
   if (!localSessionId) throw new Error("Media choices require a local session");
+  if (!mediaConfirmation || !mediaChoiceList) return;
   const parsed = parseMediaChoices(event, localSessionId);
   mediaBadge.textContent = "Anime \xB7 pick one";
   mediaTitle.textContent = parsed.query;
@@ -481,6 +490,7 @@ function showMediaChoices(event) {
 }
 function showMediaConfirmation(event) {
   if (!mediaConfirmationState) throw new Error("Media confirmation requires a local session");
+  if (!mediaConfirmation) return;
   const state = mediaConfirmationState.replace(event);
   mediaBadge.textContent = state.badge;
   mediaTitle.textContent = state.title;
@@ -699,6 +709,7 @@ function openControllerSocket() {
   });
 }
 function setStatus(state, text) {
+  if (!connectionStatus || !voiceCard) return;
   connectionStatus.dataset.state = state;
   statusText.textContent = text;
   voiceCard.dataset.active = String(
@@ -706,11 +717,13 @@ function setStatus(state, text) {
   );
 }
 function showError(message) {
+  if (!errorBanner) return;
   errorBanner.textContent = message;
   errorBanner.dataset.visible = "true";
   setStatus("error", "Connection error");
 }
 function clearError() {
+  if (!errorBanner) return;
   errorBanner.textContent = "";
   errorBanner.dataset.visible = "false";
 }
@@ -934,12 +947,25 @@ function sendRealtimeEvent(event, channel = dataChannel) {
   }
   channel.send(JSON.stringify(event));
 }
+function reportRealtimeResultDeliveryFailure(error) {
+  const message = error?.message || String(error);
+  showError(`Could not return the tool result to Realtime: ${message}`);
+  setStatus("connected", "Connected \u2014 tool result not delivered");
+}
+function isCurrentRealtimeSession(sessionContext) {
+  return Boolean(
+    sessionContext && peerConnection === sessionContext.pc && dataChannel === sessionContext.dc && executionScope === sessionContext.scope
+  );
+}
 function executeFunctionCall(item, sessionContext) {
   const callId = item.call_id;
   if (!callId) return Promise.resolve();
   const existing = functionCallExecutions.get(callId);
   if (existing) return existing;
-  const execution = runFunctionCall(item, sessionContext);
+  taskTurnScheduler.onToolExecutionStarted(callId);
+  const execution = runFunctionCall(item, sessionContext).finally(() => {
+    taskTurnScheduler.onToolExecutionFinished(callId);
+  });
   functionCallExecutions.set(callId, execution);
   return execution;
 }
@@ -975,7 +1001,7 @@ async function runFunctionCall(item, sessionContext) {
       error: { type: "gateway_unreachable", message: error.message || String(error) }
     };
   }
-  if (peerConnection !== sessionContext.pc || dataChannel !== sessionContext.dc || executionScope !== sessionContext.scope) {
+  if (!isCurrentRealtimeSession(sessionContext)) {
     return;
   }
   createActionStateCard(output);
@@ -988,36 +1014,51 @@ async function runFunctionCall(item, sessionContext) {
   if (!output.ok) {
     setStatus("connected", "Connected \u2014 tools unavailable");
   }
-  sendRealtimeEvent(
-    {
-      type: "conversation.item.create",
-      item: {
-        type: "function_call_output",
-        call_id: callId,
-        output: JSON.stringify(output)
-      }
-    },
-    sessionContext.dc
-  );
-  if (output.ok && output.result?.end_session) {
+  try {
     sendRealtimeEvent(
       {
-        type: "session.update",
-        session: {
-          type: "realtime",
-          audio: {
-            input: {
-              turn_detection: {
-                type: "semantic_vad",
-                create_response: false,
-                interrupt_response: false
-              }
-            }
-          }
+        type: "conversation.item.create",
+        item: {
+          type: "function_call_output",
+          call_id: callId,
+          output: JSON.stringify(output)
         }
       },
       sessionContext.dc
     );
+  } catch (error) {
+    const message = error?.message || String(error);
+    reportRealtimeResultDeliveryFailure(error);
+    return {
+      ok: false,
+      call_id: callId,
+      error: { type: "result_delivery_failed", message }
+    };
+  }
+  if (output.ok && output.result?.end_session) {
+    try {
+      sendRealtimeEvent(
+        {
+          type: "session.update",
+          session: {
+            type: "realtime",
+            audio: {
+              input: {
+                turn_detection: {
+                  type: "semantic_vad",
+                  create_response: false,
+                  interrupt_response: false
+                }
+              }
+            }
+          }
+        },
+        sessionContext.dc
+      );
+    } catch (error) {
+      reportRealtimeResultDeliveryFailure(error);
+      return output;
+    }
     disconnectAfterResponse = true;
     if (farewellFallbackTimer !== null) {
       clearTimeout(farewellFallbackTimer);
@@ -1035,6 +1076,7 @@ async function runFunctionCall(item, sessionContext) {
   return output;
 }
 async function handleRealtimeEvent(event, sessionContext) {
+  if (sessionContext && !isCurrentRealtimeSession(sessionContext)) return;
   appendEvent(event);
   if (event.type === "session.updated") {
     taskTurnScheduler.onChannelReady();
@@ -1107,6 +1149,7 @@ async function handleRealtimeEvent(event, sessionContext) {
     });
     if (functionCalls.length > 0) {
       await Promise.all(functionCalls.map((item) => executeFunctionCall(item, sessionContext)));
+      if (!isCurrentRealtimeSession(sessionContext)) return;
       taskTurnScheduler.requestResponse();
     } else if (disconnectAfterResponse) {
       const status = event.response?.status;
