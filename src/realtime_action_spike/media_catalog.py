@@ -80,10 +80,14 @@ class YouTubePlaybackLocator:
             raise PendingMediaCatalogError("inconsistent YouTube playback locator")
 
 
+_ALLOWED_HTTP_HEADERS = frozenset({"Authorization", "Referer"})
+
+
 @dataclass(frozen=True, slots=True)
 class DirectStreamLocator:
     stream_url: str
     webpage_url: str | None = None
+    http_headers: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "stream_url", _https_url(self.stream_url, "stream URL"))
@@ -93,6 +97,24 @@ class DirectStreamLocator:
                 "webpage_url",
                 _https_url(self.webpage_url, "webpage URL"),
             )
+        if not isinstance(self.http_headers, tuple):
+            raise PendingMediaCatalogError("invalid http headers")
+        bounded: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for item in self.http_headers:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise PendingMediaCatalogError("invalid http header")
+            name, value = item
+            if name not in _ALLOWED_HTTP_HEADERS or name in seen:
+                raise PendingMediaCatalogError("invalid http header")
+            if not isinstance(value, str) or _CONTROL_RE.search(value):
+                raise PendingMediaCatalogError("invalid http header")
+            maximum = 2048 if name == "Authorization" else 512
+            if not value or len(value) > maximum or "\r" in value or "\n" in value:
+                raise PendingMediaCatalogError("invalid http header")
+            seen.add(name)
+            bounded.append((name, value))
+        object.__setattr__(self, "http_headers", tuple(bounded))
 
 
 PlaybackLocator: TypeAlias = YouTubePlaybackLocator | DirectStreamLocator  # noqa: UP040

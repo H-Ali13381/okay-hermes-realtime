@@ -117,6 +117,43 @@ class HlsVariant:
 
 
 @dataclass(frozen=True, slots=True)
+class AnimeFallbackStream:
+    """A bounded stream locator from an alternate playback provider."""
+
+    stream_url: str
+    http_headers: tuple[tuple[str, str], ...]
+    source: str
+
+    def __post_init__(self) -> None:
+        parsed = urlsplit(self.stream_url)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or _CONTROL_RE.search(self.stream_url)
+            or len(self.stream_url) > 2048
+        ):
+            raise AnimeSourceError("invalid fallback stream URL")
+        if self.source not in {"animeonsen"}:
+            raise AnimeSourceError("invalid fallback stream source")
+        if not isinstance(self.http_headers, tuple) or len(self.http_headers) > 2:
+            raise AnimeSourceError("invalid fallback stream headers")
+        seen: set[str] = set()
+        for item in self.http_headers:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise AnimeSourceError("invalid fallback stream header")
+            name, value = item
+            if name not in {"Authorization", "Referer"} or name in seen:
+                raise AnimeSourceError("invalid fallback stream header")
+            if not isinstance(value, str) or not value or _CONTROL_RE.search(value):
+                raise AnimeSourceError("invalid fallback stream header")
+            if len(value) > (2048 if name == "Authorization" else 512):
+                raise AnimeSourceError("invalid fallback stream header")
+            seen.add(name)
+
+
+@dataclass(frozen=True, slots=True)
 class AnimeResolution:
     series_id: str
     series_title: str
@@ -125,7 +162,8 @@ class AnimeResolution:
     subtitle: str
     poster_url: str | None
     stream_url: str
-    available_episode_numbers: tuple[int, ...]
+    http_headers: tuple[tuple[str, str], ...] = ()
+    available_episode_numbers: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -786,6 +824,10 @@ class HianimeTransport(CurlAnimeTransport):
         return document
 
 
+class AnimeFallbackResolver(Protocol):
+    async def resolve(self, title: str, episode: int) -> AnimeFallbackStream: ...
+
+
 class AnimeTransport(Protocol):
     async def search(self, query: str) -> bytes: ...
 
@@ -805,10 +847,12 @@ class AnimeSourceAdapter:
         transport: AnimeTransport,
         preference_provider: Callable[[], Literal["sub", "dub"]],
         preference_writer: Callable[[Literal["sub", "dub"]], None] | None = None,
+        fallback_resolver: AnimeFallbackResolver | None = None,
     ) -> None:
         self._transport = transport
         self._preference_provider = preference_provider
         self._preference_writer = preference_writer
+        self._fallback_resolver = fallback_resolver
 
     async def resolve(
         self,
@@ -983,12 +1027,20 @@ class AnimeSourceAdapter:
                 available.append("dub")
             raise MissingAnimeLanguageError(resolved_mode, tuple(available))
 
-        master_url = parse_embed_html(await self._transport.fetch_embed(language.embed_url))
-        variants = parse_master_playlist(
-            await self._transport.fetch_playlist(master_url),
-            master_url,
-        )
-        stream_url = select_best_variant(variants).url
+        try:
+            master_url = parse_embed_html(await self._transport.fetch_embed(language.embed_url))
+            variants = parse_master_playlist(
+                await self._transport.fetch_playlist(master_url),
+                master_url,
+            )
+            stream_url = select_best_variant(variants).url
+            http_headers: tuple[tuple[str, str], ...] = ()
+        except AnimeStreamUnavailableError:
+            if self._fallback_resolver is None or resolved_mode != "sub":
+                raise
+            fallback = await self._fallback_resolver.resolve(selected.title, episode)
+            stream_url = fallback.stream_url
+            http_headers = fallback.http_headers
         label = "Subbed" if resolved_mode == "sub" else "Dubbed"
         return AnimeResolution(
             series_id=selected.series_id,
@@ -998,6 +1050,7 @@ class AnimeSourceAdapter:
             subtitle=f"Episode {episode} · {label}",
             poster_url=selected.poster_url,
             stream_url=stream_url,
+            http_headers=http_headers,
             available_episode_numbers=available_numbers,
         )
 

@@ -511,6 +511,40 @@ async def test_launch_starts_confirmed_locator_fullscreen_unpaused_once(
 
 
 @pytest.mark.asyncio
+async def test_launch_passes_bounded_http_headers_to_mpv(tmp_path: Path) -> None:
+    process = FakePlayerProcess(31200)
+    manager, _resolver, factory, _ipc, _signaler = _manager(
+        tmp_path,
+        videos=[],
+        processes=[process],
+        executable_resolver=lambda command: f"/usr/bin/{Path(command).name}",
+    )
+    locator = DirectStreamLocator(
+        stream_url="https://cdn.example.test/video/manifest.mpd",
+        http_headers=(
+            ("Authorization", "Bearer token-value"),
+            ("Referer", "https://www.example.test/"),
+        ),
+    )
+
+    await manager.launch(
+        session_id="voice-session-headers",
+        playback_id="pending-accepted-headers",
+        locator=locator,
+        title="Confirmed title",
+        subtitle="Confirmed subtitle",
+    )
+
+    argv, _kwargs = factory.calls[0]
+    expected_header = (
+        "--http-header-fields=Authorization: Bearer token-value,"
+        "Referer: https://www.example.test/"
+    )
+    assert expected_header in argv
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_duplicate_launch_generation_never_spawns_second_player(tmp_path: Path) -> None:
     process = FakePlayerProcess(31101)
     manager, _resolver, factory, _ipc, _signaler = _manager(

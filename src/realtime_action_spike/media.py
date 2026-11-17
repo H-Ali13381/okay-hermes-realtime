@@ -461,6 +461,7 @@ class MediaPlaybackManager:
             self._runtime_directory.chmod(0o700)
             ipc_path = self._runtime_directory / f"{playback_id}.sock"
             ipc_path.unlink(missing_ok=True)
+            http_headers = locator.http_headers if isinstance(locator, DirectStreamLocator) else ()
             argv = self._build_confirmed_mpv_argv(
                 mpv_path=mpv_path,
                 yt_dlp_path=yt_dlp_path,
@@ -468,6 +469,7 @@ class MediaPlaybackManager:
                 ipc_path=ipc_path,
                 target=target,
                 start_seconds=start_seconds,
+                http_headers=http_headers,
             )
             try:
                 process = await self._process_factory(
@@ -556,6 +558,7 @@ class MediaPlaybackManager:
         ipc_path: Path,
         target: str,
         start_seconds: float,
+        http_headers: tuple[tuple[str, str], ...] = (),
     ) -> tuple[str, ...]:
         argv = [
             mpv_path,
@@ -576,6 +579,9 @@ class MediaPlaybackManager:
                     "--ytdl-raw-options-append="
                     f"cookies-from-browser={browser_cookies}"
                 )
+        if http_headers:
+            joined = ",".join(f"{name}: {value}" for name, value in http_headers)
+            argv.append(f"--http-header-fields={joined}")
         argv.extend([f"--input-ipc-server={ipc_path}", "--", target])
         return tuple(argv)
 

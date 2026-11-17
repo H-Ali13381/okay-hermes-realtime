@@ -180,3 +180,26 @@ def test_catalog_rejects_invalid_ids_and_non_https_thumbnails() -> None:
 
     with pytest.raises(PendingMediaCatalogError):
         PendingMediaCatalog().create_or_replace("bad", _youtube_pending())
+
+
+def test_direct_stream_locator_carries_bounded_http_headers() -> None:
+    locator = DirectStreamLocator(
+        stream_url="https://cdn.example.test/video/manifest.mpd",
+        http_headers=(
+            ("Authorization", "Bearer token-value"),
+            ("Referer", "https://www.example.test/"),
+        ),
+    )
+
+    assert locator.http_headers == (
+        ("Authorization", "Bearer token-value"),
+        ("Referer", "https://www.example.test/"),
+    )
+
+
+def test_direct_stream_locator_rejects_unsafe_http_headers() -> None:
+    with pytest.raises(PendingMediaCatalogError, match="http header"):
+        DirectStreamLocator(
+            stream_url="https://cdn.example.test/video/manifest.mpd",
+            http_headers=(("Referer", "https://example.test/\r\nX-Evil: 1"),),
+        )

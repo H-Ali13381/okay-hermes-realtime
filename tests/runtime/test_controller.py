@@ -177,8 +177,9 @@ class BlockingSecondYouTubeResolver(RecordingYouTubeResolver):
 
 
 class RecordingAnimeAdapter:
-    def __init__(self) -> None:
+    def __init__(self, *, http_headers: tuple[tuple[str, str], ...] = ()) -> None:
         self.calls: list[dict[str, object]] = []
+        self.http_headers = http_headers
 
     async def resolve(self, query: str, **kwargs: object) -> AnimeResolution:
         self.calls.append({"query": query, **kwargs})
@@ -193,6 +194,7 @@ class RecordingAnimeAdapter:
             subtitle=f"Episode {episode} · {'Subbed' if resolved_mode == 'sub' else 'Dubbed'}",
             poster_url="https://cdn.xlsbox.com/poster/small/1065.jpg",
             stream_url=f"https://hls.anidb.app/stream/example/ep-{episode}.m3u8",
+            http_headers=self.http_headers,
             available_episode_numbers=(1, 2, 3, 4),
         )
 
@@ -474,6 +476,56 @@ async def test_media_prepare_publishes_card_and_accept_launches_exactly_once() -
             revision=None,
         )
     assert len(media.launch_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_anime_http_headers_reach_confirmed_playback_locator() -> None:
+    media = RecordingMediaManager()
+    anime = RecordingAnimeAdapter(
+        http_headers=(
+            ("Authorization", "Bearer token-value"),
+            ("Referer", "https://www.example.test/"),
+        )
+    )
+    controller = VoiceSessionController(
+        DeterministicLauncher(),
+        token_store=LaunchTokenStore(token_factory=SequenceFactory(["token-headers"])),
+        session_id_factory=SequenceFactory(["local-headers-01"]),
+        pending_id_factory=SequenceFactory(["pending-headers-01"]),
+        media_manager=media,  # type: ignore[arg-type]
+        anime_adapter=anime,
+    )
+    activation = await controller.activate("http://127.0.0.1:8765/voice")
+    session_id = activation.session_id
+
+    await controller.prepare_anime_media(
+        session_id=session_id,
+        query="Cowboy Bebop",
+        episode=1,
+        episode_offset=None,
+        audio_mode="sub",
+    )
+    await controller.decide_media(
+        session_id=session_id,
+        pending_id="pending-headers-01",
+        action="accept",
+        revision=None,
+    )
+    await controller.process_control_message(
+        session_id,
+        MediaReadyMessage(
+            session_id=session_id,
+            playback_id="pending-headers-01",
+            history=[],
+        ).model_dump_json(),
+    )
+
+    assert len(media.launch_calls) == 1
+    locator = media.launch_calls[0]["locator"]
+    assert locator.http_headers == (
+        ("Authorization", "Bearer token-value"),
+        ("Referer", "https://www.example.test/"),
+    )
 
 
 @pytest.mark.asyncio

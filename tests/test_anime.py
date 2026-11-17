@@ -10,9 +10,11 @@ import pytest
 from realtime_action_spike.anime import (
     AnimeAmbiguityError,
     AnimeChoice,
+    AnimeFallbackStream,
     AnimeSourceAdapter,
     AnimeSourceError,
     AnimeSourceUnavailableError,
+    AnimeStreamUnavailableError,
     CurlAnimeTransport,
     HianimeTransport,
     MissingAnimeLanguageError,
@@ -369,6 +371,70 @@ class FixtureTransport:
     async def fetch_playlist(self, url: str) -> bytes:
         self.calls.append(("playlist", url))
         return fixture("master.m3u8")
+
+
+class DeadEmbedTransport(FixtureTransport):
+    async def fetch_embed(self, url: str) -> bytes:
+        self.calls.append(("embed", url))
+        raise AnimeStreamUnavailableError("embed page had no player config")
+
+
+class RecordingFallbackResolver:
+    def __init__(self, stream: AnimeFallbackStream) -> None:
+        self.stream = stream
+        self.calls: list[tuple[str, int]] = []
+
+    async def resolve(self, title: str, episode: int) -> AnimeFallbackStream:
+        self.calls.append((title, episode))
+        return self.stream
+
+
+@pytest.mark.asyncio
+async def test_adapter_uses_fallback_stream_when_embed_is_dead() -> None:
+    fallback = RecordingFallbackResolver(
+        AnimeFallbackStream(
+            stream_url="https://cdn.example.test/video/manifest.mpd",
+            http_headers=(
+                ("Authorization", "Bearer token-value"),
+                ("Referer", "https://www.example.test/"),
+            ),
+            source="animeonsen",
+        )
+    )
+    adapter = AnimeSourceAdapter(
+        transport=DeadEmbedTransport(),
+        preference_provider=lambda: "sub",
+        fallback_resolver=fallback,  # type: ignore[arg-type]
+    )
+
+    result = await adapter.resolve("Cowboy Bebop", episode=1, audio_mode="sub")
+
+    assert result.stream_url == "https://cdn.example.test/video/manifest.mpd"
+    assert result.http_headers == (
+        ("Authorization", "Bearer token-value"),
+        ("Referer", "https://www.example.test/"),
+    )
+    assert fallback.calls == [("Cowboy Bebop", 1)]
+
+
+@pytest.mark.asyncio
+async def test_adapter_does_not_use_sub_only_fallback_for_dub() -> None:
+    fallback = RecordingFallbackResolver(
+        AnimeFallbackStream(
+            stream_url="https://cdn.example.test/video/manifest.mpd",
+            http_headers=(),
+            source="animeonsen",
+        )
+    )
+    adapter = AnimeSourceAdapter(
+        transport=DeadEmbedTransport(),
+        preference_provider=lambda: "dub",
+        fallback_resolver=fallback,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(AnimeStreamUnavailableError):
+        await adapter.resolve("Cowboy Bebop", episode=1, audio_mode="dub")
+    assert fallback.calls == []
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,7 @@ from realtime_action_spike.anime import (
     AnimeSourceAdapter,
     HianimeTransport,
 )
+from realtime_action_spike.anime_onsen import AnimeOnsenResolver
 from realtime_action_spike.capabilities import CapabilityBroker, HandoffRecord
 from realtime_action_spike.contracts import MediaRevisionArguments
 from realtime_action_spike.media import (
@@ -227,6 +228,7 @@ class VoiceSessionController:
         self._anime_adapter = anime_adapter or AnimeSourceAdapter(
             transport=HianimeTransport(),
             preference_provider=preference_store.get_audio_mode,
+            fallback_resolver=AnimeOnsenResolver(),
         )
         self._pending_media = pending_catalog or PendingMediaCatalog()
         self._pending_id_factory = pending_id_factory or (lambda: secrets.token_urlsafe(16))
@@ -444,7 +446,10 @@ class VoiceSessionController:
             title=resolved.series_title,
             subtitle=resolved.subtitle,
             thumbnail_url=resolved.poster_url,
-            playback_locator=DirectStreamLocator(stream_url=resolved.stream_url),
+            playback_locator=DirectStreamLocator(
+                stream_url=resolved.stream_url,
+                http_headers=resolved.http_headers,
+            ),
             prompt=f"Play {resolved.series_title}, {resolved.subtitle}?",
             episode=PendingEpisodeMetadata(
                 series_title=resolved.series_title,
