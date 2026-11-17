@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 from realtime_action_spike.anime import (
     AnimeChoice,
     AnimeSourceAdapter,
-    CurlAnimeTransport,
+    HianimeTransport,
 )
 from realtime_action_spike.capabilities import CapabilityBroker, HandoffRecord
 from realtime_action_spike.contracts import MediaRevisionArguments
@@ -225,7 +225,7 @@ class VoiceSessionController:
         )
         self._media_preference_store = preference_store
         self._anime_adapter = anime_adapter or AnimeSourceAdapter(
-            transport=CurlAnimeTransport(),
+            transport=HianimeTransport(),
             preference_provider=preference_store.get_audio_mode,
         )
         self._pending_media = pending_catalog or PendingMediaCatalog()

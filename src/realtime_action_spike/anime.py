@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import html as html_lib
 import json
 import re
 import unicodedata
@@ -15,7 +17,22 @@ from urllib.parse import quote_plus, urljoin, urlsplit
 _ANIDB_ORIGIN = "https://anidb.app"
 _ANIDB_HOST = urlsplit(_ANIDB_ORIGIN).hostname
 assert _ANIDB_HOST is not None
-_POSTER_HOST = "cdn.xlsbox.com"
+_HIANIME_ORIGIN = "https://hianime.fm"
+_HIANIME_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+_POSTER_PATH_PREFIXES = {
+    "cdn.xlsbox.com": "/poster/",
+    "cdn.anipixcdn.co": "/thumbnail/",
+}
+_EMBED_HOSTS = {"anidb.app", "zokoanime.video", "megaplay.buzz"}
+_EMBED_PATH_PREFIXES = {
+    "anidb.app": "/embed/",
+    "zokoanime.video": "/stream/",
+    "megaplay.buzz": "/stream/",
+}
+_STREAM_HOST_SUFFIXES = ("hls.anidb.app", "anipixcdn.co", "megaplay.buzz", "zokoanime.video")
 _STREAM_HOST = "hls.anidb.app"
 _USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64; rv:135.0) "
@@ -34,6 +51,10 @@ _MAX_VARIANTS = 20
 
 class AnimeSourceError(RuntimeError):
     """The bounded anime source could not produce a safe playable result."""
+
+
+class AnimeSourceUnavailableError(AnimeSourceError):
+    """The external anime catalog is unavailable; retrying the query will not help."""
 
 
 class AnimeAmbiguityError(AnimeSourceError):
@@ -241,12 +262,7 @@ class _SearchParser(HTMLParser):
         if not title or len(title) > 300 or _CONTROL_RE.search(title):
             return
         raw_poster = (values.get("src") or "").strip()
-        poster_url = _validate_url(
-            raw_poster,
-            hosts={_POSTER_HOST},
-            path_prefix="/poster/",
-            label="poster URL",
-        )
+        poster_url = _validate_poster_url(raw_poster)
         self.results.append(
             AnimeCandidate(
                 series_id=self.current_series_id,
@@ -307,6 +323,32 @@ def _validate_url(
     return value
 
 
+def _validate_poster_url(value: str) -> str:
+    parsed = urlsplit(value)
+    host = parsed.hostname or ""
+    prefix = _POSTER_PATH_PREFIXES.get(host)
+    if prefix is None:
+        raise AnimeSourceError("invalid poster URL")
+    return _validate_url(value, hosts={host}, path_prefix=prefix, label="poster URL")
+
+
+def _validate_embed_url(value: str) -> str:
+    parsed = urlsplit(value)
+    host = parsed.hostname or ""
+    prefix = _EMBED_PATH_PREFIXES.get(host)
+    if prefix is None:
+        raise AnimeSourceError("invalid embed URL")
+    return _validate_url(value, hosts={host}, path_prefix=prefix, label="embed URL")
+
+
+def _validate_stream_url(value: str, *, label: str = "stream URL") -> str:
+    parsed = urlsplit(value)
+    host = parsed.hostname or ""
+    if not any(host == suffix or host.endswith("." + suffix) for suffix in _STREAM_HOST_SUFFIXES):
+        raise AnimeSourceError(f"invalid {label}")
+    return _validate_url(value, hosts={host}, path_prefix="/", label=label)
+
+
 def parse_search_html(payload: bytes) -> tuple[AnimeCandidate, ...]:
     parser = _SearchParser()
     try:
@@ -317,7 +359,7 @@ def parse_search_html(payload: bytes) -> tuple[AnimeCandidate, ...]:
     except Exception as exc:
         raise AnimeSourceError("anime search response was malformed") from exc
     if not parser.results:
-        raise AnimeSourceError("anime search returned no results")
+        raise AnimeSourceUnavailableError("anime catalog returned no search results")
     unique: dict[str, AnimeCandidate] = {}
     for candidate in parser.results:
         if _SERIES_ID_RE.fullmatch(candidate.series_id):
@@ -325,7 +367,7 @@ def parse_search_html(payload: bytes) -> tuple[AnimeCandidate, ...]:
         if len(unique) >= _MAX_CANDIDATES:
             break
     if not unique:
-        raise AnimeSourceError("anime search returned no valid results")
+        raise AnimeSourceUnavailableError("anime catalog returned no valid results")
     return tuple(unique.values())
 
 
@@ -373,12 +415,7 @@ def parse_languages_json(payload: bytes) -> tuple[AnimeLanguage, ...]:
             AnimeLanguage(
                 code=code,
                 name=name.strip(),
-                embed_url=_validate_url(
-                    embed_url,
-                    hosts={"anidb.app"},
-                    path_prefix="/embed/",
-                    label="embed URL",
-                ),
+                embed_url=_validate_embed_url(embed_url),
             )
         )
     return tuple(result)
@@ -388,21 +425,11 @@ def parse_embed_html(payload: bytes) -> str:
     match = _STREAM_RE.search(_decode(payload, "embed page"))
     if match is None:
         raise AnimeSourceError("embed page did not contain a stream URL")
-    return _validate_url(
-        match.group(2),
-        hosts={_STREAM_HOST},
-        path_prefix="/stream/",
-        label="stream URL",
-    )
+    return _validate_stream_url(match.group(2))
 
 
 def parse_master_playlist(payload: bytes, master_url: str) -> tuple[HlsVariant, ...]:
-    _validate_url(
-        master_url,
-        hosts={_STREAM_HOST},
-        path_prefix="/stream/",
-        label="playlist URL",
-    )
+    _validate_stream_url(master_url, label="playlist URL")
     lines = [line.strip() for line in _decode(payload, "playlist").splitlines()]
     variants: list[HlsVariant] = []
     for index, line in enumerate(lines):
@@ -425,12 +452,7 @@ def parse_master_playlist(payload: bytes, master_url: str) -> tuple[HlsVariant, 
             raise AnimeSourceError("playlist response used a non-allowlisted URL")
         variants.append(
             HlsVariant(
-                url=_validate_url(
-                    url,
-                    hosts={_STREAM_HOST},
-                    path_prefix="/stream/",
-                    label="playlist variant URL",
-                ),
+                url=_validate_stream_url(url, label="playlist variant URL"),
                 width=int(resolution.group(1)),
                 height=int(resolution.group(2)),
                 bandwidth=int(bandwidth.group(1)),
@@ -474,6 +496,7 @@ class CurlAnimeTransport:
         timeout_seconds: float = 10.0,
         terminate_timeout_seconds: float = 1.0,
         max_output_bytes: int = 2_000_000,
+        user_agent: str = _USER_AGENT,
         process_factory: ProcessFactory = asyncio.create_subprocess_exec,
     ) -> None:
         if timeout_seconds <= 0 or terminate_timeout_seconds <= 0 or max_output_bytes < 1:
@@ -482,6 +505,7 @@ class CurlAnimeTransport:
         self._timeout_seconds = timeout_seconds
         self._terminate_timeout_seconds = terminate_timeout_seconds
         self._max_output_bytes = max_output_bytes
+        self._user_agent = user_agent
         self._process_factory = process_factory
 
     async def search(self, query: str) -> bytes:
@@ -520,7 +544,12 @@ class CurlAnimeTransport:
             )
         )
 
-    async def _get(self, url: str) -> bytes:
+    async def _get(
+        self,
+        url: str,
+        *,
+        headers: tuple[str, ...] = (),
+    ) -> bytes:
         process: _Process = await self._process_factory(
             self._curl_bin,
             "--silent",
@@ -530,7 +559,8 @@ class CurlAnimeTransport:
             "--max-filesize",
             str(self._max_output_bytes),
             "--user-agent",
-            _USER_AGENT,
+            self._user_agent,
+            *headers,
             "--",
             url,
             stdin=asyncio.subprocess.DEVNULL,
@@ -548,7 +578,7 @@ class CurlAnimeTransport:
             )
         except TimeoutError as exc:
             await self._stop_process(process)
-            raise AnimeSourceError("anime source request timed out") from exc
+            raise AnimeSourceUnavailableError("anime source request timed out") from exc
         except asyncio.CancelledError:
             await self._stop_process(process)
             raise
@@ -556,7 +586,7 @@ class CurlAnimeTransport:
             await self._stop_process(process)
             raise
         if process.returncode != 0:
-            raise AnimeSourceError("anime source request failed")
+            raise AnimeSourceUnavailableError("anime source request failed")
         return stdout
 
     @staticmethod
@@ -583,6 +613,173 @@ class CurlAnimeTransport:
             await asyncio.wait_for(process.wait(), timeout=self._terminate_timeout_seconds)
         except TimeoutError as exc:
             raise AnimeSourceError("anime resolver resisted forced termination") from exc
+
+
+_HIANIME_SEARCH_LINK_RE = re.compile(
+    r'href="https://hianime\.(?:fm|at)/([a-z0-9-]+-[1-9][0-9]*)"\s+title="([^"]+)"'
+)
+_HIANIME_SEARCH_IMG_RE = re.compile(r'<img[^>]+src="([^"]+)"[^>]+alt="([^"]+)"', re.S)
+_HIANIME_SERVER_RE = re.compile(
+    r'data-type="(sub|dub)"\s+data-server-name="([^"]+)"\s+data-hash="([^"]+)"',
+    re.S,
+)
+_EMBED_XOR_KEY = b"otaku-embed-v1"
+
+
+def parse_hianime_search_html(payload: bytes) -> tuple[AnimeCandidate, ...]:
+    """Translate current HiAnime search markup into bounded source candidates."""
+    text = _decode(payload, "anime search")
+    text = text.split('id="main-sidebar"', 1)[0]
+    result: list[AnimeCandidate] = []
+    for block in text.split('<div class="flw-item')[1:]:
+        link = _HIANIME_SEARCH_LINK_RE.search(block)
+        image = _HIANIME_SEARCH_IMG_RE.search(block)
+        if link is None or image is None:
+            continue
+        title = html_lib.unescape(link.group(2)).strip()
+        poster = html_lib.unescape(image.group(1)).strip()
+        if not title or len(title) > 300 or _CONTROL_RE.search(title):
+            continue
+        try:
+            poster_url = _validate_poster_url(poster)
+        except AnimeSourceError:
+            continue
+        result.append(AnimeCandidate(link.group(1), title, poster_url))
+        if len(result) >= _MAX_CANDIDATES:
+            break
+    if not result:
+        raise AnimeSourceUnavailableError("anime catalog returned no search results")
+    return tuple(result)
+
+
+def _deobfuscate_embed_blob(blob: str) -> dict[str, object]:
+    if not blob or len(blob) > 100_000:
+        raise AnimeSourceUnavailableError("embed page contained no usable player config")
+    try:
+        raw = base64.b64decode(blob, validate=True)
+        decoded = bytes(
+            byte ^ _EMBED_XOR_KEY[index % len(_EMBED_XOR_KEY)]
+            for index, byte in enumerate(raw)
+        )
+        payload = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise AnimeSourceUnavailableError("embed player config was malformed") from exc
+    if not isinstance(payload, dict):
+        raise AnimeSourceUnavailableError("embed player config had an invalid shape")
+    return payload
+
+
+class HianimeTransport(CurlAnimeTransport):
+    """Current ani-cli source adapter: hianime search/servers translated to the bounded contract."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(user_agent=_HIANIME_UA, timeout_seconds=15.0, **kwargs)  # type: ignore[arg-type]
+
+    async def search(self, query: str) -> bytes:
+        normalized = self._normalize_query(query)
+        page = await self._get(f"{_HIANIME_ORIGIN}/search?keyword={quote_plus(normalized)}")
+        candidates = parse_hianime_search_html(page)
+        return "".join(
+            '<a href="/anime/{series}"><img alt="{title}" src="{poster}"></a>'.format(
+                series=html_lib.escape(item.series_id, quote=True),
+                title=html_lib.escape(item.title, quote=True),
+                poster=html_lib.escape(item.poster_url or "", quote=True),
+            )
+            for item in candidates
+        ).encode("utf-8")
+
+    async def episodes(self, numeric_series_id: int) -> bytes:
+        if isinstance(numeric_series_id, bool) or numeric_series_id < 1:
+            raise AnimeSourceError("invalid anime series id")
+        payload = await self._get(f"{_HIANIME_ORIGIN}/api/theme/episode/list/{numeric_series_id}")
+        document = self._load_object(payload, "episode list")
+        page = document.get("html")
+        if not isinstance(page, str):
+            raise AnimeSourceUnavailableError("episode list was unavailable")
+        episodes: dict[int, int] = {}
+        for number, episode_id in re.findall(
+            r'data-number="([1-9][0-9]*)"\s+data-id="([1-9][0-9]*)"',
+            page,
+        ):
+            episodes[int(number)] = int(episode_id)
+            if len(episodes) >= _MAX_EPISODES:
+                break
+        if not episodes:
+            raise AnimeSourceUnavailableError("episode list was unavailable")
+        return json.dumps(
+            {
+                "episodes": [
+                    {"id": episode_id, "number": number}
+                    for number, episode_id in sorted(episodes.items())
+                ]
+            }
+        ).encode("utf-8")
+
+    async def languages(self, episode_id: int) -> bytes:
+        if isinstance(episode_id, bool) or episode_id < 1:
+            raise AnimeSourceError("invalid anime episode id")
+        payload = await self._get(
+            f"{_HIANIME_ORIGIN}/api/theme/episode/servers?episodeId={episode_id}"
+        )
+        document = self._load_object(payload, "server list")
+        page = document.get("html")
+        if not isinstance(page, str):
+            raise AnimeSourceUnavailableError("server list was unavailable")
+        languages: dict[str, dict[str, object]] = {}
+        matches = list(_HIANIME_SERVER_RE.finditer(page))
+        matches.sort(key=lambda match: 0 if match.group(2) == "HD-1" else 1)
+        for match in matches:
+            kind, server, encoded = match.groups()
+            try:
+                decoded_hash = base64.b64decode(encoded, validate=True).decode("utf-8")
+                embed_url = _validate_embed_url(decoded_hash)
+            except (ValueError, UnicodeDecodeError, AnimeSourceError):
+                continue
+            code = "jpn" if kind == "sub" else "eng"
+            if code in languages:
+                continue
+            languages[code] = {
+                "code": code,
+                "name": f"{server} {'subtitled' if kind == 'sub' else 'dubbed'}",
+                "embed_url": embed_url,
+            }
+            if len(languages) >= 2:
+                break
+        if not languages:
+            raise AnimeSourceUnavailableError("stream servers were unavailable")
+        return json.dumps({"languages": list(languages.values())}).encode("utf-8")
+
+    async def fetch_embed(self, url: str) -> bytes:
+        embed_url = _validate_embed_url(url)
+        origin = urlsplit(embed_url)
+        referer = f"{origin.scheme}://{origin.hostname}/"
+        page = await self._get(embed_url, headers=("--referer", referer))
+        match = re.search(r'window\.__P="([^"]*)"', _decode(page, "embed page"))
+        if match is None:
+            raise AnimeSourceUnavailableError("embed page had no player config")
+        config = _deobfuscate_embed_blob(match.group(1))
+        source = config.get("src")
+        if not isinstance(source, str):
+            raise AnimeSourceUnavailableError("embed player config had no stream URL")
+        stream_url = _validate_stream_url(source)
+        return f'<script>file:{json.dumps(stream_url)};</script>'.encode()
+
+    async def fetch_playlist(self, url: str) -> bytes:
+        return await self._get(url)
+
+    @staticmethod
+    def _normalize_query(query: str) -> str:
+        normalized = " ".join(query.split())
+        if not normalized or len(normalized) > 300 or _CONTROL_RE.search(normalized):
+            raise AnimeSourceError("invalid anime search query")
+        return normalized
+
+    @staticmethod
+    def _load_object(payload: bytes, label: str) -> dict[str, object]:
+        document = _load_json(payload, label)
+        if document.get("status") is not True:
+            raise AnimeSourceUnavailableError(f"{label} was unavailable")
+        return document
 
 
 class AnimeTransport(Protocol):

@@ -12,10 +12,13 @@ from realtime_action_spike.anime import (
     AnimeChoice,
     AnimeSourceAdapter,
     AnimeSourceError,
+    AnimeSourceUnavailableError,
     CurlAnimeTransport,
+    HianimeTransport,
     MissingAnimeLanguageError,
     parse_embed_html,
     parse_episode_json,
+    parse_hianime_search_html,
     parse_languages_json,
     parse_master_playlist,
     parse_search_html,
@@ -574,3 +577,38 @@ async def test_resolve_still_raises_ambiguity_for_legacy_callers() -> None:
 
     with pytest.raises(AnimeAmbiguityError):
         await adapter.resolve("cowboy", episode=1, audio_mode="auto")
+
+
+def test_hianime_search_markup_parses_current_candidates() -> None:
+    markup = b"""
+    <div class="flw-item">
+      <img src="https://cdn.anipixcdn.co/thumbnail/abc.jpg" alt="Cowboy Bebop">
+      <div class="film-detail"><h3 class="film-name">
+        <a href="https://hianime.fm/cowboy-bebop-1281" title="Cowboy Bebop">Cowboy Bebop</a>
+      </h3></div>
+    </div>
+    <div id="main-sidebar"></div>
+    <div class="flw-item">
+      <img src="https://cdn.anipixcdn.co/thumbnail/def.jpg" alt="Stale Sidebar">
+      <div class="film-detail"><h3 class="film-name">
+        <a href="https://hianime.fm/stale-sidebar-9999" title="Stale Sidebar">Stale Sidebar</a>
+      </h3></div>
+    </div>
+    """
+
+    candidates = parse_hianime_search_html(markup)
+
+    assert [(item.series_id, item.title) for item in candidates] == [
+        ("cowboy-bebop-1281", "Cowboy Bebop")
+    ]
+    assert candidates[0].poster_url == "https://cdn.anipixcdn.co/thumbnail/abc.jpg"
+
+
+def test_dead_catalog_landing_page_is_source_unavailable() -> None:
+    with pytest.raises(AnimeSourceUnavailableError):
+        parse_search_html(b"<html><title>Watch Anime Free - Anilab2</title></html>")
+
+
+def test_hianime_transport_uses_current_source_origin() -> None:
+    transport = HianimeTransport()
+    assert transport._user_agent.startswith("Mozilla/5.0 (Windows NT 10.0")

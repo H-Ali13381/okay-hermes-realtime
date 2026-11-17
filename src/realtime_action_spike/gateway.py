@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.websockets import WebSocketDisconnect
 
+from .anime import AnimeSourceUnavailableError
 from .capabilities import (
     CAPABILITIES,
     CapabilityBroker,
@@ -549,6 +550,21 @@ def create_app(
                 "ok": False,
                 "call_id": execution_request.call_id,
                 "error": {"type": "media_playback_failed", "message": str(exc)},
+            }
+        except AnimeSourceUnavailableError as exc:
+            status_code = 503
+            body = {
+                "ok": False,
+                "call_id": execution_request.call_id,
+                "error": {
+                    "type": "source_unavailable",
+                    "message": "anime catalog is temporarily unavailable",
+                    "detail": _bounded_trace_text(str(exc)),
+                },
+                "follow_up": (
+                    "Briefly tell the user the anime catalog is temporarily unavailable. "
+                    "Do not retry this source and do not rewrite the title."
+                ),
             }
         except (ValueError, RuntimeError) as exc:
             status_code = 400
