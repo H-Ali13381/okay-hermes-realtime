@@ -305,7 +305,12 @@ class MediaConfirmationMessage(_StrictBaseModel):
         parsed = urlsplit(value)
         if (
             parsed.scheme != "https"
-            or parsed.hostname not in {"i.ytimg.com", "img.youtube.com", "cdn.xlsbox.com"}
+            or parsed.hostname not in {
+                "i.ytimg.com",
+                "img.youtube.com",
+                "cdn.xlsbox.com",
+                "cdn.anipixcdn.co",
+            }
             or parsed.username is not None
             or parsed.password is not None
             or parsed.port not in {None, 443}

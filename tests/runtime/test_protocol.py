@@ -860,6 +860,48 @@ def test_media_messages_round_trip_and_parse_with_session_guard(message: Loopbac
     assert parsed == message
 
 
+def test_all_catalog_poster_hosts_are_protocol_allowlisted() -> None:
+    from realtime_action_spike.anime import _POSTER_PATH_PREFIXES
+
+    for host in _POSTER_PATH_PREFIXES:
+        payload = {
+            "type": "media_confirmation",
+            "session_id": "local-session-01",
+            "pending_id": "pending_abc12345",
+            "source": "anime",
+            "title": "Cowboy Bebop",
+            "subtitle": "Episode 1 · Subbed",
+            "thumbnail_url": f"https://{host}/poster/small/1065.jpg",
+            "prompt": "Play this episode?",
+            "episode": {"series_title": "Cowboy Bebop", "episode_number": 1},
+            "audio_mode": "sub",
+            "resume": None,
+        }
+        parsed = parse_loopback_message(payload, expected_session_id="local-session-01")
+        assert isinstance(parsed, MediaConfirmationMessage)
+
+
+def test_media_confirmation_accepts_hianime_poster_host() -> None:
+    payload = {
+        "type": "media_confirmation",
+        "session_id": "local-session-01",
+        "pending_id": "pending_abc12345",
+        "source": "anime",
+        "title": "Cowboy Bebop",
+        "subtitle": "Episode 1 · Subbed",
+        "thumbnail_url": "https://cdn.anipixcdn.co/thumbnail/1782735600/1065.jpg",
+        "prompt": "Play this episode?",
+        "episode": {"series_title": "Cowboy Bebop", "episode_number": 1},
+        "audio_mode": "sub",
+        "resume": None,
+    }
+
+    parsed = parse_loopback_message(payload, expected_session_id="local-session-01")
+
+    assert isinstance(parsed, MediaConfirmationMessage)
+    assert parsed.thumbnail_url == "https://cdn.anipixcdn.co/thumbnail/1782735600/1065.jpg"
+
+
 def test_media_confirmation_rejects_private_locator_and_unsafe_thumbnail() -> None:
     payload = {
         "type": "media_confirmation",
