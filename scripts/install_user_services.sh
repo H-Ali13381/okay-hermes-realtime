@@ -35,6 +35,10 @@ skip_native=0
 skip_systemctl=0
 uninstall=0
 rollback_only=0
+runtime_mpv_bin="${MPV_BIN:-mpv}"
+runtime_yt_dlp_bin="${YT_DLP_BIN:-yt-dlp}"
+resolved_mpv_bin=""
+resolved_yt_dlp_bin=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -177,6 +181,27 @@ cleanup() {
 }
 trap cleanup EXIT
 
+resolve_runtime_command() {
+  local configured="$1"
+  local display_name="$2"
+  local resolved=""
+  if [[ "$configured" == */* ]]; then
+    resolved="$(realpath "$configured" 2>/dev/null || true)"
+    if [[ -z "$resolved" || ! -x "$resolved" ]]; then
+      echo "$display_name is required for YouTube playback: not executable: $configured" >&2
+      return 2
+    fi
+    printf '%s\n' "$resolved"
+    return 0
+  fi
+  resolved="$(type -P "$configured" || true)"
+  if [[ -z "$resolved" ]]; then
+    echo "$display_name is required for YouTube playback: command not found: $configured" >&2
+    return 2
+  fi
+  printf '%s\n' "$resolved"
+}
+
 require_file_absent() {
   local target="$1"
   if [[ -e "$target" && "$force" -ne 1 ]]; then
@@ -224,8 +249,19 @@ install_units() {
 }
 
 install_config() {
+  local rendered_config
+  local line
   chmod 0700 "$config_dir"
-  install -m 0600 "$repo_dir/config.example.env" "$config_file"
+  rendered_config="$(mktemp)"
+  temp_dirs+=("$rendered_config")
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      MPV_BIN=*) printf 'MPV_BIN=%s\n' "$resolved_mpv_bin" ;;
+      YT_DLP_BIN=*) printf 'YT_DLP_BIN=%s\n' "$resolved_yt_dlp_bin" ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < "$repo_dir/config.example.env" > "$rendered_config"
+  install -m 0600 "$rendered_config" "$config_file"
   mark_installed "$config_file"
 }
 
@@ -398,6 +434,9 @@ if (( uninstall == 1 )); then
   installing=0
   exit 0
 fi
+
+resolved_mpv_bin="$(resolve_runtime_command "$runtime_mpv_bin" "mpv")"
+resolved_yt_dlp_bin="$(resolve_runtime_command "$runtime_yt_dlp_bin" "yt-dlp")"
 
 for target in "${requirements[@]}"; do
   require_file_absent "$target"

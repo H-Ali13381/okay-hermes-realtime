@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -44,6 +45,22 @@ def test_voice_route_serves_visible_html() -> None:
     assert response.text.startswith("<!doctype html>")
     assert "Start conversation" in response.text
     assert "data-testid" not in response.text
+
+
+def test_media_confirmation_is_inline_voice_first_and_not_yes_no_buttons() -> None:
+    index_html = _read(INDEX_PATH)
+    source_js = _read(PROJECT_ROOT / "frontend" / "voice.js")
+
+    assert 'id="media-confirmation"' in index_html
+    assert 'aria-live="polite"' in index_html
+    assert "Respond naturally" in index_html
+    assert ">Yes<" not in index_html
+    assert ">No<" not in index_html
+    assert 'event.type === "media_confirmation"' in source_js
+    assert "MediaConfirmationState" in source_js
+    assert "mediaTitle.textContent" in source_js
+    assert "mediaPrompt.textContent" in source_js
+    assert "mediaConfirmation.innerHTML" not in source_js
 
 
 def test_assets_routes_serve_voice_css_and_js() -> None:
@@ -107,7 +124,7 @@ def test_js_uses_direct_realtime_webrtc_transport_and_scoped_tools() -> None:
     script = _read(JS_PATH)
     start_block = _extract_block(
         script,
-        "async function startConversation() {",
+        "async function startConversation(options = {}) {",
         "function stopConversation(options = {}) {",
     )
 
@@ -126,6 +143,18 @@ def test_js_uses_direct_realtime_webrtc_transport_and_scoped_tools() -> None:
     assert "executeFunctionCall" in script
     assert "OpenAIRealtimeWebRTC" not in script
     assert 'fetch("/client-secret"' not in script
+
+
+def test_end_session_update_preserves_required_realtime_session_type() -> None:
+    source = _read(SOURCE_JS_PATH)
+    end_session_block = _extract_block(
+        source,
+        "if (output.ok && output.result?.end_session) {",
+        "return output;",
+    )
+
+    assert 'type: "session.update"' in end_session_block
+    assert re.search(r'session:\s*\{\s*type:\s*"realtime",', end_session_block)
 
 
 def test_task_events_use_manual_non_interrupting_realtime_turns() -> None:
@@ -280,7 +309,7 @@ def test_page_errors_are_reported_to_the_controller_trace() -> None:
     # not only to the on-page error banner.
     start_catch = _extract_block(
         script,
-        "async function startConversation() {",
+        "async function startConversation(options = {}) {",
         None,
     ).split("} catch (error) {", maxsplit=1)[1]
     assert "reportPageError" in start_catch.split("stopConversation", maxsplit=1)[0]
@@ -387,7 +416,7 @@ def test_activation_mode_uses_same_origin_control_websocket_and_auto_start() -> 
     html = _read(INDEX_PATH)
     start_block = _extract_block(
         script,
-        "async function startConversation() {",
+        "async function startConversation(options = {}) {",
         "function stopConversation(options = {}) {",
     )
 

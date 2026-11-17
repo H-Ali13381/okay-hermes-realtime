@@ -148,6 +148,9 @@ def test_built_wheel_contains_runtime_package_web_assets_and_entrypoints(tmp_pat
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
         assert "realtime_action_spike/service.py" in names
+        assert "realtime_action_spike/contracts.py" in names
+        assert "realtime_action_spike/media.py" in names
+        assert "realtime_action_spike/media_image_hosts.json" in names
         assert "realtime_action_spike/web/voice.js" in names
         entrypoints = archive.read(
             "openai_realtime_action_spike-0.1.0.dist-info/entry_points.txt"
@@ -165,6 +168,10 @@ def test_config_example_has_replacement_defaults_and_no_ohv_paths():
     assert "WAKEWORD_THRESHOLD=0.6973556280136108" in lines
     assert "WAKEWORD_CONSECUTIVE_WINDOWS=2" in lines
     assert "WAKEWORD_INFERENCE_INTERVAL_MS=250" in lines
+    assert "MPV_BIN=mpv" in lines
+    assert "YT_DLP_BIN=yt-dlp" in lines
+    assert "YOUTUBE_RESOLVE_TIMEOUT_SECONDS=12.0" in lines
+    assert "YOUTUBE_BROWSER_COOKIES=" in lines
 
     assert "~/.hermes" not in lines
     assert "okay-hermes-voice" not in lines
@@ -201,6 +208,8 @@ def _run_installer(
         "systemctl",
         "printf '%s\\n' \"$*\" >>\"$HOME/systemctl.log\"",
     )
+    _make_fake_command(bin_dir, "mpv", "exit 0")
+    _make_fake_command(bin_dir, "yt-dlp", "exit 0")
 
     command_env["PATH"] = f"{bin_dir}:{command_env['PATH']}"
 
@@ -215,6 +224,26 @@ def _run_installer(
         cwd=str(REPO_ROOT),
         env=command_env,
     )
+
+
+def test_installer_fails_before_writes_when_media_prerequisite_is_missing(tmp_path):
+    prefix = tmp_path / "home"
+    model = tmp_path / "model.onnx"
+    model.write_text("dummy model")
+
+    result = _run_installer(
+        prefix,
+        "--model",
+        str(model),
+        "--skip-systemctl",
+        "--skip-native",
+        "--skip-venv",
+        env={"MPV_BIN": "/definitely/missing/mpv"},
+    )
+
+    assert result.returncode == 2
+    assert "mpv is required for YouTube playback" in result.stderr
+    assert not (prefix / ".config/okay-hermes-realtime/config.env").exists()
 
 
 def test_installer_detects_collisions_without_touching_unrelated_services(
@@ -285,6 +314,9 @@ def test_installer_install_and_uninstall_isolated_prefix(tmp_path):
     assert config_path.is_file()
     assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(config_path.parent.stat().st_mode) == 0o700
+    installed_config = config_path.read_text()
+    assert f"MPV_BIN={prefix / 'fake-bin/mpv'}" in installed_config
+    assert f"YT_DLP_BIN={prefix / 'fake-bin/yt-dlp'}" in installed_config
     assert controller_unit.is_file()
     assert wakeword_unit.is_file()
     assert listener_installed.is_file()

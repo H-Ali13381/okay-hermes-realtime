@@ -4,6 +4,8 @@ import asyncio
 import json
 import socket
 import stat
+import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -24,6 +26,16 @@ ACTIVATION = {
     "detected_at": 12.5,
     "native_listener": True,
 }
+
+
+@pytest.fixture
+def socket_dir(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    # Do not bind in pytest's potentially long basetemp or the live runtime directory.
+    with tempfile.TemporaryDirectory(prefix="act-") as directory:
+        root = Path(directory)
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(root))
+        monkeypatch.setenv("ACTIVATION_SOCKET_PATH", str(root / "runtime" / "activation.sock"))
+        yield root
 
 
 class FakeController:
@@ -64,8 +76,8 @@ async def _read_json_line(reader: asyncio.StreamReader) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
-async def test_valid_handoff_blocks_until_exact_session_closes(tmp_path: Path) -> None:
-    path = tmp_path / "runtime" / "activation.sock"
+async def test_valid_handoff_blocks_until_exact_session_closes(socket_dir: Path) -> None:
+    path = socket_dir / "runtime" / "activation.sock"
     controller = FakeController(
         ActivationResult(status="opened", session_id="local-session-01", token="launch-token")
     )
@@ -95,8 +107,8 @@ async def test_valid_handoff_blocks_until_exact_session_closes(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_cancelled_terminal_result_is_reported_distinctly(tmp_path: Path) -> None:
-    path = tmp_path / "runtime" / "activation.sock"
+async def test_cancelled_terminal_result_is_reported_distinctly(socket_dir: Path) -> None:
+    path = socket_dir / "runtime" / "activation.sock"
     controller = FakeController(
         ActivationResult(status="opened", session_id="local-session-03", token="launch-token")
     )
@@ -124,8 +136,8 @@ async def test_cancelled_terminal_result_is_reported_distinctly(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_busy_and_malformed_requests_return_bounded_responses(tmp_path: Path) -> None:
-    path = tmp_path / "runtime" / "activation.sock"
+async def test_busy_and_malformed_requests_return_bounded_responses(socket_dir: Path) -> None:
+    path = socket_dir / "runtime" / "activation.sock"
     controller = FakeController(ActivationResult(status="busy"))
     server = ActivationSocket(controller, "http://127.0.0.1:8765/voice", str(path))  # type: ignore[arg-type]
     await server.start()
@@ -157,8 +169,8 @@ async def test_busy_and_malformed_requests_return_bounded_responses(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_socket_and_parent_are_owner_only_and_removed_on_stop(tmp_path: Path) -> None:
-    path = tmp_path / "runtime" / "activation.sock"
+async def test_socket_and_parent_are_owner_only_and_removed_on_stop(socket_dir: Path) -> None:
+    path = socket_dir / "runtime" / "activation.sock"
     controller = FakeController(ActivationResult(status="busy"))
     server = ActivationSocket(controller, "http://127.0.0.1:8765/voice", str(path))  # type: ignore[arg-type]
 
@@ -171,8 +183,8 @@ async def test_socket_and_parent_are_owner_only_and_removed_on_stop(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_stale_socket_is_recovered_but_healthy_socket_is_refused(tmp_path: Path) -> None:
-    path = tmp_path / "runtime" / "activation.sock"
+async def test_stale_socket_is_recovered_but_healthy_socket_is_refused(socket_dir: Path) -> None:
+    path = socket_dir / "runtime" / "activation.sock"
     path.parent.mkdir()
 
     stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -198,8 +210,8 @@ async def test_stale_socket_is_recovered_but_healthy_socket_is_refused(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_non_socket_path_is_never_removed(tmp_path: Path) -> None:
-    path = tmp_path / "runtime" / "activation.sock"
+async def test_non_socket_path_is_never_removed(socket_dir: Path) -> None:
+    path = socket_dir / "runtime" / "activation.sock"
     path.parent.mkdir()
     path.write_text("do not delete", encoding="utf-8")
     server = ActivationSocket(
@@ -214,8 +226,8 @@ async def test_non_socket_path_is_never_removed(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_client_disconnect_does_not_cancel_terminal_future(tmp_path: Path) -> None:
-    path = tmp_path / "runtime" / "activation.sock"
+async def test_client_disconnect_does_not_cancel_terminal_future(socket_dir: Path) -> None:
+    path = socket_dir / "runtime" / "activation.sock"
     controller = FakeController(
         ActivationResult(status="opened", session_id="local-session-02", token="launch-token")
     )

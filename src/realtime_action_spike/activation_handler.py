@@ -132,8 +132,14 @@ def _decode_response(raw: str) -> dict[str, object]:
 
 
 def _sanitize_error(error: object) -> str:
-    if not isinstance(error, str) or not error:
-        return "activation failed"
+    # Only exact reason codes are public; free-form diagnostics may contain secrets.
+    if isinstance(error, str) and error in {
+        "transport_failure",
+        "session_closed",
+        "socket_unavailable",
+        "invalid_response",
+    }:
+        return error
     return "activation failed"
 
 

@@ -8,7 +8,8 @@ Required:
 
 - user systemd;
 - PipeWire and WirePlumber;
-- Brave Origin Nightly actual executable at `/opt/brave.com/brave-origin-nightly/brave` (or set `BRAVE_BIN` to another real Chromium executable, not a retained shell wrapper);
+- Brave Origin available as the stable `brave-origin` command (or set `BRAVE_BIN` to another trusted Chromium executable);
+- `mpv` and `yt-dlp` on PATH, or trusted executable paths configured through `MPV_BIN` and `YT_DLP_BIN`;
 - CMake, Ninja, a C compiler, Qt 6 Widgets/DBus, and PulseAudioQt for the tray;
 - `uv` or Python 3 for the isolated venv;
 - a wakeword ONNX model;
@@ -80,7 +81,7 @@ Set at least:
 
 ```dotenv
 OPENAI_API_KEY=...
-BRAVE_BIN=/opt/brave.com/brave-origin-nightly/brave
+BRAVE_BIN=brave-origin
 ```
 
 Keep these replacement defaults unless intentionally relocating the install:
@@ -88,6 +89,9 @@ Keep these replacement defaults unless intentionally relocating the install:
 ```dotenv
 VOICE_BROWSER_PROFILE=~/.local/share/okay-hermes-realtime/brave-profile
 VOICE_PAGE_URL=http://127.0.0.1:8765/voice
+MPV_BIN=mpv
+YT_DLP_BIN=yt-dlp
+YOUTUBE_RESOLVE_TIMEOUT_SECONDS=12.0
 WAKEWORD_MODEL_PATH=~/.local/share/okay-hermes-realtime/models/okay-hermes-realtime-wakeword.onnx
 ```
 
@@ -136,9 +140,10 @@ Do not grant permission in or point the replacement at a personal Brave profile.
 5. Speak and hear one response.
 6. Interrupt an audible response and confirm playback stops promptly while the microphone session remains active.
 7. Exercise “What time is it?” and “End this conversation.”
-8. Start another session to prove wake rearm and stale-session rejection.
-9. With the voice page live, use tray **Turn OFF**.
-10. Verify clean shutdown:
+8. Start a new session and ask for a specific YouTube video by spoken title. Confirm the small `mpv` popup appears paused, the assistant names the selected video, Brave closes, and only then playback starts.
+9. Close the player, then start another session to prove wake rearm and stale-session rejection.
+10. With the voice page live, use tray **Turn OFF**.
+11. Verify clean shutdown:
 
 ```bash
 systemctl --user show okay-hermes-realtime-controller.service -p Result
@@ -191,7 +196,7 @@ CONTROLLER=$(systemctl --user show okay-hermes-realtime-controller.service -p Ma
 LISTENER=$(systemctl --user show okay-hermes-realtime-wakeword.service -p MainPID --value)
 TRAY=$(pgrep -n -f '/okay-hermes-realtime-tray$')
 BRAVE=$(ps -eo pid=,args= | \
-  grep '/opt/brave.com/brave-origin-nightly/brave --user-data-dir=.*/okay-hermes-realtime/brave-profile' | \
+  grep '/brave-origin .*--user-data-dir=.*/okay-hermes-realtime/brave-profile' | \
   grep -v -- '--type=' | awk 'NR == 1 {print $1}')
 
 uv run python scripts/measure_runtime.py \

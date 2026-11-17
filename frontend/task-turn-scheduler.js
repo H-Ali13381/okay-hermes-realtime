@@ -24,9 +24,10 @@ function buildTaskInstructions(events) {
 }
 
 export class TaskTurnScheduler {
-  constructor({ sendEvent, isReady }) {
+  constructor({ sendEvent, isReady, responseInstructions = () => null }) {
     this.sendEvent = sendEvent;
     this.isReady = isReady;
+    this.responseInstructions = responseInstructions;
     this.reset();
   }
 
@@ -37,8 +38,18 @@ export class TaskTurnScheduler {
     this.assistantResponding = false;
     this.responseCreatePending = false;
     this.responseRequested = false;
+    this.userAudioTurnCommitted = false;
+    this.pendingToolExecutions = new Set();
     this.pendingEvents = new Map();
     this.inFlightEvents = new Map();
+  }
+
+  onToolExecutionStarted(callId) {
+    this.pendingToolExecutions.add(callId);
+  }
+
+  onToolExecutionFinished(callId) {
+    this.pendingToolExecutions.delete(callId);
   }
 
   onChannelReady() {
@@ -66,6 +77,7 @@ export class TaskTurnScheduler {
   onAudioCommitted() {
     this.audioCommittedSinceSpeechStarted = true;
     this.awaitingCommit = false;
+    this.userAudioTurnCommitted = true;
     this.requestResponse();
   }
 
@@ -107,6 +119,7 @@ export class TaskTurnScheduler {
       || this.awaitingCommit
       || this.assistantResponding
       || this.responseCreatePending
+      || this.pendingToolExecutions.size > 0
       || !this.isReady()
     ) {
       return false;
@@ -116,14 +129,14 @@ export class TaskTurnScheduler {
     this.pendingEvents.clear();
     this.responseRequested = false;
     this.responseCreatePending = true;
+    const useUserTurnInstructions = this.userAudioTurnCommitted;
+    this.userAudioTurnCommitted = false;
 
-    const event = this.inFlightEvents.size > 0
-      ? {
-          type: "response.create",
-          response: {
-            instructions: buildTaskInstructions([...this.inFlightEvents.values()]),
-          },
-        }
+    const instructions = this.inFlightEvents.size > 0
+      ? buildTaskInstructions([...this.inFlightEvents.values()])
+      : useUserTurnInstructions ? this.responseInstructions() : null;
+    const event = typeof instructions === "string" && instructions.length > 0
+      ? { type: "response.create", response: { instructions } }
       : { type: "response.create" };
 
     try {
@@ -136,6 +149,7 @@ export class TaskTurnScheduler {
       this.inFlightEvents.clear();
       this.responseRequested = true;
       this.responseCreatePending = false;
+      this.userAudioTurnCommitted = useUserTurnInstructions;
       return false;
     }
   }

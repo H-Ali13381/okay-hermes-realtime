@@ -14,8 +14,16 @@ from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import Field, ValidationError, field_validator
 
+from .contracts import (
+    MediaChooseArguments,
+    MediaDecisionArguments,
+    MediaPrepareAnimeArguments,
+    MediaPrepareCrunchyrollArguments,
+    MediaPrepareYouTubeArguments,
+    StrictArguments,
+)
 from .routing import find_routing_wrappers
 
 JsonObject = dict[str, Any]
@@ -28,10 +36,6 @@ class ExecutionContractError(ValueError):
 
 class UnknownCapabilityError(ExecutionContractError):
     """The model requested a capability that was not exposed."""
-
-
-class StrictArguments(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
 
 class CurrentTimeArguments(StrictArguments):
@@ -73,8 +77,7 @@ class TaskStatusArguments(StrictArguments):
         default=None,
         max_length=64,
         description=(
-            "Kanban task id from a previous handoff result. "
-            "Omit to check the most recent handoff."
+            "Kanban task id from a previous handoff result. Omit to check the most recent handoff."
         ),
     )
 
@@ -204,9 +207,7 @@ def _run_hermes(cmd: list[str], timeout: float, failure: str) -> str:
     output = (completed.stdout or "").strip()
     if completed.returncode != 0:
         error = (
-            completed.stderr
-            or output
-            or f"{failure} exited with status {completed.returncode}"
+            completed.stderr or output or f"{failure} exited with status {completed.returncode}"
         ).strip()
         raise ExecutionContractError(error[-1_000:])
     return output
@@ -237,20 +238,22 @@ def _create_kanban_handoff(
     cmd = [hermes_bin, "kanban"]
     if board is not None:
         cmd.extend(["--board", board[0]])
-    cmd.extend([
-        "create",
-        title,
-        "--body",
-        body,
-        "--assignee",
-        os.getenv("HERMES_KANBAN_HEAVY_ASSIGNEE", "default"),
-        "--created-by",
-        "okay-hermes-realtime",
-        "--max-runtime",
-        os.getenv("HERMES_KANBAN_HEAVY_MAX_RUNTIME", "30m"),
-        "--goal",
-        "--json",
-    ])
+    cmd.extend(
+        [
+            "create",
+            title,
+            "--body",
+            body,
+            "--assignee",
+            os.getenv("HERMES_KANBAN_HEAVY_ASSIGNEE", "default"),
+            "--created-by",
+            "okay-hermes-realtime",
+            "--max-runtime",
+            os.getenv("HERMES_KANBAN_HEAVY_MAX_RUNTIME", "30m"),
+            "--goal",
+            "--json",
+        ]
+    )
     provider = os.getenv("HERMES_KANBAN_HEAVY_PROVIDER", "").strip()
     model = os.getenv("HERMES_KANBAN_HEAVY_MODEL", "").strip()
     if model:
@@ -405,6 +408,15 @@ def _permission_resolution_requires_live_session(
     )
 
 
+def _media_action_requires_live_session(
+    _arguments: StrictArguments,
+    _now_provider: NowProvider,
+) -> JsonObject:
+    raise ExecutionContractError(
+        "media preparation and decisions require the originating live voice session"
+    )
+
+
 CAPABILITIES: tuple[CapabilityDefinition, ...] = (
     CapabilityDefinition(
         name="assistant_get_current_time",
@@ -461,6 +473,64 @@ CAPABILITIES: tuple[CapabilityDefinition, ...] = (
         execution="kanban",
         handler=_permission_resolution_requires_live_session,
     ),
+    CapabilityDefinition(
+        name="media_prepare_youtube",
+        description=(
+            "Prepare one YouTube confirmation proposal from the user's spoken title, channel, "
+            "recency, topic words, or exact YouTube URL. Do not ask the user to dictate a URL. "
+            'After preparation, interpret conversational replies such as "yep, that\'s it" '
+            "through media_decide. Requires the originating live session."
+        ),
+        arguments_model=MediaPrepareYouTubeArguments,
+        execution="local",
+        handler=_media_action_requires_live_session,
+    ),
+    CapabilityDefinition(
+        name="media_prepare_anime",
+        description=(
+            "Prepare one anime episode confirmation proposal. Interpret spoken episode and "
+            "audio details, including compound corrections such as next episode, but do not "
+            "launch playback. Requires the originating live session."
+        ),
+        arguments_model=MediaPrepareAnimeArguments,
+        execution="local",
+        handler=_media_action_requires_live_session,
+    ),
+    CapabilityDefinition(
+        name="media_choose",
+        description=(
+            "Select one displayed anime choice by its displayed number after media_prepare_anime "
+            "returned awaiting_choice. Use only a number that was displayed to the user. Requires "
+            "the originating live session."
+        ),
+        arguments_model=MediaChooseArguments,
+        execution="local",
+        handler=_media_action_requires_live_session,
+    ),
+    CapabilityDefinition(
+        name="media_prepare_crunchyroll",
+        description=(
+            "Use only when the user explicitly asks for Crunchyroll. Open the official "
+            "Crunchyroll login setup in a dedicated Brave profile while preserving the original "
+            "request details for later integration. This does not claim playback or title "
+            "resolution. Requires the originating live session."
+        ),
+        arguments_model=MediaPrepareCrunchyrollArguments,
+        execution="local",
+        handler=_media_action_requires_live_session,
+    ),
+    CapabilityDefinition(
+        name="media_decide",
+        description=(
+            "Turn the user's natural conversational replies into one strict action for the exact "
+            'pending proposal: accept, reject, cancel, or revise. For example, "no, play the '
+            'next episode" is one revise action with an episode_offset revision. Requires the '
+            "originating live session."
+        ),
+        arguments_model=MediaDecisionArguments,
+        execution="local",
+        handler=_media_action_requires_live_session,
+    ),
 )
 
 _CAPABILITIES_BY_NAME = {capability.name: capability for capability in CAPABILITIES}
@@ -514,6 +584,60 @@ def parse_permission_resolution_arguments(
         return PermissionResolutionArguments.model_validate(parsed)
     except ValidationError as exc:
         raise ExecutionContractError(_format_validation_error(exc)) from exc
+
+
+ArgumentsModel = type[StrictArguments]
+
+
+def _parse_typed_arguments(
+    arguments: str | Mapping[str, Any],
+    model: ArgumentsModel,
+) -> StrictArguments:
+    parsed = _parse_arguments(arguments)
+    try:
+        return model.model_validate(parsed)
+    except ValidationError as exc:
+        raise ExecutionContractError(_format_validation_error(exc)) from exc
+
+
+def parse_media_prepare_youtube_arguments(
+    arguments: str | Mapping[str, Any],
+) -> MediaPrepareYouTubeArguments:
+    parsed = _parse_typed_arguments(arguments, MediaPrepareYouTubeArguments)
+    assert isinstance(parsed, MediaPrepareYouTubeArguments)
+    return parsed
+
+
+def parse_media_prepare_anime_arguments(
+    arguments: str | Mapping[str, Any],
+) -> MediaPrepareAnimeArguments:
+    parsed = _parse_typed_arguments(arguments, MediaPrepareAnimeArguments)
+    assert isinstance(parsed, MediaPrepareAnimeArguments)
+    return parsed
+
+
+def parse_media_choose_arguments(
+    arguments: str | Mapping[str, Any],
+) -> MediaChooseArguments:
+    parsed = _parse_typed_arguments(arguments, MediaChooseArguments)
+    assert isinstance(parsed, MediaChooseArguments)
+    return parsed
+
+
+def parse_media_prepare_crunchyroll_arguments(
+    arguments: str | Mapping[str, Any],
+) -> MediaPrepareCrunchyrollArguments:
+    parsed = _parse_typed_arguments(arguments, MediaPrepareCrunchyrollArguments)
+    assert isinstance(parsed, MediaPrepareCrunchyrollArguments)
+    return parsed
+
+
+def parse_media_decision_arguments(
+    arguments: str | Mapping[str, Any],
+) -> MediaDecisionArguments:
+    parsed = _parse_typed_arguments(arguments, MediaDecisionArguments)
+    assert isinstance(parsed, MediaDecisionArguments)
+    return parsed
 
 
 class CapabilityBroker:

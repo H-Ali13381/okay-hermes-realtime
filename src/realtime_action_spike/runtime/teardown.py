@@ -34,6 +34,11 @@ async def _noop_release_profile_lock() -> None:
     return None
 
 
+async def _noop_finalize_media(_request: TeardownRequest) -> None:
+    """Default media finalizer for controllers without prepared playback."""
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class TeardownHooks:
     mark_stopping: Callable[[TeardownRequest], Awaitable[None]]
@@ -44,6 +49,7 @@ class TeardownHooks:
         [TeardownRequest, tuple[TeardownStepFailure, ...]],
         Awaitable[None],
     ]
+    finalize_media: Callable[[TeardownRequest], Awaitable[None]] = _noop_finalize_media
     release_profile_lock: Callable[[], Awaitable[None]] = _noop_release_profile_lock
 
 
@@ -96,6 +102,7 @@ class TeardownCoordinator:
     async def _run(self, request: TeardownRequest) -> TeardownReport:
         failures: list[TeardownStepFailure] = []
         browser_acknowledged = False
+        media_finalized = False
         finalization_task: asyncio.Task[bool] | None = None
 
         try:
@@ -131,6 +138,18 @@ class TeardownCoordinator:
                 lambda: self._hooks.persist_trace(tuple(failures)),
                 failures,
             )
+            media_request = request
+            if any(failure.step == "close_browser" for failure in failures):
+                media_request = TeardownRequest(
+                    outcome=SessionOutcome.CANCELLED,
+                    reason=StopReason.NATIVE_CANCEL,
+                    error=request.error,
+                )
+            media_finalized = await self._run_step(
+                "finalize_media",
+                lambda: self._hooks.finalize_media(media_request),
+                failures,
+            )
             finalization_task = asyncio.create_task(
                 self._run_step(
                     "finalize",
@@ -141,6 +160,20 @@ class TeardownCoordinator:
             await asyncio.shield(finalization_task)
         except asyncio.CancelledError:
             failures.append(TeardownStepFailure(step="teardown_cancelled", kind="error"))
+            if not media_finalized:
+                cancelled_media_request = TeardownRequest(
+                    outcome=SessionOutcome.CANCELLED,
+                    reason=StopReason.NATIVE_CANCEL,
+                    error=request.error,
+                )
+                media_finalization_task = asyncio.create_task(
+                    self._run_step(
+                        "finalize_media",
+                        lambda: self._hooks.finalize_media(cancelled_media_request),
+                        failures,
+                    )
+                )
+                await asyncio.shield(media_finalization_task)
             if finalization_task is None:
                 finalization_task = asyncio.create_task(
                     self._run_step(

@@ -23,12 +23,20 @@ class FakeController:
     def __init__(self) -> None:
         self.close_calls = 0
         self.task_event_shutdown_calls = 0
+        self.media_shutdown_calls = 0
+        self.crunchyroll_shutdown_calls = 0
 
     async def close_active_session(self) -> None:
         self.close_calls += 1
 
     async def shutdown_task_events(self) -> None:
         self.task_event_shutdown_calls += 1
+
+    async def shutdown_media(self) -> None:
+        self.media_shutdown_calls += 1
+
+    async def shutdown_crunchyroll(self) -> None:
+        self.crunchyroll_shutdown_calls += 1
 
 
 class FakeSocket:
@@ -137,6 +145,8 @@ async def test_readiness_waits_for_socket_and_http_then_shutdown_is_coordinated(
     assert harness.socket.stop_calls == 1
     assert harness.controller.close_calls == 1
     assert harness.controller.task_event_shutdown_calls == 1
+    assert harness.controller.media_shutdown_calls == 1
+    assert harness.controller.crunchyroll_shutdown_calls == 1
 
 
 @pytest.mark.asyncio
@@ -144,12 +154,22 @@ async def test_shutdown_closes_active_session_before_http_and_activation_socket(
     harness = _harness()
     events: list[str] = []
     original_controller_close = harness.controller.close_active_session
+    original_crunchyroll_shutdown = harness.controller.shutdown_crunchyroll
+    original_media_shutdown = harness.controller.shutdown_media
     original_http_shutdown = harness.http.shutdown
     original_socket_stop = harness.socket.stop
 
     async def close_active_session() -> None:
         events.append("controller_close")
         await original_controller_close()
+
+    async def shutdown_crunchyroll() -> None:
+        events.append("crunchyroll_shutdown")
+        await original_crunchyroll_shutdown()
+
+    async def shutdown_media() -> None:
+        events.append("media_shutdown")
+        await original_media_shutdown()
 
     async def shutdown_http() -> None:
         events.append("http_shutdown")
@@ -160,6 +180,8 @@ async def test_shutdown_closes_active_session_before_http_and_activation_socket(
         await original_socket_stop()
 
     harness.controller.close_active_session = close_active_session
+    harness.controller.shutdown_crunchyroll = shutdown_crunchyroll
+    harness.controller.shutdown_media = shutdown_media
     harness.http.shutdown = shutdown_http
     harness.socket.stop = stop_socket
 
@@ -171,11 +193,44 @@ async def test_shutdown_closes_active_session_before_http_and_activation_socket(
     harness.service.request_shutdown()
     await asyncio.wait_for(run_task, timeout=1.0)
 
-    assert events == ["controller_close", "http_shutdown", "socket_stop"]
+    assert events == [
+        "controller_close",
+        "crunchyroll_shutdown",
+        "media_shutdown",
+        "http_shutdown",
+        "socket_stop",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_controller_health_marker_tracks_service_readiness_and_shutdown(
+async def test_media_cleanup_failure_is_reported_after_other_shutdown_steps_complete(
+    isolated_service_state_home: Path,
+) -> None:
+    harness = _harness()
+    marker = isolated_service_state_home / "okay-hermes-realtime" / "controller-health"
+
+    async def fail_media_shutdown() -> None:
+        harness.controller.media_shutdown_calls += 1
+        raise RuntimeError("mpv did not exit after forced termination")
+
+    harness.controller.shutdown_media = fail_media_shutdown
+    run_task = asyncio.create_task(harness.service.run())
+    await asyncio.wait_for(harness.http.serve_entered.wait(), timeout=1.0)
+    harness.http.started.set()
+    await asyncio.wait_for(harness.service.ready.wait(), timeout=1.0)
+
+    harness.service.request_shutdown()
+    with pytest.raises(RuntimeError, match="media cleanup failed during service shutdown"):
+        await asyncio.wait_for(run_task, timeout=1.0)
+
+    assert harness.controller.media_shutdown_calls == 1
+    assert harness.http.shutdown_calls == 1
+    assert harness.socket.stop_calls == 1
+    assert marker.read_text(encoding="utf-8") == "ready\n"
+
+
+@pytest.mark.asyncio
+async def test_controller_health_marker_tracks_service_readiness_and_persists_on_shutdown(
     isolated_service_state_home: Path,
 ) -> None:
     harness = _harness()
@@ -191,7 +246,29 @@ async def test_controller_health_marker_tracks_service_readiness_and_shutdown(
 
     harness.service.request_shutdown()
     await asyncio.wait_for(run_task, timeout=1.0)
-    assert not marker.exists()
+    assert marker.read_text(encoding="utf-8") == "ready\n"
+
+
+@pytest.mark.asyncio
+async def test_failed_secondary_service_does_not_remove_live_health_marker(
+    isolated_service_state_home: Path,
+) -> None:
+    primary = _harness()
+    marker = isolated_service_state_home / "okay-hermes-realtime" / "controller-health"
+    primary_task = asyncio.create_task(primary.service.run())
+    await asyncio.wait_for(primary.http.serve_entered.wait(), timeout=1.0)
+    primary.http.started.set()
+    await asyncio.wait_for(primary.service.ready.wait(), timeout=1.0)
+    assert marker.read_text(encoding="utf-8") == "ready\n"
+
+    secondary = _harness(socket=FakeSocket(start_error=RuntimeError("socket unavailable")))
+    with pytest.raises(RuntimeError, match="socket unavailable"):
+        await secondary.service.run()
+
+    assert marker.read_text(encoding="utf-8") == "ready\n"
+
+    primary.service.request_shutdown()
+    await asyncio.wait_for(primary_task, timeout=1.0)
 
 
 @pytest.mark.asyncio
@@ -344,6 +421,372 @@ async def test_uvicorn_adapter_leaves_signal_ownership_to_runtime_service(
     await asyncio.wait_for(serve_task, timeout=2.0)
 
     assert not captured_signals
+
+
+class _RecordingRuntimeService:
+    def __init__(self, settings: object, events: list[str]) -> None:
+        self.settings = settings
+        self._events = events
+        self._events.append("runtime construct")
+
+    async def run(self) -> None:
+        self._events.append("run")
+
+
+class _KeyboardInterruptAcquireLock:
+    def __init__(self, path: object, events: list[str]) -> None:
+        self.path = path
+        self._events = events
+        self.release_called = False
+        self._events.append("lock construct")
+
+    def acquire(self) -> None:
+        self._events.append("acquire")
+        raise KeyboardInterrupt
+
+    def release(self) -> None:
+        self.release_called = True
+        self._events.append("release")
+
+
+class _RecordingLock:
+    def __init__(self, path: object, events: list[str]) -> None:
+        self.path = path
+        self._events = events
+        self._events.append("lock construct")
+
+    def acquire(self) -> None:
+        self._events.append("acquire")
+
+    def release(self) -> None:
+        self._events.append("release")
+
+
+class _AlreadyRunningLock:
+    def __init__(self, _path: object) -> None:
+        pass
+
+    def acquire(self) -> None:
+        raise service_module.ControllerAlreadyRunningError("controller already running")
+
+    def release(self) -> None:
+        raise AssertionError("release must not be called when acquire fails")
+
+
+class _GenericLockErrorLock:
+    def __init__(self, _path: object) -> None:
+        pass
+
+    def acquire(self) -> None:
+        raise service_module.ControllerInstanceLockError("controller lock could not be acquired")
+
+    def release(self) -> None:
+        raise AssertionError("release must not be called when acquire fails")
+
+
+def test_main_rejects_duplicate_controller_processes_early(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    called = {"settings": False, "runtime": False}
+
+    monkeypatch.setattr(service_module, "ControllerInstanceLock", _AlreadyRunningLock)
+    monkeypatch.setattr(
+        service_module, "default_controller_lock_path", lambda: Path("/tmp/controller.lock")
+    )
+    monkeypatch.setattr(
+        service_module.Settings, "from_env", lambda: called.__setitem__("settings", True) or None
+    )
+    monkeypatch.setattr(
+        service_module,
+        "RuntimeService",
+        lambda _settings: called.__setitem__("runtime", True) or None,
+    )
+
+    exit_code = service_module.main()
+    captured = capsys.readouterr()
+
+    assert exit_code == service_module.CONTROLLER_ALREADY_RUNNING_EXIT_CODE
+    assert captured.err == "Okay Hermes Realtime controller is already running.\n"
+    assert called == {"settings": False, "runtime": False}
+
+
+def test_main_reports_generic_controller_lock_failures_without_touching_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    called = {"settings": False, "runtime": False}
+
+    monkeypatch.setattr(service_module, "ControllerInstanceLock", _GenericLockErrorLock)
+    monkeypatch.setattr(
+        service_module, "default_controller_lock_path", lambda: Path("/tmp/controller.lock")
+    )
+    monkeypatch.setattr(
+        service_module.Settings, "from_env", lambda: called.__setitem__("settings", True) or None
+    )
+    monkeypatch.setattr(
+        service_module,
+        "RuntimeService",
+        lambda _settings: called.__setitem__("runtime", True) or None,
+    )
+
+    exit_code = service_module.main()
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.err == "Okay Hermes Realtime controller lock could not be acquired.\n"
+    assert called == {"settings": False, "runtime": False}
+
+
+def test_main_returns_130_when_lock_acquire_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    called = {"settings": False, "runtime": False}
+    fake_lock = _KeyboardInterruptAcquireLock(Path("/tmp/controller.lock"), events)
+
+    def fake_from_env() -> object:
+        called["settings"] = True
+        raise AssertionError("settings must not be loaded when lock acquisition is interrupted")
+
+    def fake_runtime_service(_settings: object) -> object:
+        called["runtime"] = True
+        raise AssertionError(
+            "runtime service must not be constructed when lock acquisition is interrupted"
+        )
+
+    monkeypatch.setattr(service_module, "ControllerInstanceLock", lambda _path: fake_lock)
+    monkeypatch.setattr(
+        service_module, "default_controller_lock_path", lambda: Path("/tmp/controller.lock")
+    )
+    monkeypatch.setattr(service_module.Settings, "from_env", fake_from_env)
+    monkeypatch.setattr(service_module, "RuntimeService", fake_runtime_service)
+
+    exit_code = service_module.main()
+
+    assert exit_code == 130
+    assert events == ["lock construct", "acquire"]
+    assert fake_lock.release_called is False
+    assert called == {"settings": False, "runtime": False}
+
+
+def test_main_loads_settings_after_lock_before_constructing_runtime_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    def fake_from_env() -> object:
+        events.append("settings")
+        return object()
+
+    def fake_runtime_service(settings: object) -> _RecordingRuntimeService:
+        return _RecordingRuntimeService(settings, events)
+
+    monkeypatch.setattr(
+        service_module, "ControllerInstanceLock", lambda path: _RecordingLock(path, events)
+    )
+    monkeypatch.setattr(
+        service_module, "default_controller_lock_path", lambda: Path("/tmp/controller.lock")
+    )
+    monkeypatch.setattr(service_module.Settings, "from_env", fake_from_env)
+    monkeypatch.setattr(service_module, "RuntimeService", fake_runtime_service)
+
+    exit_code = service_module.main()
+
+    assert exit_code == 0
+    assert events == [
+        "lock construct",
+        "acquire",
+        "settings",
+        "runtime construct",
+        "run",
+        "release",
+    ]
+
+
+def test_main_propagates_settings_failure_and_releases_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    def fake_from_env() -> object:
+        events.append("settings")
+        raise RuntimeError("settings failed")
+
+    monkeypatch.setattr(
+        service_module, "ControllerInstanceLock", lambda path: _RecordingLock(path, events)
+    )
+    monkeypatch.setattr(
+        service_module, "default_controller_lock_path", lambda: Path("/tmp/controller.lock")
+    )
+    monkeypatch.setattr(service_module.Settings, "from_env", fake_from_env)
+    runtime_called = False
+
+    def fake_runtime_service(_settings: object) -> object:
+        nonlocal runtime_called
+        runtime_called = True
+        raise AssertionError("runtime service must not be constructed when settings fail")
+
+    monkeypatch.setattr(service_module, "RuntimeService", fake_runtime_service)
+
+    with pytest.raises(RuntimeError, match="settings failed"):
+        service_module.main()
+
+    assert runtime_called is False
+    assert events == ["lock construct", "acquire", "settings", "release"]
+
+
+@pytest.mark.parametrize(
+    ("interrupt_point", "expected_events"),
+    [
+        (
+            "settings",
+            ["lock construct", "acquire", "settings", "release"],
+        ),
+        (
+            "runtime",
+            ["lock construct", "acquire", "settings", "runtime construct", "release"],
+        ),
+    ],
+)
+def test_main_returns_130_for_keyboard_interrupt_during_startup_and_releases_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt_point: str,
+    expected_events: list[str],
+) -> None:
+    events: list[str] = []
+
+    def fake_from_env() -> object:
+        events.append("settings")
+        if interrupt_point == "settings":
+            raise KeyboardInterrupt
+        return object()
+
+    def fake_runtime_service(settings: object) -> object:
+        events.append("runtime construct")
+        if interrupt_point == "runtime":
+            raise KeyboardInterrupt
+        return _RecordingRuntimeService(settings, events)
+
+    monkeypatch.setattr(
+        service_module, "ControllerInstanceLock", lambda path: _RecordingLock(path, events)
+    )
+    monkeypatch.setattr(
+        service_module, "default_controller_lock_path", lambda: Path("/tmp/controller.lock")
+    )
+    monkeypatch.setattr(service_module.Settings, "from_env", fake_from_env)
+    monkeypatch.setattr(service_module, "RuntimeService", fake_runtime_service)
+
+    exit_code = service_module.main()
+
+    assert exit_code == 130
+    assert events == expected_events
+
+
+def test_main_releases_lock_when_runtime_service_construction_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    def fake_from_env() -> object:
+        events.append("settings")
+        return object()
+
+    def fake_runtime_service(_settings: object) -> object:
+        events.append("runtime construct")
+        raise RuntimeError("runtime constructor failed")
+
+    monkeypatch.setattr(
+        service_module, "ControllerInstanceLock", lambda path: _RecordingLock(path, events)
+    )
+    monkeypatch.setattr(
+        service_module, "default_controller_lock_path", lambda: Path("/tmp/controller.lock")
+    )
+    monkeypatch.setattr(service_module.Settings, "from_env", fake_from_env)
+    monkeypatch.setattr(service_module, "RuntimeService", fake_runtime_service)
+
+    with pytest.raises(RuntimeError, match="runtime constructor failed"):
+        service_module.main()
+
+    assert events == ["lock construct", "acquire", "settings", "runtime construct", "release"]
+
+
+def test_main_releases_lock_when_runtime_run_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    def fake_from_env() -> object:
+        events.append("settings")
+        return object()
+
+    class FakeRuntimeService:
+        def __init__(self, _settings: object) -> None:
+            events.append("runtime construct")
+
+        async def run(self) -> None:
+            events.append("run")
+            raise RuntimeError("runtime failed")
+
+    monkeypatch.setattr(
+        service_module, "ControllerInstanceLock", lambda path: _RecordingLock(path, events)
+    )
+    monkeypatch.setattr(
+        service_module, "default_controller_lock_path", lambda: Path("/tmp/controller.lock")
+    )
+    monkeypatch.setattr(service_module.Settings, "from_env", fake_from_env)
+    monkeypatch.setattr(service_module, "RuntimeService", FakeRuntimeService)
+
+    with pytest.raises(RuntimeError, match="runtime failed"):
+        service_module.main()
+
+    assert events == [
+        "lock construct",
+        "acquire",
+        "settings",
+        "runtime construct",
+        "run",
+        "release",
+    ]
+
+
+def test_main_returns_130_for_keyboard_interrupt_and_releases_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    def fake_from_env() -> object:
+        events.append("settings")
+        return object()
+
+    class FakeRuntimeService:
+        def __init__(self, _settings: object) -> None:
+            events.append("runtime construct")
+
+        async def run(self) -> None:
+            events.append("run")
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        service_module, "ControllerInstanceLock", lambda path: _RecordingLock(path, events)
+    )
+    monkeypatch.setattr(
+        service_module, "default_controller_lock_path", lambda: Path("/tmp/controller.lock")
+    )
+    monkeypatch.setattr(service_module.Settings, "from_env", fake_from_env)
+    monkeypatch.setattr(service_module, "RuntimeService", FakeRuntimeService)
+
+    exit_code = service_module.main()
+
+    assert exit_code == 130
+    assert events == [
+        "lock construct",
+        "acquire",
+        "settings",
+        "runtime construct",
+        "run",
+        "release",
+    ]
 
 
 def test_service_module_executes_main_only_under_module_entrypoint() -> None:

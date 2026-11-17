@@ -5,18 +5,53 @@ import contextlib
 import copy
 import json
 import logging
+import os
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
+from realtime_action_spike.anime import (
+    AnimeChoice,
+    AnimeSourceAdapter,
+    HianimeTransport,
+)
+from realtime_action_spike.anime_onsen import AnimeOnsenResolver
 from realtime_action_spike.capabilities import CapabilityBroker, HandoffRecord
+from realtime_action_spike.contracts import MediaRevisionArguments
+from realtime_action_spike.media import (
+    MediaPlaybackManager,
+    PlaybackCompletion,
+    PlaybackProgress,
+    YouTubeResolver,
+)
+from realtime_action_spike.media_catalog import (
+    DirectStreamLocator,
+    PendingEpisodeMetadata,
+    PendingMedia,
+    PendingMediaCatalog,
+    PendingResumeMetadata,
+    YouTubePlaybackLocator,
+    build_youtube_thumbnail_url,
+)
+from realtime_action_spike.media_state import (
+    AnimeProgress,
+    AnimeProgressStore,
+    MediaPreferenceStore,
+    propose_resume,
+)
 
 from .browser import BrowserHandle
 from .protocol import (
     LoopbackMessage,
+    MediaChoicesMessage,
+    MediaConfirmationMessage,
+    MediaFinishedMessage,
+    MediaReadyMessage,
+    MediaResumeCompleteMessage,
     PageReadyMessage,
     PageStartedMessage,
     SessionClosedMessage,
@@ -65,6 +100,21 @@ class StaleControlMessage(ValueError):
     """Raised when a control message does not match the active session."""
 
 
+class CrunchyrollLogin(Protocol):
+    async def start(
+        self,
+        *,
+        session_id: str,
+        query: str,
+        episode: int | None,
+        audio_mode: Literal["auto", "sub", "dub"],
+    ) -> dict[str, object]: ...
+
+    async def stop_session(self, session_id: str) -> None: ...
+
+    async def shutdown(self) -> None: ...
+
+
 class BrowserLauncher(Protocol):
     """Protocol for launching the browser control URL."""
 
@@ -101,6 +151,18 @@ class _WakeSession:
     startup_deadline: BrowserStartupDeadline | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _AnimePlaybackContext:
+    session_id: str
+    playback_id: str
+    query: str
+    series_id: str
+    series_title: str
+    episode: int
+    audio_mode: Literal["sub", "dub"]
+    available_episode_numbers: tuple[int, ...]
+
+
 class VoiceSessionController:
     """Coordinate one active local wake session and its control messages."""
 
@@ -120,6 +182,14 @@ class VoiceSessionController:
         status_observer: StatusObserver | None = None,
         task_event_coordinator: TaskEventCoordinator | None = None,
         task_notifications_enabled: bool = True,
+        media_manager: MediaPlaybackManager | None = None,
+        youtube_resolver: YouTubeResolver | None = None,
+        anime_adapter: AnimeSourceAdapter | None = None,
+        pending_catalog: PendingMediaCatalog | None = None,
+        pending_id_factory: Callable[[], str] | None = None,
+        media_preference_store: MediaPreferenceStore | None = None,
+        anime_progress_store: AnimeProgressStore | None = None,
+        crunchyroll_login_manager: CrunchyrollLogin | None = None,
     ) -> None:
         self._launcher = launcher
         self._session_id_factory = session_id_factory or (lambda: secrets.token_urlsafe(16))
@@ -148,6 +218,31 @@ class VoiceSessionController:
             notifier=NotifySendDesktopNotifier(enabled=task_notifications_enabled),
             permission_client=HermesKanbanPermissionClient(),
         )
+        self._media_manager = media_manager or MediaPlaybackManager()
+        self._youtube_resolver = youtube_resolver or YouTubeResolver()
+        state_root = Path(os.getenv("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
+        preference_store = media_preference_store or MediaPreferenceStore(
+            state_root / "okay-hermes-realtime" / "media_state.json"
+        )
+        self._media_preference_store = preference_store
+        self._anime_adapter = anime_adapter or AnimeSourceAdapter(
+            transport=HianimeTransport(),
+            preference_provider=preference_store.get_audio_mode,
+            fallback_resolver=AnimeOnsenResolver(),
+        )
+        self._pending_media = pending_catalog or PendingMediaCatalog()
+        self._pending_id_factory = pending_id_factory or (lambda: secrets.token_urlsafe(16))
+        self._anime_progress_store = anime_progress_store or AnimeProgressStore(
+            state_root / "okay-hermes-realtime" / "media_state.json"
+        )
+        self._anime_playback: _AnimePlaybackContext | None = None
+        self._crunchyroll_login = crunchyroll_login_manager
+        self._accepted_media: PendingMedia | None = None
+        self._anime_choices: dict[str, tuple[str, tuple[AnimeChoice, ...]]] = {}
+        self._active_playback: tuple[str, str] | None = None
+        self._resuming_playback: tuple[str, str] | None = None
+        self._media_manager.bind_progress_handler(self._handle_playback_progress)
+        self._media_manager.bind_completion_handler(self._handle_playback_completion)
 
     @property
     def token_store(self) -> LaunchTokenStore:
@@ -175,6 +270,10 @@ class VoiceSessionController:
             return "stopping"
         return "idle"
 
+    @property
+    def media_status(self) -> dict[str, object]:
+        return self._media_manager.status
+
     def session_is_active(self, session_id: str) -> bool:
         active = self._active_session
         return (
@@ -182,6 +281,22 @@ class VoiceSessionController:
             and active.session_id == session_id
             and active.state.phase
             in {SessionPhase.LAUNCHING, SessionPhase.CONNECTING, SessionPhase.LIVE}
+        )
+
+    def record_tool_lifecycle(
+        self,
+        session_id: str,
+        name: str,
+        *,
+        data: dict[str, JsonValue],
+    ) -> None:
+        """Record bounded tool diagnostics without affecting execution."""
+        if not self.session_is_active(session_id):
+            return
+        self._require_active_session(session_id).trace.record(
+            name,
+            source="controller",
+            data=data,
         )
 
     async def publish_task_event(
@@ -236,8 +351,448 @@ class VoiceSessionController:
             response=response,
         )
 
+    async def prepare_youtube_media(
+        self,
+        *,
+        session_id: str,
+        query: str,
+        replaces_pending_id: str | None = None,
+    ) -> dict[str, object]:
+        if not self.session_is_active(session_id):
+            raise StaleControlMessage("media request is not from the originating session")
+        video = await self._youtube_resolver.resolve(query)
+        pending = PendingMedia(
+            pending_id=self._pending_id_factory(),
+            source="youtube",
+            title=video.title,
+            subtitle=video.channel,
+            thumbnail_url=build_youtube_thumbnail_url(video.video_id),
+            playback_locator=YouTubePlaybackLocator(
+                video_id=video.video_id,
+                canonical_url=video.webpage_url,
+            ),
+            prompt=f"Play {video.title} by {video.channel}?",
+            request_query=query,
+        )
+        return await self._publish_pending_media(
+            session_id,
+            pending,
+            replaces_pending_id=replaces_pending_id,
+        )
+
+    async def prepare_anime_media(
+        self,
+        *,
+        session_id: str,
+        query: str,
+        episode: int | None,
+        episode_offset: int | None,
+        audio_mode: Literal["auto", "sub", "dub"],
+        replaces_pending_id: str | None = None,
+    ) -> dict[str, object]:
+        if not self.session_is_active(session_id):
+            raise StaleControlMessage("media request is not from the originating session")
+        if episode_offset is not None:
+            raise ValueError("episode_offset requires an existing pending anime proposal")
+        selected_episode = episode or 1
+        requested_audio_mode = audio_mode
+        effective_audio_mode = (
+            await asyncio.to_thread(self._media_preference_store.get_audio_mode)
+            if audio_mode == "auto"
+            else audio_mode
+        )
+        ranked = await self._anime_adapter.resolve_or_rank(
+            query,
+            episode=selected_episode,
+            audio_mode=effective_audio_mode,
+        )
+        if ranked.kind == "choices":
+            return await self._publish_anime_choices(
+                session_id,
+                query=query,
+                choices=ranked.choices,
+            )
+        resolved = ranked.resolution
+        assert resolved is not None
+        if requested_audio_mode in {"sub", "dub"}:
+            await asyncio.to_thread(
+                self._media_preference_store.set_audio_mode,
+                requested_audio_mode,
+            )
+        resume_metadata: PendingResumeMetadata | None = None
+        if episode is None:
+            saved = await asyncio.to_thread(
+                self._anime_progress_store.get,
+                resolved.series_id,
+            )
+            proposal = propose_resume(saved, resolved.available_episode_numbers)
+            if proposal.kind == "terminal" or proposal.episode_number is None:
+                raise ValueError("all available episodes are complete")
+            if proposal.episode_number != resolved.episode:
+                resolved = await self._anime_adapter.resolve(
+                    query,
+                    episode=proposal.episode_number,
+                    audio_mode=audio_mode,
+                )
+            if proposal.start_seconds > 0:
+                resume_metadata = PendingResumeMetadata(
+                    start_seconds=proposal.start_seconds,
+                    duration_seconds=(saved.duration_seconds if saved is not None else None),
+                    reason=proposal.reason,
+                )
+        pending = PendingMedia(
+            pending_id=self._pending_id_factory(),
+            source="anime",
+            title=resolved.series_title,
+            subtitle=resolved.subtitle,
+            thumbnail_url=resolved.poster_url,
+            playback_locator=DirectStreamLocator(
+                stream_url=resolved.stream_url,
+                http_headers=resolved.http_headers,
+            ),
+            prompt=f"Play {resolved.series_title}, {resolved.subtitle}?",
+            episode=PendingEpisodeMetadata(
+                series_title=resolved.series_title,
+                season_number=None,
+                episode_number=resolved.episode,
+            ),
+            audio_mode=resolved.audio_mode,
+            resume=resume_metadata,
+            request_query=query,
+            canonical_series_id=resolved.series_id,
+            available_episode_numbers=resolved.available_episode_numbers,
+        )
+        return await self._publish_pending_media(
+            session_id,
+            pending,
+            replaces_pending_id=replaces_pending_id,
+        )
+
+    async def choose_anime_media(
+        self,
+        *,
+        session_id: str,
+        position: int,
+    ) -> dict[str, object]:
+        """Consume one displayed ranked choice and publish its confirmation card."""
+        if not self.session_is_active(session_id):
+            raise StaleControlMessage("choice selection is not from the originating session")
+        if isinstance(position, bool) or not isinstance(position, int):
+            raise ValueError("position must be a displayed number")
+        stored = self._anime_choices.get(session_id)
+        if stored is None:
+            raise ValueError("no ranked anime choices are active for this session")
+        _query, entries = stored
+        if not 1 <= position <= len(entries):
+            raise ValueError(f"position {position} is not a displayed choice")
+        choice = entries[position - 1]
+        # The exact displayed title re-enters the normal resolution path, so episode
+        # defaults, resume handling, and audio preference reuse the proven flow.
+        self._anime_choices.pop(session_id, None)
+        return await self.prepare_anime_media(
+            session_id=session_id,
+            query=choice.title,
+            episode=None,
+            episode_offset=None,
+            audio_mode="auto",
+        )
+
+    async def _publish_anime_choices(
+        self,
+        session_id: str,
+        *,
+        query: str,
+        choices: tuple[AnimeChoice, ...],
+    ) -> dict[str, object]:
+        if len(choices) < 2:
+            raise ValueError("a choice set requires at least two candidates")
+        bounded = choices[:5]
+        async with self._lock:
+            if not self.session_is_active(session_id):
+                raise StaleControlMessage("media session ended before preparation completed")
+            # Pending ids are allocated now; each binds to a real proposal at selection time.
+            pending_ids = [self._pending_id_factory() for _ in bounded]
+            self._anime_choices[session_id] = (query, tuple(bounded))
+            message = MediaChoicesMessage.model_validate({
+                "session_id": session_id,
+                "query": query,
+                "pending_ids": pending_ids,
+                "choices": [
+                    {
+                        "position": index,
+                        "series_id": choice.series_id,
+                        "title": choice.title,
+                    }
+                    for index, choice in enumerate(bounded, start=1)
+                ],
+            })
+            queue = self._outbound_messages[session_id]
+            if queue.full():
+                queue.get_nowait()
+            queue.put_nowait(message)
+            self._require_active_session(session_id).trace.record(
+                "media_choices_prepared",
+                source="controller",
+                data={"query": query, "choice_count": len(bounded)},
+            )
+        return {
+            "status": "awaiting_choice",
+            "query": query,
+            "choice_count": len(bounded),
+            "choices": [
+                {"position": choice.position, "title": choice.title}
+                for choice in message.choices
+            ],
+        }
+
+    async def prepare_crunchyroll_media(
+        self,
+        *,
+        session_id: str,
+        query: str,
+        episode: int | None,
+        audio_mode: Literal["auto", "sub", "dub"],
+    ) -> dict[str, object]:
+        if not self.session_is_active(session_id):
+            raise StaleControlMessage("Crunchyroll request is not from the originating session")
+        if self._crunchyroll_login is None:
+            raise RuntimeError("Crunchyroll login is not configured")
+        return await self._crunchyroll_login.start(
+            session_id=session_id,
+            query=query,
+            episode=episode,
+            audio_mode=audio_mode,
+        )
+
+    async def _publish_pending_media(
+        self,
+        session_id: str,
+        pending: PendingMedia,
+        *,
+        replaces_pending_id: str | None = None,
+    ) -> dict[str, object]:
+        async with self._lock:
+            if not self.session_is_active(session_id):
+                raise StaleControlMessage("media session ended before preparation completed")
+            if replaces_pending_id is None:
+                self._pending_media.create_or_replace(session_id, pending)
+            else:
+                self._pending_media.replace_exact(session_id, replaces_pending_id, pending)
+            display = pending.display_projection()
+            message = MediaConfirmationMessage.model_validate({"session_id": session_id, **display})
+            queue = self._outbound_messages[session_id]
+            if queue.full():
+                queue.get_nowait()
+            queue.put_nowait(message)
+            self._require_active_session(session_id).trace.record(
+                "media_confirmation_prepared",
+                source="controller",
+                data={"pending_id": pending.pending_id, "source": pending.source},
+            )
+        return {
+            "status": "awaiting_confirmation",
+            "pending_id": pending.pending_id,
+            "prompt": pending.prompt,
+        }
+
+    async def decide_media(
+        self,
+        *,
+        session_id: str,
+        pending_id: str,
+        action: Literal["accept", "reject", "cancel", "revise"],
+        revision: MediaRevisionArguments | dict[str, object] | None,
+    ) -> dict[str, object]:
+        if not self.session_is_active(session_id):
+            raise StaleControlMessage("media decision is not from the originating session")
+        pending = self._pending_media.get_exact(session_id, pending_id)
+        if action == "accept":
+            accepted = self._pending_media.take_exact(session_id, pending_id)
+            if self._accepted_media is not None or self._active_playback is not None:
+                self._pending_media.create_or_replace(session_id, accepted)
+                raise ValueError("another media handoff is active")
+            self._accepted_media = accepted
+            return {
+                "status": "handoff_pending",
+                "pending_id": accepted.pending_id,
+                "media_handoff": True,
+            }
+        if action in {"reject", "cancel"}:
+            self._pending_media.clear_exact(session_id, pending_id)
+            result: dict[str, object] = {
+                "status": "rejected" if action == "reject" else "cancelled",
+                "pending_id": pending_id,
+            }
+            if action == "reject":
+                result["follow_up"] = "Ask one short question about what the user wants instead."
+            return result
+        if action != "revise":
+            raise ValueError("unsupported media decision")
+        parsed_revision = (
+            revision
+            if isinstance(revision, MediaRevisionArguments)
+            else MediaRevisionArguments.model_validate(revision or {})
+        )
+        query = parsed_revision.query or pending.request_query
+        if query is None:
+            raise ValueError("revision has no media query context")
+        if pending.source == "youtube":
+            if any(
+                value is not None
+                for value in (
+                    parsed_revision.episode,
+                    parsed_revision.episode_offset,
+                    parsed_revision.audio_mode,
+                )
+            ):
+                raise ValueError("episode and audio revisions require anime media")
+            result = await self.prepare_youtube_media(
+                session_id=session_id,
+                query=query,
+                replaces_pending_id=pending_id,
+            )
+            return result
+        current_episode = pending.episode.episode_number if pending.episode else 1
+        target_episode = parsed_revision.episode or current_episode
+        if parsed_revision.episode_offset is not None:
+            target_episode = current_episode + parsed_revision.episode_offset
+        if target_episode not in pending.available_episode_numbers:
+            raise ValueError(f"episode {target_episode} is not available")
+        mode = parsed_revision.audio_mode or pending.audio_mode or "sub"
+        return await self.prepare_anime_media(
+            session_id=session_id,
+            query=query,
+            episode=target_episode,
+            episode_offset=None,
+            audio_mode=mode,
+            replaces_pending_id=pending_id,
+        )
+
     async def shutdown_task_events(self) -> None:
         await self._task_events.shutdown()
+
+    async def _handle_playback_progress(self, sample: PlaybackProgress) -> None:
+        context = self._anime_playback
+        if (
+            context is None
+            or context.session_id != sample.session_id
+            or context.playback_id != sample.playback_id
+            or not self.session_is_active(sample.session_id)
+        ):
+            return
+        await self._persist_anime_progress(
+            context,
+            position_seconds=sample.position_seconds,
+            duration_seconds=sample.duration_seconds,
+            completed=False,
+        )
+
+    async def _handle_playback_completion(self, completion: PlaybackCompletion) -> None:
+        if self._active_playback != (completion.session_id, completion.playback_id):
+            return
+        self._active_playback = None
+        self._resuming_playback = (completion.session_id, completion.playback_id)
+        context = self._anime_playback
+        if context is None:
+            await self._publish_media_finished(completion, False)
+            return
+        if (
+            context.session_id != completion.session_id
+            or context.playback_id != completion.playback_id
+            or not self.session_is_active(completion.session_id)
+        ):
+            return
+        self._anime_playback = None
+        position = completion.position_seconds
+        duration = completion.duration_seconds
+        next_episode_pending = False
+        next_episode: int | None = None
+        if position is not None and duration is not None:
+            sample_record = AnimeProgress(
+                series_id=context.series_id,
+                series_title=context.series_title,
+                last_episode=context.episode,
+                position_seconds=position,
+                duration_seconds=duration,
+                completed=False,
+                last_audio_mode_used=context.audio_mode,
+                updated_at=datetime.now(UTC).isoformat(),
+            )
+            proposal = propose_resume(sample_record, context.available_episode_numbers)
+            next_episode_pending = (
+                completion.outcome == "completed" and proposal.kind == "next_episode"
+            )
+            next_episode = proposal.episode_number if next_episode_pending else None
+            await self._persist_anime_progress(
+                context,
+                position_seconds=position,
+                duration_seconds=duration,
+                completed=next_episode_pending,
+            )
+
+        await self._publish_media_finished(completion, next_episode_pending)
+        if next_episode is None or not self.session_is_active(completion.session_id):
+            return
+        try:
+            await self.prepare_anime_media(
+                session_id=completion.session_id,
+                query=context.query,
+                episode=next_episode,
+                episode_offset=None,
+                audio_mode=context.audio_mode,
+            )
+        except Exception:
+            logger.exception("next episode proposal failed")
+
+    async def _persist_anime_progress(
+        self,
+        context: _AnimePlaybackContext,
+        *,
+        position_seconds: float,
+        duration_seconds: float,
+        completed: bool,
+    ) -> None:
+        progress = AnimeProgress(
+            series_id=context.series_id,
+            series_title=context.series_title,
+            last_episode=context.episode,
+            position_seconds=position_seconds,
+            duration_seconds=duration_seconds,
+            completed=completed,
+            last_audio_mode_used=context.audio_mode,
+            updated_at=datetime.now(UTC).isoformat(),
+        )
+        try:
+            await asyncio.to_thread(self._anime_progress_store.put, progress)
+        except Exception:
+            logger.exception("anime progress persistence failed")
+
+    async def _publish_media_finished(
+        self,
+        completion: PlaybackCompletion,
+        next_episode_pending: bool,
+    ) -> None:
+        async with self._lock:
+            if not self.session_is_active(completion.session_id):
+                return
+            queue = self._outbound_messages[completion.session_id]
+            if queue.full():
+                queue.get_nowait()
+            queue.put_nowait(
+                MediaFinishedMessage(
+                    session_id=completion.session_id,
+                    playback_id=completion.playback_id,
+                    outcome=completion.outcome,
+                    next_episode_pending=next_episode_pending,
+                )
+            )
+
+    async def shutdown_media(self) -> None:
+        await self._media_manager.shutdown()
+
+    async def shutdown_crunchyroll(self) -> None:
+        if self._crunchyroll_login is not None:
+            await self._crunchyroll_login.shutdown()
 
     async def activate(self, launch_base_url: str) -> ActivationResult:
         """Create a new local session and launch the control page."""
@@ -445,7 +1000,6 @@ class VoiceSessionController:
                     data={"reason": message.reason.value},
                 )
 
-
         async def close_browser() -> None:
             async with self._lock:
                 browser_handle = session.browser_handle
@@ -461,6 +1015,22 @@ class VoiceSessionController:
             if release is None:
                 return
             await asyncio.to_thread(release)
+
+        async def finalize_media(_request: TeardownRequest) -> None:
+            self._pending_media.clear_session(session.session_id)
+            self._anime_choices.pop(session.session_id, None)
+            if self._crunchyroll_login is not None:
+                await self._crunchyroll_login.stop_session(session.session_id)
+            if self._accepted_media is not None and self._active_session is session:
+                self._accepted_media = None
+            if self._active_playback is not None and self._active_playback[0] == session.session_id:
+                self._active_playback = None
+                self._anime_playback = None
+            if (
+                self._resuming_playback is not None
+                and self._resuming_playback[0] == session.session_id
+            ):
+                self._resuming_playback = None
 
         async def persist_trace(failures: tuple[TeardownStepFailure, ...]) -> None:
             for failure in failures:
@@ -496,9 +1066,7 @@ class VoiceSessionController:
                     else SessionPhase.CLOSED
                 )
                 _transition(session, terminal_phase)
-                self._last_closed_interruption_traces = copy.deepcopy(
-                    session.interruptions.traces
-                )
+                self._last_closed_interruption_traces = copy.deepcopy(session.interruptions.traces)
                 self._active_session = None
                 self._notify_status()
                 self._last_closed_session_id = session.session_id
@@ -514,14 +1082,13 @@ class VoiceSessionController:
                     error=request.error,
                 )
 
-
         return TeardownCoordinator(
             TeardownHooks(
                 mark_stopping=mark_stopping,
                 request_browser_stop=request_browser_stop,
-
                 close_browser=close_browser,
                 persist_trace=persist_trace,
+                finalize_media=finalize_media,
                 finalize=finalize,
                 release_profile_lock=release_profile_lock,
             ),
@@ -603,9 +1170,7 @@ class VoiceSessionController:
                     TeardownCompleteMessage,
                 ):
                     resolved = self._terminal_results.get(session_id)
-                    outcome = (
-                        resolved.outcome if resolved is not None else SessionOutcome.COMPLETED
-                    )
+                    outcome = resolved.outcome if resolved is not None else SessionOutcome.COMPLETED
                     return SessionClosedMessage(
                         type="session_closed",
                         session_id=session_id,
@@ -629,14 +1194,13 @@ class VoiceSessionController:
                 self._notify_status()
                 return None
 
-
             if isinstance(message, TimingMessage):
                 diagnostic_data = sanitize_timing_data(message.data)
+                diagnostic_data["browser_monotonic_ms"] = message.monotonic_ms
                 active.trace.record(
                     message.name.value,
                     source="browser",
                     data=diagnostic_data,
-                    monotonic_ns=int(message.monotonic_ms * 1_000_000),
                 )
                 logger.info(
                     "session_diagnostic %s",
@@ -651,6 +1215,61 @@ class VoiceSessionController:
                     ),
                 )
                 return None
+
+            if isinstance(message, MediaReadyMessage):
+                accepted = self._accepted_media
+                if accepted is None or accepted.pending_id != message.playback_id:
+                    raise StaleControlMessage("stale media handoff generation")
+                self._accepted_media = None
+                self._active_playback = (session_id, accepted.pending_id)
+                previous_anime_context = self._anime_playback
+                if accepted.source == "anime" and accepted.episode is not None:
+                    self._anime_playback = _AnimePlaybackContext(
+                        session_id=session_id,
+                        playback_id=accepted.pending_id,
+                        query=accepted.request_query or accepted.episode.series_title,
+                        series_id=(accepted.canonical_series_id or accepted.episode.series_title),
+                        series_title=accepted.episode.series_title,
+                        episode=accepted.episode.episode_number,
+                        audio_mode=accepted.audio_mode or "sub",
+                        available_episode_numbers=accepted.available_episode_numbers,
+                    )
+                else:
+                    self._anime_playback = None
+                try:
+                    await self._media_manager.launch(
+                        session_id=session_id,
+                        playback_id=accepted.pending_id,
+                        locator=accepted.playback_locator,
+                        title=accepted.title,
+                        subtitle=accepted.subtitle,
+                        start_seconds=(accepted.resume.start_seconds if accepted.resume else 0.0),
+                    )
+                except BaseException:
+                    self._active_playback = None
+                    self._anime_playback = previous_anime_context
+                    self._accepted_media = accepted
+                    raise
+                active.trace.record(
+                    "media_handoff_ready",
+                    source="browser",
+                    data={"playback_id": message.playback_id},
+                )
+                return None
+
+            if isinstance(message, MediaResumeCompleteMessage):
+                if self._resuming_playback != (session_id, message.playback_id):
+                    raise StaleControlMessage("stale media resume generation")
+                self._resuming_playback = None
+                active.trace.record(
+                    "media_resume_complete",
+                    source="browser",
+                    data={"playback_id": message.playback_id, "mode": message.mode},
+                )
+                return None
+
+            if isinstance(message, MediaFinishedMessage):
+                raise ValueError("media_finished messages are controller-to-page only")
 
             if isinstance(message, StopMessage):
                 outcome = self._outcome_for_stop_reason(message.reason)

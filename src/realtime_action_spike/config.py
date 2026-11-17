@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from .capabilities import build_openai_tools
+from .providers import UnknownVoiceProviderError, VoiceProviderContract, get_provider_contract
 
 DEFAULT_BRAVE_BIN = "brave-origin"
 
@@ -25,6 +26,28 @@ Hold an ordinary conversation and use the supplied tools for supported assistant
 # Tools
 - Use only tools supplied in this session and only for actions described by their schemas.
 - Use a direct lightweight tool when one can complete the request.
+- Interpret conversational replies as strict typed tool decisions when intent is clear. Casual
+  confirmations such as "yep, that's it" mean accept. Compound corrections such as "no, play the
+  next episode" mean one revise action with the correction, not a literal yes/no phrase match.
+- Use media_prepare_youtube for spoken YouTube title, channel, topic, or recency requests.
+- When the user explicitly asks for Crunchyroll, use media_prepare_crunchyroll and do not silently
+  use media_prepare_anime or an unofficial source. This opens official login setup only; report the
+  tool result without claiming the title was resolved or playback started.
+- Use media_prepare_anime for anime requests that do not explicitly name Crunchyroll, including
+  their explicit episode or audio details. Then use media_decide to accept, reject, cancel, or
+  revise an exact pending proposal.
+- If media_prepare_anime returns awaiting_choice, its result lists the exact numbered choices.
+  Say those option numbers and titles once, briefly, then stop and listen. Use media_choose with
+  only the spoken displayed number, and never re-resolve or invent titles that were not displayed.
+- If a tool result has `source_unavailable`, the external catalog is down. Do not retry it or
+  rewrite the title. Briefly say the anime catalog is temporarily unavailable and stop.
+- If a tool result has `stream_unavailable`, the title was found but playback is unavailable.
+  Say that briefly, offer another listed title or trying later, and do not call media_choose again.
+- Do not ask the user to dictate a URL when a spoken request is enough.
+- A prepared proposal is not playing yet. Ask what the user would like to do and keep listening.
+- If the user rejects without corrected criteria, use the tool's follow_up instruction to ask one
+  short follow-up about what they want instead. A cancellation needs no media follow-up.
+- Do not claim playback is audible or started before an accepted launch succeeds.
 
 # Delegation policy
 - If the user explicitly asks to use Kanban, Hermes, or Hermes Agent for work, treat that as
@@ -59,9 +82,12 @@ class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     openai_api_key: SecretStr | None = None
-    realtime_model: str = "gpt-realtime-2.1-mini"
+    voice_provider: str = "openai"
+    realtime_model: str = "gpt-realtime-2.1"
     realtime_voice: str = "marin"
     realtime_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] = "minimal"
+    gemini_api_key: SecretStr | None = None
+    gemini_model: str = "gemini-3.8-live"
     gateway_host: str = "127.0.0.1"
     gateway_port: int = Field(default=8765, ge=1, le=65_535)
 
@@ -72,6 +98,11 @@ class Settings(BaseModel):
     voice_page_url: str = "http://127.0.0.1:8765/voice"
     voice_browser_start_timeout_seconds: float = 20.0
     kde_task_notifications: bool = True
+
+    mpv_bin: str = Field(default="mpv", min_length=1, max_length=4_096)
+    yt_dlp_bin: str = Field(default="yt-dlp", min_length=1, max_length=4_096)
+    youtube_resolve_timeout_seconds: float = Field(default=12.0, gt=0, le=60)
+    youtube_browser_cookies: str | None = Field(default=None, min_length=1, max_length=200)
 
     @staticmethod
     def default_activation_socket_path(xdg_runtime_dir: str | None = None) -> str:
@@ -91,6 +122,14 @@ class Settings(BaseModel):
                     raise ValueError("ACTIVATION_SOCKET_PATH must be absolute")
                 return data
         return data
+
+    @field_validator("voice_provider")
+    @classmethod
+    def _validate_voice_provider(cls, value: str) -> str:
+        try:
+            return get_provider_contract(value).id
+        except UnknownVoiceProviderError as exc:
+            raise ValueError(str(exc)) from exc
 
     @property
     def resolved_activation_socket_path(self) -> str:
@@ -123,9 +162,12 @@ class Settings(BaseModel):
         return cls.model_validate(
             {
                 "openai_api_key": key,
-                "realtime_model": os.getenv("REALTIME_MODEL", "gpt-realtime-2.1-mini"),
+                "voice_provider": os.getenv("VOICE_PROVIDER", "openai"),
+                "realtime_model": os.getenv("REALTIME_MODEL", "gpt-realtime-2.1"),
                 "realtime_voice": os.getenv("REALTIME_VOICE", "marin"),
                 "realtime_reasoning_effort": os.getenv("REALTIME_REASONING_EFFORT", "minimal"),
+                "gemini_api_key": os.getenv("GEMINI_API_KEY") or None,
+                "gemini_model": os.getenv("GEMINI_MODEL", "gemini-3.8-live"),
                 "gateway_host": os.getenv("GATEWAY_HOST", "127.0.0.1"),
                 "gateway_port": os.getenv("GATEWAY_PORT", "8765"),
                 "activation_socket_path": activation_socket_path,
@@ -141,9 +183,13 @@ class Settings(BaseModel):
                 "voice_browser_start_timeout_seconds": os.getenv(
                     "VOICE_BROWSER_START_TIMEOUT_SECONDS", "20.0"
                 ),
-                "kde_task_notifications": os.getenv(
-                    "KDE_TASK_NOTIFICATIONS", "true"
+                "kde_task_notifications": os.getenv("KDE_TASK_NOTIFICATIONS", "true"),
+                "mpv_bin": os.getenv("MPV_BIN", "mpv"),
+                "yt_dlp_bin": os.getenv("YT_DLP_BIN", "yt-dlp"),
+                "youtube_resolve_timeout_seconds": os.getenv(
+                    "YOUTUBE_RESOLVE_TIMEOUT_SECONDS", "12.0"
                 ),
+                "youtube_browser_cookies": os.getenv("YOUTUBE_BROWSER_COOKIES") or None,
             }
         )
 
@@ -151,6 +197,16 @@ class Settings(BaseModel):
         if self.openai_api_key is None:
             return None
         return self.openai_api_key.get_secret_value()
+
+    @property
+    def provider_contract(self) -> VoiceProviderContract:
+        return get_provider_contract(self.voice_provider)
+
+    @property
+    def provider_model(self) -> str:
+        if self.voice_provider == "gemini":
+            return self.gemini_model
+        return self.realtime_model
 
 
 def build_realtime_session(settings: Settings) -> dict[str, object]:

@@ -8,6 +8,7 @@ This project is an OpenAI-specific, independently installable successor to [Okay
 
 - **Native wake word listener.** A small C listener captures the microphone through PipeWire and runs a local ONNX wake-word model. No cloud wake detection, no polling loop.
 - **Scoped tool execution.** The model sees a small allowlist of functions and nothing else. The local controller validates every call: scope, function name, bounded JSON arguments, call-ID replay. Model-generated shell or code is never evaluated.
+- **Confirmed YouTube and anime playback.** Sources resolve metadata into an inline card first. Natural replies accept, reject, or revise the exact proposal; only an accepted generation launches controller-owned fullscreen `mpv` after microphone/VAD suspension. Anime adds saved Subbed/Dubbed preference, progress/resume, and next-episode confirmation.
 - **Heavy-agent handoff.** Complex requests (coding, filesystem, web lookups, automation, deep reasoning) become Hermes Kanban cards instead of failing inside the voice session. The voice reply is immediate; the heavy work runs asynchronously. A status tool reports what happened with the task.
 
 ## Runtime topology
@@ -16,6 +17,7 @@ This project is an OpenAI-specific, independently installable successor to [Okay
 native wake listener ──activation socket──> local controller
        ▲                                      │
        │ pause/rearm                          ├─ scoped /execute broker
+       │                                      ├─ yt-dlp resolver → paused mpv popup
        │                                      └─ dedicated Brave app process
 system tray                                         │
                                              WebRTC + oai-events
@@ -27,7 +29,7 @@ The controller launches a dedicated Brave app window in its own process group an
 
 ## Install
 
-Runtime prerequisites: a Linux user systemd session, PipeWire/WirePlumber, Brave (configurable via `BRAVE_BIN`; the default resolves the packaged `brave-origin` command rather than a version-specific `/opt` path), Qt 6 development packages with CMake/Ninja for the tray, a wake-word ONNX model, ONNX Runtime, `uv`, and an OpenAI API key with Realtime access. Rebuilding the committed browser bundle additionally requires Node.js and npm.
+Runtime prerequisites: a Linux user systemd session, PipeWire/WirePlumber, Brave (configurable via `BRAVE_BIN`; the default resolves the packaged `brave-origin` command rather than a version-specific `/opt` path), `mpv`, `yt-dlp`, Qt 6 development packages with CMake/Ninja for the tray, a wake-word ONNX model, ONNX Runtime, `uv`, and an OpenAI API key with Realtime access. Rebuilding the committed browser bundle additionally requires Node.js and npm. The installer validates `mpv` and `yt-dlp` before writing any files and records their resolved absolute paths for the user service; install them with your distribution package manager first.
 
 ```bash
 git clone https://github.com/H-Ali13381/okay-hermes-realtime.git
@@ -59,9 +61,35 @@ Do not run the old OHV wake listener and this one at the same time; record the o
 |---|---|---|
 | `assistant_get_current_time` | Current time, local or by IANA timezone | Local |
 | `voice_end_session` | Ends the voice session when the user asks to stop | Local |
+| `media_prepare_youtube` | Resolves one YouTube candidate and shows an inline confirmation card | Local |
+| `media_prepare_anime` | Resolves one anime episode, Subbed/Dubbed mode, and resume proposal | Local |
+| `media_decide` | Accepts, rejects, cancels, or revises the exact pending media proposal | Local |
 | `handoff_to_heavy_agent` | Queues a complex request as a Hermes Kanban card and dispatches a worker | Kanban |
 | `check_heavy_agent_task` | Reports status and summary for a handed-off task, defaulting to the most recent | Kanban |
 | `resolve_heavy_agent_block` | Records an explicit one-shot approval or denial for the exact blocked event | Kanban |
+
+### Confirmed media playback
+
+`media_prepare_youtube` accepts bounded spoken search text or an exact HTTPS YouTube `watch`, `youtu.be`, or `shorts` URL. `media_prepare_anime` accepts a bounded title plus optional episode and `auto`, `sub`, or `dub` mode. Preparation resolves metadata only and publishes an inline card; it never starts `mpv`. The Realtime model interprets natural replies and calls strict `media_decide` actions such as `accept`, `reject`, `cancel`, or `revise` for the exact pending generation.
+
+An accepted proposal still does not launch immediately. The browser first disables microphone tracks, disables VAD, clears buffered input, and sends exact `media_ready`. The controller then starts one fullscreen, unpaused `mpv` process group with a private Unix IPC socket under `$XDG_RUNTIME_DIR/okay-hermes-realtime/media/`. Duplicate, stale, or cross-session readiness cannot launch. On player exit the exact Realtime peer resumes; if it died during playback, the page makes one bounded replacement connection to the same local controller session.
+
+The YouTube resolver invokes `yt-dlp` as a fixed argv vector, validates canonical IDs and URLs, and never evaluates model-generated shell. The native anime adapter follows the public ani-cli source flow with bounded fixed-argv `curl`: AniDB search/API/embed responses, allowlisted poster and HLS hosts, finite output/time limits, and deterministic title/episode/language selection. The controller keeps stream and canonical playback locators private; the page receives display metadata only.
+
+Anime defaults globally to Subbed. An explicit Subbed or Dubbed request is saved in the mode-0600 state file at `$XDG_STATE_HOME/okay-hermes-realtime/media_state.json`; later `auto` requests reuse it. Per-series progress is checkpointed from bounded `mpv` IPC reads. Resume requires both at least 5% watched and at least 90 seconds watched; near-EOF completion proposes the next episode through a fresh confirmation card and never autoplays it.
+
+Cancelled, failed, timed-out, stale, or service-shutdown paths clear pending generations and terminate/reap owned subprocesses. Unrelated desktop media is never targeted.
+
+Configuration overrides:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MPV_BIN` | `mpv` | Trusted `mpv` command or absolute executable path |
+| `YT_DLP_BIN` | `yt-dlp` | Trusted `yt-dlp` command or absolute executable path |
+| `YOUTUBE_RESOLVE_TIMEOUT_SECONDS` | `12.0` | Bounded metadata-resolution timeout |
+| `YOUTUBE_BROWSER_COOKIES` | unset | Optional trusted `yt-dlp --cookies-from-browser` value, such as `brave:Default` |
+
+If YouTube challenges anonymous requests, set `YOUTUBE_BROWSER_COOKIES` explicitly in the mode-0600 server config. Cookie values and resolver stderr are not returned to the model or health endpoint. `/health` exposes only bounded media state (`idle`, `starting`, `prepared`, or `playing`) and the selected title/playback generation while active.
 
 ### Heavy-agent handoff
 
@@ -84,6 +112,19 @@ Environment overrides (set in `~/.config/okay-hermes-realtime/config.env`):
 | `KDE_TASK_NOTIFICATIONS` | `true` | Show secondary task events through Plasma's native notification service |
 
 The controller resolves the Hermes binary through these overrides, PATH, and absolute fallback paths, because systemd units do not inherit the user shell PATH. Missing binary or timeout surfaces as a controlled tool error, never a gateway 500.
+
+## Provider contracts
+
+`VOICE_PROVIDER` selects the voice provider when the controller starts and is fixed for the whole session; it never switches mid-conversation. Registered contracts are explicit:
+
+| Provider | Transport | Model default | Build status |
+|---|---|---|---|
+| `openai` | Browser WebRTC Realtime | `gpt-realtime-2.1` | active |
+| `gemini` | Gemini Live WebSocket | `gemini-3.8-live` | contract-only |
+
+The Gemini contract is registered so configuration and health output are explicit, but its WebSocket transport is not wired into this build. Selecting it makes `/session` fail with a clear 503 instead of silently using OpenAI or exposing a provider key to the page.
+
+Tool dispatch remains low latency: execution starts when complete tool arguments arrive, not when the whole model response finishes.
 
 ## Operation
 
@@ -178,7 +219,7 @@ This is a single short sample, not a benchmark. Brave dominates residency, and C
 
 ## Limitations
 
-- OpenAI Realtime only. There is no provider abstraction and none is planned here.
+- OpenAI Realtime is the only transport-active provider. Gemini Live is a registered contract only; its transport requires a separate architecture-approved adapter.
 - Single user, loopback-only.
 - Requires Brave for the voice page and an ONNX wake-word model for activation.
 - Handoff is asynchronous. Automatic voice delivery requires the originating session to remain open; ended sessions receive only the optional native desktop notification.

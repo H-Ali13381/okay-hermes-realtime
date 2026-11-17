@@ -9,7 +9,13 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from realtime_action_spike.anime import (
+    AnimeSourceUnavailableError,
+    AnimeStreamUnavailableError,
+    MissingAnimeEpisodeError,
+)
 from realtime_action_spike.config import Settings, build_realtime_session
+from realtime_action_spike.crunchyroll_remote.contracts import RemotePrototypeError
 from realtime_action_spike.gateway import (
     LOCAL_CLIENT_HEADER,
     LOCAL_CLIENT_HEADER_VALUE,
@@ -19,6 +25,7 @@ from realtime_action_spike.gateway import (
     _relay_control_websocket,
     create_app,
 )
+from realtime_action_spike.media import MediaPlaybackError
 from realtime_action_spike.runtime.browser import NoopBrowserHandle
 from realtime_action_spike.runtime.controller import VoiceSessionController
 from realtime_action_spike.runtime.protocol import (
@@ -76,10 +83,37 @@ class CapturingLauncher:
 
 
 class ActiveSessionController:
-    def __init__(self, active_session_id: str | None = None) -> None:
+    def __init__(
+        self,
+        active_session_id: str | None = None,
+        *,
+        media_error: str | None = None,
+    ) -> None:
         self.active_session_id = active_session_id
+        self.media_error = media_error
         self.registrations: list[tuple[str, object]] = []
         self.permission_resolutions: list[dict[str, object]] = []
+        self.media_preparations: list[dict[str, object]] = []
+        self.media_choices: list[dict[str, object]] = []
+        self.media_decisions: list[dict[str, object]] = []
+        self.tool_lifecycle: list[tuple[str, str, dict[str, object]]] = []
+
+    @property
+    def status(self) -> str:
+        return "live" if self.active_session_id else "idle"
+
+    @property
+    def media_status(self) -> dict[str, object]:
+        return {"status": "idle"}
+
+    def record_tool_lifecycle(
+        self,
+        session_id: str,
+        name: str,
+        *,
+        data: dict[str, object],
+    ) -> None:
+        self.tool_lifecycle.append((session_id, name, data))
 
     def register_handoff(self, session_id: str, record: object) -> bool:
         self.registrations.append((session_id, record))
@@ -93,6 +127,70 @@ class ActiveSessionController:
             "task_id": kwargs["task_id"],
             "block_event_id": kwargs["block_event_id"],
             "decision": kwargs["decision"],
+        }
+
+    async def prepare_youtube_media(self, **kwargs: object) -> dict[str, object]:
+        self.media_preparations.append({"kind": "youtube", **kwargs})
+        if self.media_error is not None:
+            raise MediaPlaybackError(self.media_error)
+        return {
+            "status": "awaiting_confirmation",
+            "pending_id": "pending-youtube-01",
+            "prompt": "Play Selected video by Selected channel?",
+        }
+
+    async def prepare_anime_media(self, **kwargs: object) -> dict[str, object]:
+        self.media_preparations.append({"kind": "anime", **kwargs})
+        if self.media_error == "source_unavailable":
+            raise AnimeSourceUnavailableError("anime catalog returned no search results")
+        if self.media_error == "episode_unavailable":
+            raise MissingAnimeEpisodeError(99)
+        if self.media_error == "stream_unavailable":
+            raise AnimeStreamUnavailableError("embed page had no player config")
+        if self.media_error is not None:
+            raise MediaPlaybackError(self.media_error)
+        return {
+            "status": "awaiting_confirmation",
+            "pending_id": "pending-anime-01",
+            "prompt": "Play Cowboy Bebop, Episode 2 · Subbed?",
+        }
+
+    async def prepare_crunchyroll_media(self, **kwargs: object) -> dict[str, object]:
+        self.media_preparations.append({"kind": "crunchyroll", **kwargs})
+        if self.media_error is not None:
+            if self.media_error.startswith("crunchyroll:"):
+                raise RemotePrototypeError(self.media_error.removeprefix("crunchyroll:"))
+            raise MediaPlaybackError(self.media_error)
+        return {
+            "status": "authentication_required",
+            "provider": "crunchyroll",
+            "login_window_opened": True,
+            "request_query": kwargs["query"],
+            "message": "Scan the QR code in the Crunchyroll window to sign in.",
+        }
+
+    async def decide_media(self, **kwargs: object) -> dict[str, object]:
+        self.media_decisions.append(kwargs)
+        if self.media_error is not None:
+            raise MediaPlaybackError(self.media_error)
+        return {
+            "status": "playing",
+            "pending_id": kwargs["pending_id"],
+            "media_handoff": True,
+        }
+
+    async def choose_anime_media(self, **kwargs: object) -> dict[str, object]:
+        self.media_choices.append(kwargs)
+        if self.media_error == "episode_unavailable":
+            raise MissingAnimeEpisodeError(99)
+        if self.media_error == "stream_unavailable":
+            raise AnimeStreamUnavailableError("embed page had no player config")
+        if self.media_error is not None:
+            raise MediaPlaybackError(self.media_error)
+        return {
+            "status": "awaiting_confirmation",
+            "pending_id": "pending-chosen-01",
+            "prompt": "Play Cowboy Bebop: The Movie, Episode 1 · Subbed?",
         }
 
 
@@ -236,7 +334,7 @@ def test_session_configuration_uses_fast_natural_voice_defaults() -> None:
     session = build_realtime_session(settings())
 
     assert session["type"] == "realtime"
-    assert session["model"] == "gpt-realtime-2.1-mini"
+    assert session["model"] == "gpt-realtime-2.1"
     assert session["reasoning"] == {"effort": "minimal"}
     assert session["output_modalities"] == ["audio"]
     assert session["audio"]["output"]["voice"] == "marin"
@@ -248,7 +346,7 @@ def test_session_configuration_uses_fast_natural_voice_defaults() -> None:
     }
     assert session["audio"]["input"]["transcription"] == {"model": "gpt-4o-mini-transcribe"}
     assert session["tool_choice"] == "auto"
-    assert len(session["tools"]) == 5
+    assert len(session["tools"]) == 10
     assert "Do not claim an action succeeded before its tool result" in session["instructions"]
     assert "resolve_heavy_agent_block" in session["instructions"]
     assert "Never infer approval" in session["instructions"]
@@ -263,15 +361,24 @@ def test_health_reports_model_and_missing_key_without_secret_material() -> None:
     assert response.json() == {
         "status": "ok",
         "api_key_configured": False,
-        "model": "gpt-realtime-2.1-mini",
+        "provider": "openai",
+        "provider_model": "gpt-realtime-2.1",
+        "provider_availability": "active",
+        "model": "gpt-realtime-2.1",
         "capabilities": [
             "assistant_get_current_time",
             "voice_end_session",
             "handoff_to_heavy_agent",
             "check_heavy_agent_task",
             "resolve_heavy_agent_block",
+            "media_prepare_youtube",
+            "media_prepare_anime",
+            "media_choose",
+            "media_prepare_crunchyroll",
+            "media_decide",
         ],
         "controller_status": "idle",
+        "media": {"status": "idle"},
     }
 
 
@@ -324,14 +431,13 @@ def test_session_endpoint_relays_sdp_and_server_owned_configuration() -> None:
     assert response.text == "v=0\r\nmock-answer"
     assert len(upstream.calls) == 1
 
-
     call = upstream.calls[0]
     assert call["url"] == OPENAI_REALTIME_CALLS_URL
     assert call["headers"]["Authorization"] == "Bearer test-secret-key"
     assert call["headers"]["OpenAI-Safety-Identifier"]
     assert call["files"]["sdp"] == (None, "v=0\r\nmock-offer", "application/sdp")
     session_json = call["files"]["session"][1]
-    assert json.loads(session_json)["model"] == "gpt-realtime-2.1-mini"
+    assert json.loads(session_json)["model"] == "gpt-realtime-2.1"
 
 
 def test_session_endpoint_rejects_stale_query_binding_before_upstream() -> None:
@@ -497,6 +603,12 @@ def test_bound_session_issues_scope_and_execute_replays_identical_call() -> None
 
     assert first.status_code == 200
     assert first.json()["ok"] is True
+    assert [name for _session, name, _data in controller.tool_lifecycle] == [
+        "realtime_tool_dispatched",
+        "realtime_tool_result",
+    ]
+    assert controller.tool_lifecycle[0][2]["tool_name"] == "assistant_get_current_time"
+    assert controller.tool_lifecycle[1][2]["ok"] is True
     assert replay.status_code == 200
     assert replay.content == first.content
     assert conflict.status_code == 409
@@ -567,6 +679,349 @@ def test_permission_resolution_is_bound_to_live_scope_and_exact_block_event() ->
     ]
     assert invalid.status_code == 400
     assert invalid.json()["error"]["type"] == "invalid_arguments"
+
+
+def test_media_tools_are_session_bound_and_replay_safe() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_media"},
+        )
+    )
+    controller = ActiveSessionController(active_session_id="local-session-1234")
+    client = TestClient(
+        create_app(
+            settings(),
+            upstream_client=upstream,
+            controller=controller,  # type: ignore[arg-type]
+        )
+    )
+    session = client.post(
+        "/session?local_session_id=local-session-1234",
+        content="v=0\r\nmock-offer",
+        headers={
+            LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE,
+            "Content-Type": "application/sdp",
+        },
+    )
+    scope = session.headers["x-okay-hermes-execution-scope"]
+    headers = {LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE}
+    prepare = {
+        "scope": scope,
+        "call_id": "call_media_prepare_01",
+        "name": "media_prepare_youtube",
+        "arguments": {"query": "latest Technology Connections video"},
+    }
+
+    first = client.post("/execute", json=prepare, headers=headers)
+    replay = client.post("/execute", json=prepare, headers=headers)
+    accept = client.post(
+        "/execute",
+        json={
+            "scope": scope,
+            "call_id": "call_media_decide_01",
+            "name": "media_decide",
+            "arguments": {"pending_id": "pending-youtube-01", "action": "accept"},
+        },
+        headers=headers,
+    )
+
+    assert first.status_code == 200
+    assert first.json()["result"] == {
+        "status": "awaiting_confirmation",
+        "pending_id": "pending-youtube-01",
+        "prompt": "Play Selected video by Selected channel?",
+    }
+    assert "end_session" not in first.text
+    assert replay.content == first.content
+    assert controller.media_preparations == [
+        {
+            "kind": "youtube",
+            "session_id": "local-session-1234",
+            "query": "latest Technology Connections video",
+        }
+    ]
+    assert accept.status_code == 200
+    assert accept.json()["result"]["status"] == "playing"
+    assert accept.json()["result"]["media_handoff"] is True
+    assert "end_session" not in accept.text
+    assert controller.media_decisions[0]["action"] == "accept"
+
+
+def test_anime_prepare_and_compound_revision_are_typed() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_anime"},
+        )
+    )
+    controller = ActiveSessionController(active_session_id="local-session-1234")
+    client = TestClient(
+        create_app(settings(), upstream_client=upstream, controller=controller)  # type: ignore[arg-type]
+    )
+    session = client.post(
+        "/session?local_session_id=local-session-1234",
+        content="v=0\r\nmock-offer",
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE, "Content-Type": "application/sdp"},
+    )
+    scope = session.headers["x-okay-hermes-execution-scope"]
+    headers = {LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE}
+
+    prepared = client.post(
+        "/execute",
+        json={
+            "scope": scope,
+            "call_id": "call_anime_prepare_01",
+            "name": "media_prepare_anime",
+            "arguments": {"query": "Cowboy Bebop", "episode": 1},
+        },
+        headers=headers,
+    )
+    revised = client.post(
+        "/execute",
+        json={
+            "scope": scope,
+            "call_id": "call_anime_revise_01",
+            "name": "media_decide",
+            "arguments": {
+                "pending_id": "pending-anime-01",
+                "action": "revise",
+                "revision": {"episode_offset": 1, "audio_mode": "dub"},
+            },
+        },
+        headers=headers,
+    )
+
+    assert prepared.status_code == 200
+    assert revised.status_code == 200
+    assert controller.media_preparations == [
+        {
+            "kind": "anime",
+            "session_id": "local-session-1234",
+            "query": "Cowboy Bebop",
+            "episode": 1,
+            "episode_offset": None,
+            "audio_mode": "auto",
+        }
+    ]
+    decision = controller.media_decisions[0]
+    assert decision["action"] == "revise"
+    assert decision["revision"].episode_offset == 1  # type: ignore[union-attr]
+    assert decision["revision"].audio_mode == "dub"  # type: ignore[union-attr]
+
+
+def test_media_choose_dispatches_position_to_controller() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_choose"},
+        )
+    )
+    controller = ActiveSessionController(active_session_id="local-session-1234")
+    client = TestClient(
+        create_app(settings(), upstream_client=upstream, controller=controller)  # type: ignore[arg-type]
+    )
+    session = client.post(
+        "/session?local_session_id=local-session-1234",
+        content="v=0\r\nmock-offer",
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE, "Content-Type": "application/sdp"},
+    )
+    scope = session.headers["x-okay-hermes-execution-scope"]
+
+    response = client.post(
+        "/execute",
+        json={
+            "scope": scope,
+            "call_id": "call_choose_01",
+            "name": "media_choose",
+            "arguments": {"position": 2},
+        },
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["result"]["status"] == "awaiting_confirmation"
+    assert controller.media_choices == [
+        {"session_id": "local-session-1234", "position": 2},
+    ]
+
+
+def test_media_choose_rejects_out_of_range_positions_before_dispatch() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_choose_bad"},
+        )
+    )
+    controller = ActiveSessionController(active_session_id="local-session-1234")
+    client = TestClient(
+        create_app(settings(), upstream_client=upstream, controller=controller)  # type: ignore[arg-type]
+    )
+    session = client.post(
+        "/session?local_session_id=local-session-1234",
+        content="v=0\r\nmock-offer",
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE, "Content-Type": "application/sdp"},
+    )
+    scope = session.headers["x-okay-hermes-execution-scope"]
+
+    response = client.post(
+        "/execute",
+        json={
+            "scope": scope,
+            "call_id": "call_choose_bad_01",
+            "name": "media_choose",
+            "arguments": {"position": 12},
+        },
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
+    )
+
+    assert response.status_code == 400
+    assert controller.media_choices == []
+
+
+def test_explicit_crunchyroll_request_opens_official_login_without_unofficial_fallback() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_crunchyroll"},
+        )
+    )
+    controller = ActiveSessionController(active_session_id="local-session-1234")
+    client = TestClient(
+        create_app(settings(), upstream_client=upstream, controller=controller)  # type: ignore[arg-type]
+    )
+    session = client.post(
+        "/session?local_session_id=local-session-1234",
+        content="v=0\r\nmock-offer",
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE, "Content-Type": "application/sdp"},
+    )
+
+    response = client.post(
+        "/execute",
+        json={
+            "scope": session.headers["x-okay-hermes-execution-scope"],
+            "call_id": "call_crunchyroll_prepare_01",
+            "name": "media_prepare_crunchyroll",
+            "arguments": {
+                "query": "Cowboy Bebop on Crunchyroll",
+                "episode": 2,
+                "audio_mode": "dub",
+            },
+        },
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"] == {
+        "status": "authentication_required",
+        "provider": "crunchyroll",
+        "login_window_opened": True,
+        "request_query": "Cowboy Bebop on Crunchyroll",
+        "message": "Scan the QR code in the Crunchyroll window to sign in.",
+    }
+    assert controller.media_preparations == [
+        {
+            "kind": "crunchyroll",
+            "session_id": "local-session-1234",
+            "query": "Cowboy Bebop on Crunchyroll",
+            "episode": 2,
+            "audio_mode": "dub",
+        }
+    ]
+
+
+def test_crunchyroll_startup_failure_is_actionable_and_does_not_close_session() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_crunchyroll_failure"},
+        )
+    )
+    controller = ActiveSessionController(
+        active_session_id="local-session-1234",
+        media_error="crunchyroll:loopback debug port 49200 is already in use",
+    )
+    client = TestClient(
+        create_app(settings(), upstream_client=upstream, controller=controller)  # type: ignore[arg-type]
+    )
+    session = client.post(
+        "/session?local_session_id=local-session-1234",
+        content="v=0\r\nmock-offer",
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE, "Content-Type": "application/sdp"},
+    )
+
+    response = client.post(
+        "/execute",
+        json={
+            "scope": session.headers["x-okay-hermes-execution-scope"],
+            "call_id": "call_crunchyroll_failure_01",
+            "name": "media_prepare_crunchyroll",
+            "arguments": {"query": "Cowboy Bebop on Crunchyroll"},
+        },
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "type": "crunchyroll_login_failed",
+        "message": "loopback debug port 49200 is already in use",
+    }
+    assert "end_session" not in response.json()
+
+
+def test_youtube_playback_failure_is_actionable_and_does_not_close_session() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_media_failure"},
+        )
+    )
+    controller = ActiveSessionController(
+        active_session_id="local-session-1234",
+        media_error="mpv is not installed or is not executable",
+    )
+    client = TestClient(
+        create_app(
+            settings(),
+            upstream_client=upstream,
+            controller=controller,  # type: ignore[arg-type]
+        )
+    )
+    session = client.post(
+        "/session?local_session_id=local-session-1234",
+        content="v=0\r\nmock-offer",
+        headers={
+            LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE,
+            "Content-Type": "application/sdp",
+        },
+    )
+
+    failure = client.post(
+        "/execute",
+        json={
+            "scope": session.headers["x-okay-hermes-execution-scope"],
+            "call_id": "call_media_failure_01",
+            "name": "media_prepare_youtube",
+            "arguments": {"query": "specific video"},
+        },
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
+    )
+
+    assert failure.status_code == 503
+    assert failure.json()["error"] == {
+        "type": "media_playback_failed",
+        "message": "mpv is not installed or is not executable",
+    }
+    assert "end_session" not in failure.json()
 
 
 def test_execute_rejects_missing_or_stale_scope() -> None:
@@ -823,3 +1278,119 @@ def test_internal_open_is_loopback_only_and_response_is_sanitized() -> None:
     assert "session" not in local.text
     assert remote.status_code == 403
     assert launcher.urls and "activation=launch-token-private" in launcher.urls[0]
+
+
+@pytest.mark.parametrize("name,arguments", [
+    ("media_prepare_anime", {"query": "Cowboy Bebop", "episode": 99}),
+    ("media_choose", {"position": 1}),
+])
+def test_missing_anime_episode_asks_user_without_substitution(name: str, arguments: dict) -> None:
+    controller = ActiveSessionController(
+        active_session_id="local-session-missing-episode", media_error="episode_unavailable",
+    )
+    upstream = StubUpstreamClient(httpx.Response(
+        201, text="v=0\r\nanswer", headers={"Location": "/v1/realtime/calls/missing_episode"},
+    ))
+    client = TestClient(create_app(
+        settings(), upstream_client=upstream, controller=controller,  # type: ignore[arg-type]
+    ))
+    session = client.post(
+        "/session?local_session_id=local-session-missing-episode",
+        content="v=0\r\noffer",
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE, "Content-Type": "application/sdp"},
+    )
+    response = client.post(
+        "/execute",
+        json={
+            "scope": session.headers["x-okay-hermes-execution-scope"],
+            "call_id": "call_missing_episode", "name": name, "arguments": arguments,
+        },
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["ok"] is False
+    assert body["error"] == {
+        "type": "episode_unavailable", "message": "episode 99 is not available", "episode": 99,
+    }
+    assert "ask the user" in body["follow_up"].casefold()
+    assert "do not substitute" in body["follow_up"].casefold()
+
+
+def test_anime_source_unavailable_is_not_reported_as_bad_arguments() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_source_down"},
+        )
+    )
+    controller = ActiveSessionController(
+        active_session_id="local-session-source-down",
+        media_error="source_unavailable",
+    )
+    client = TestClient(
+        create_app(settings(), upstream_client=upstream, controller=controller)  # type: ignore[arg-type]
+    )
+    session = client.post(
+        "/session?local_session_id=local-session-source-down",
+        content="v=0\r\nmock-offer",
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE, "Content-Type": "application/sdp"},
+    )
+    scope = session.headers["x-okay-hermes-execution-scope"]
+
+    response = client.post(
+        "/execute",
+        json={
+            "scope": scope,
+            "call_id": "call_source_down_01",
+            "name": "media_prepare_anime",
+            "arguments": {"query": "Cowboy", "episode": 1},
+        },
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
+    )
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["error"]["type"] == "source_unavailable"
+    assert "do not retry" in body["follow_up"].casefold()
+
+
+def test_anime_stream_unavailable_is_distinct_from_catalog_outage() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_stream_down"},
+        )
+    )
+    controller = ActiveSessionController(
+        active_session_id="local-session-stream-down",
+        media_error="stream_unavailable",
+    )
+    client = TestClient(
+        create_app(settings(), upstream_client=upstream, controller=controller)  # type: ignore[arg-type]
+    )
+    session = client.post(
+        "/session?local_session_id=local-session-stream-down",
+        content="v=0\r\nmock-offer",
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE, "Content-Type": "application/sdp"},
+    )
+    scope = session.headers["x-okay-hermes-execution-scope"]
+
+    response = client.post(
+        "/execute",
+        json={
+            "scope": scope,
+            "call_id": "call_stream_down_01",
+            "name": "media_choose",
+            "arguments": {"position": 1},
+        },
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
+    )
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["error"]["type"] == "stream_unavailable"
+    assert "do not call media_choose again" in body["follow_up"].casefold()

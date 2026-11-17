@@ -18,17 +18,30 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.websockets import WebSocketDisconnect
 
+from .anime import (
+    AnimeSourceUnavailableError,
+    AnimeStreamUnavailableError,
+    MissingAnimeEpisodeError,
+)
 from .capabilities import (
     CAPABILITIES,
     CapabilityBroker,
     UnknownCapabilityError,
     latest_handoff,
+    parse_media_choose_arguments,
+    parse_media_decision_arguments,
+    parse_media_prepare_anime_arguments,
+    parse_media_prepare_crunchyroll_arguments,
+    parse_media_prepare_youtube_arguments,
     parse_permission_resolution_arguments,
 )
 from .config import Settings, build_realtime_session
+from .crunchyroll_remote.contracts import RemotePrototypeError
+from .media import MediaPlaybackError, MediaPlaybackManager, YouTubeResolver
 from .runtime.browser import NoopBrowserHandle
 from .runtime.controller import StaleControlMessage, VoiceSessionController
 from .runtime.protocol import StopMessage
+from .runtime.timing import JsonValue
 from .runtime.tokens import LaunchTokenStore
 
 OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
@@ -41,7 +54,6 @@ LOCAL_EXECUTION_SCOPE_HEADER = "X-Okay-Hermes-Execution-Scope"
 MAX_OPENAI_CALLS_PER_SESSION = 512
 _LOCAL_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,128}$")
 logger = logging.getLogger(__name__)
-
 
 
 class ExecutionRequest(BaseModel):
@@ -66,9 +78,54 @@ def _execution_fingerprint(execution_request: ExecutionRequest) -> str:
     return hashlib.sha256(canonical_request.encode()).hexdigest()
 
 
+def _bounded_trace_text(value: object, limit: int = 240) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return text[:limit]
+
+
+def _tool_dispatch_trace_data(execution_request: ExecutionRequest) -> dict[str, JsonValue]:
+    arguments = execution_request.arguments
+    if isinstance(arguments, dict):
+        argument_summary: JsonValue = {
+            key: _bounded_trace_text(value, 120)
+            for key, value in list(arguments.items())[:8]
+        }
+    else:
+        argument_summary = _bounded_trace_text(arguments)
+    return {
+        "call_id": execution_request.call_id,
+        "tool_name": execution_request.name,
+        "arguments": argument_summary,
+    }
+
+
+def _tool_result_trace_data(body: dict[str, Any]) -> dict[str, JsonValue]:
+    error_value = body.get("error")
+    error: dict[str, Any] = error_value if isinstance(error_value, dict) else {}
+    result_value = body.get("result")
+    payload: dict[str, Any] = result_value if isinstance(result_value, dict) else {}
+    data: dict[str, JsonValue] = {
+        "ok": body.get("ok") is True,
+        "error_type": _bounded_trace_text(error.get("type", "")),
+        "message": _bounded_trace_text(error.get("message", "")),
+        "detail": _bounded_trace_text(error.get("detail", "")),
+        "status": _bounded_trace_text(payload.get("status", "")),
+    }
+    choices = payload.get("choices")
+    if isinstance(choices, list):
+        data["choice_count"] = len(choices)
+        data["choice_titles"] = [
+            _bounded_trace_text(
+                item.get("title", "") if isinstance(item, dict) else "",
+                120,
+            )
+            for item in choices[:5]
+        ]
+    return data
+
+
 class AsyncPostClient(Protocol):
     async def post(self, url: str, **kwargs: Any) -> httpx.Response: ...
-
 
 
 def _safety_identifier() -> str:
@@ -208,6 +265,7 @@ def create_app(
     controller: VoiceSessionController | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
+    voice_provider = settings.provider_contract
     broker = broker or CapabilityBroker()
     web_root = Path(__file__).resolve().parent / "web"
     index_html = web_root / "index.html"
@@ -221,15 +279,23 @@ def create_app(
         def launch(self, loopback_url: str) -> NoopBrowserHandle:
             return NoopBrowserHandle()
 
-    _controller = (
-        controller
-        if controller is not None
-        else VoiceSessionController(
+    if controller is not None:
+        _controller = controller
+    else:
+        media_manager = MediaPlaybackManager(
+            resolver=YouTubeResolver(
+                yt_dlp_bin=settings.yt_dlp_bin,
+                timeout_seconds=settings.youtube_resolve_timeout_seconds,
+                browser_cookies=settings.youtube_browser_cookies,
+            ),
+            mpv_bin=settings.mpv_bin,
+        )
+        _controller = VoiceSessionController(
             launcher=_DiagnosticLauncher(),
             token_store=LaunchTokenStore(),
             capability_broker=broker,
+            media_manager=media_manager,
         )
-    )
 
     active_session_id: str | None = None
     active_execution_scope: str | None = None
@@ -297,9 +363,13 @@ def create_app(
         return {
             "status": "ok",
             "api_key_configured": settings.api_key_value() is not None,
+            "provider": voice_provider.id,
+            "provider_model": settings.provider_model,
+            "provider_availability": voice_provider.availability,
             "model": settings.realtime_model,
             "capabilities": [capability.name for capability in CAPABILITIES],
             "controller_status": _controller.status,
+            "media": _controller.media_status,
         }
 
     @app.post("/execute")
@@ -364,8 +434,81 @@ def create_app(
                 },
             )
 
+        _controller.record_tool_lifecycle(
+            active_session_id,
+            "realtime_tool_dispatched",
+            data=_tool_dispatch_trace_data(execution_request),
+        )
+
         try:
-            if execution_request.name == "resolve_heavy_agent_block":
+            if execution_request.name == "media_prepare_youtube":
+                youtube = parse_media_prepare_youtube_arguments(execution_request.arguments)
+                playback_result = await _controller.prepare_youtube_media(
+                    session_id=active_session_id,
+                    query=youtube.query,
+                )
+                result = {
+                    "ok": True,
+                    "capability": execution_request.name,
+                    "execution": "local",
+                    "result": playback_result,
+                }
+            elif execution_request.name == "media_prepare_anime":
+                anime = parse_media_prepare_anime_arguments(execution_request.arguments)
+                anime_result = await _controller.prepare_anime_media(
+                    session_id=active_session_id,
+                    query=anime.query,
+                    episode=anime.episode,
+                    episode_offset=anime.episode_offset,
+                    audio_mode=anime.audio_mode,
+                )
+                result = {
+                    "ok": True,
+                    "capability": execution_request.name,
+                    "execution": "local",
+                    "result": anime_result,
+                }
+            elif execution_request.name == "media_choose":
+                chosen = parse_media_choose_arguments(execution_request.arguments)
+                chosen_result = await _controller.choose_anime_media(
+                    session_id=active_session_id,
+                    position=chosen.position,
+                )
+                result = {
+                    "ok": True,
+                    "capability": execution_request.name,
+                    "execution": "local",
+                    "result": chosen_result,
+                }
+            elif execution_request.name == "media_prepare_crunchyroll":
+                crunchyroll = parse_media_prepare_crunchyroll_arguments(execution_request.arguments)
+                crunchyroll_result = await _controller.prepare_crunchyroll_media(
+                    session_id=active_session_id,
+                    query=crunchyroll.query,
+                    episode=crunchyroll.episode,
+                    audio_mode=crunchyroll.audio_mode,
+                )
+                result = {
+                    "ok": True,
+                    "capability": execution_request.name,
+                    "execution": "local",
+                    "result": crunchyroll_result,
+                }
+            elif execution_request.name == "media_decide":
+                decision = parse_media_decision_arguments(execution_request.arguments)
+                decision_result = await _controller.decide_media(
+                    session_id=active_session_id,
+                    pending_id=decision.pending_id,
+                    action=decision.action,
+                    revision=decision.revision,
+                )
+                result = {
+                    "ok": True,
+                    "capability": execution_request.name,
+                    "execution": "local",
+                    "result": decision_result,
+                }
+            elif execution_request.name == "resolve_heavy_agent_block":
                 permission = parse_permission_resolution_arguments(execution_request.arguments)
                 permission_result = await _controller.resolve_task_permission(
                     session_id=active_session_id,
@@ -385,9 +528,11 @@ def create_app(
                 if execution_request.name == "handoff_to_heavy_agent" and result.get("ok") is True:
                     handoff = latest_handoff()
                     returned_task = result.get("result", {}).get("task", {})
-                    returned_task_id = str(
-                        returned_task.get("id") or returned_task.get("task_id") or ""
-                    ) if isinstance(returned_task, dict) else ""
+                    returned_task_id = (
+                        str(returned_task.get("id") or returned_task.get("task_id") or "")
+                        if isinstance(returned_task, dict)
+                        else ""
+                    )
                     if handoff is not None and handoff.task_id == returned_task_id:
                         _controller.register_handoff(active_session_id, handoff)
         except UnknownCapabilityError as exc:
@@ -396,6 +541,66 @@ def create_app(
                 "ok": False,
                 "call_id": execution_request.call_id,
                 "error": {"type": "unknown_capability", "message": str(exc)},
+            }
+        except RemotePrototypeError as exc:
+            status_code = 503
+            body = {
+                "ok": False,
+                "call_id": execution_request.call_id,
+                "error": {"type": "crunchyroll_login_failed", "message": str(exc)},
+            }
+        except MediaPlaybackError as exc:
+            status_code = 503
+            body = {
+                "ok": False,
+                "call_id": execution_request.call_id,
+                "error": {"type": "media_playback_failed", "message": str(exc)},
+            }
+        except MissingAnimeEpisodeError as exc:
+            status_code = 409
+            body = {
+                "ok": False,
+                "call_id": execution_request.call_id,
+                "error": {
+                    "type": "episode_unavailable",
+                    "message": str(exc),
+                    "episode": exc.episode,
+                },
+                "follow_up": (
+                    "Tell the user the requested episode is unavailable and ask the user "
+                    "which episode to try instead. Do not substitute another episode "
+                    "or retry playback without their choice."
+                ),
+            }
+        except AnimeStreamUnavailableError as exc:
+            status_code = 503
+            body = {
+                "ok": False,
+                "call_id": execution_request.call_id,
+                "error": {
+                    "type": "stream_unavailable",
+                    "message": "playback source is temporarily unavailable",
+                    "detail": _bounded_trace_text(str(exc)),
+                },
+                "follow_up": (
+                    "Briefly say this title's playback source is unavailable. Offer to try another "
+                    "listed title or try again later. Do not call media_choose again."
+                ),
+            }
+        except AnimeSourceUnavailableError as exc:
+            status_code = 503
+            body = {
+                "ok": False,
+                "call_id": execution_request.call_id,
+                "error": {
+                    "type": "source_unavailable",
+                    "message": "anime catalog is temporarily unavailable",
+                    "detail": _bounded_trace_text(str(exc)),
+                },
+                "follow_up": (
+                    "Briefly tell the user the anime catalog is temporarily unavailable. "
+                    "Do not retry this source and do not rewrite the title."
+                ),
             }
         except (ValueError, RuntimeError) as exc:
             status_code = 400
@@ -409,6 +614,11 @@ def create_app(
             body = {"call_id": execution_request.call_id, **result}
 
         body_json = json.dumps(body, separators=(",", ":"))
+        _controller.record_tool_lifecycle(
+            active_session_id,
+            "realtime_tool_result",
+            data=_tool_result_trace_data(body),
+        )
         execution_results_by_call_id[execution_request.call_id] = (
             fingerprint,
             status_code,
@@ -419,6 +629,11 @@ def create_app(
     @app.post("/session")
     async def create_realtime_session(request: Request) -> Response:
         nonlocal active_execution_scope, active_session_id, latest_session_attempt
+        if voice_provider.availability != "active":
+            raise HTTPException(
+                status_code=503,
+                detail=f"{voice_provider.display_name} transport is contract-only in this build",
+            )
         if settings.api_key_value() is None:
             raise HTTPException(
                 status_code=503,

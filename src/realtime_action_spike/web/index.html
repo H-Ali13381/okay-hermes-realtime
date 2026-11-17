@@ -33,6 +33,26 @@
               requests appear in the inspector before the local test broker returns a result.
             </p>
           </div>
+          <section
+            id="media-confirmation"
+            class="media-confirmation"
+            data-visible="false"
+            aria-live="polite"
+            aria-atomic="true"
+          >
+            <div class="media-artwork" aria-hidden="true">
+              <img id="media-thumbnail" alt="" hidden />
+              <span id="media-fallback-mark">▶</span>
+            </div>
+            <div class="media-confirmation-copy">
+              <div id="media-badge" class="media-badge">Media</div>
+              <h3 id="media-title">Selection</h3>
+              <p id="media-subtitle" class="media-subtitle"></p>
+              <p id="media-prompt" class="media-prompt"></p>
+              <ol id="media-choice-list" class="media-choice-list" hidden></ol>
+              <p class="media-natural-reply">Respond naturally</p>
+            </div>
+          </section>
           <div class="examples" aria-label="Suggested tests">
             <div class="example"><strong>Direct answer:</strong> “Tell me why CRTs need a flyback transformer.”</div>
             <div class="example"><strong>Local utility:</strong> “What time is it in Tokyo?”</div>

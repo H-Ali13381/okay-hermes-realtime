@@ -32,3 +32,16 @@ health handling, menu actions, and browser-launch ownership. The original
 project's Apache-2.0 license remains applicable to the adapted portions.
 
 Apache License 2.0: https://www.apache.org/licenses/LICENSE-2.0
+
+## TweetNaCl.js
+
+- **Component**: `src/realtime_action_spike/crunchyroll_remote/assets/tweetnacl.min.js`
+- **Upstream**: TweetNaCl.js by Dmitry Chestnykh and contributors
+- **Version / revision**: 1.0.3, commit `5bf1ff5fa15e89ae249401b0d5aa54c5c5955041`
+- **License**: Unlicense / public domain dedication
+- **Source URL**: https://github.com/dchest/tweetnacl-js
+- **Vendored SHA-256**: `3ec535c004aeeb225785d8e93fb33bf99f52e399bd7dfc01969b5629baea5131`
+- **License text**: `src/realtime_action_spike/crunchyroll_remote/assets/TWEETNACL-LICENSE.txt`
+
+The vendored browser build provides authenticated encryption for the temporary
+phone remote without a CDN or external runtime dependency.
