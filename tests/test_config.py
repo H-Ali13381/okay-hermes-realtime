@@ -27,6 +27,8 @@ def test_default_instructions_define_voice_to_hermes_routing_policy() -> None:
     assert "say those option numbers and titles once" in instructions
     assert "source_unavailable" in instructions
     assert "do not retry it or" in instructions
+    assert "stream_unavailable" in instructions
+    assert "do not call media_choose again" in instructions
     assert "media_prepare_crunchyroll" in instructions
     assert "explicitly asks for crunchyroll" in instructions
     assert "do not silently use media_prepare_anime" in instructions

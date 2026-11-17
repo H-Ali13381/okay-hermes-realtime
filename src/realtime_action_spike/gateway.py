@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.websockets import WebSocketDisconnect
 
-from .anime import AnimeSourceUnavailableError
+from .anime import AnimeSourceUnavailableError, AnimeStreamUnavailableError
 from .capabilities import (
     CAPABILITIES,
     CapabilityBroker,
@@ -104,6 +104,7 @@ def _tool_result_trace_data(body: dict[str, Any]) -> dict[str, JsonValue]:
         "ok": body.get("ok") is True,
         "error_type": _bounded_trace_text(error.get("type", "")),
         "message": _bounded_trace_text(error.get("message", "")),
+        "detail": _bounded_trace_text(error.get("detail", "")),
         "status": _bounded_trace_text(payload.get("status", "")),
     }
     choices = payload.get("choices")
@@ -550,6 +551,21 @@ def create_app(
                 "ok": False,
                 "call_id": execution_request.call_id,
                 "error": {"type": "media_playback_failed", "message": str(exc)},
+            }
+        except AnimeStreamUnavailableError as exc:
+            status_code = 503
+            body = {
+                "ok": False,
+                "call_id": execution_request.call_id,
+                "error": {
+                    "type": "stream_unavailable",
+                    "message": "playback source is temporarily unavailable",
+                    "detail": _bounded_trace_text(str(exc)),
+                },
+                "follow_up": (
+                    "Briefly say this title's playback source is unavailable. Offer to try another "
+                    "listed title or try again later. Do not call media_choose again."
+                ),
             }
         except AnimeSourceUnavailableError as exc:
             status_code = 503

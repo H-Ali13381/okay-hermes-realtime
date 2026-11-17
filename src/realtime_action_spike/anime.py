@@ -57,6 +57,10 @@ class AnimeSourceUnavailableError(AnimeSourceError):
     """The external anime catalog is unavailable; retrying the query will not help."""
 
 
+class AnimeStreamUnavailableError(AnimeSourceError):
+    """The catalog found the title, but its playback source has no usable stream."""
+
+
 class AnimeAmbiguityError(AnimeSourceError):
     def __init__(self, choices: tuple[str, ...]) -> None:
         self.choices = choices
@@ -654,7 +658,7 @@ def parse_hianime_search_html(payload: bytes) -> tuple[AnimeCandidate, ...]:
 
 def _deobfuscate_embed_blob(blob: str) -> dict[str, object]:
     if not blob or len(blob) > 100_000:
-        raise AnimeSourceUnavailableError("embed page contained no usable player config")
+        raise AnimeStreamUnavailableError("embed page contained no usable player config")
     try:
         raw = base64.b64decode(blob, validate=True)
         decoded = bytes(
@@ -663,9 +667,9 @@ def _deobfuscate_embed_blob(blob: str) -> dict[str, object]:
         )
         payload = json.loads(decoded.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
-        raise AnimeSourceUnavailableError("embed player config was malformed") from exc
+        raise AnimeStreamUnavailableError("embed player config was malformed") from exc
     if not isinstance(payload, dict):
-        raise AnimeSourceUnavailableError("embed player config had an invalid shape")
+        raise AnimeStreamUnavailableError("embed player config had an invalid shape")
     return payload
 
 
@@ -756,11 +760,11 @@ class HianimeTransport(CurlAnimeTransport):
         page = await self._get(embed_url, headers=("--referer", referer))
         match = re.search(r'window\.__P="([^"]*)"', _decode(page, "embed page"))
         if match is None:
-            raise AnimeSourceUnavailableError("embed page had no player config")
+            raise AnimeStreamUnavailableError("embed page had no player config")
         config = _deobfuscate_embed_blob(match.group(1))
         source = config.get("src")
         if not isinstance(source, str):
-            raise AnimeSourceUnavailableError("embed player config had no stream URL")
+            raise AnimeStreamUnavailableError("embed player config had no stream URL")
         stream_url = _validate_stream_url(source)
         return f'<script>file:{json.dumps(stream_url)};</script>'.encode()
 

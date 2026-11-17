@@ -9,7 +9,10 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from realtime_action_spike.anime import AnimeSourceUnavailableError
+from realtime_action_spike.anime import (
+    AnimeSourceUnavailableError,
+    AnimeStreamUnavailableError,
+)
 from realtime_action_spike.config import Settings, build_realtime_session
 from realtime_action_spike.crunchyroll_remote.contracts import RemotePrototypeError
 from realtime_action_spike.gateway import (
@@ -139,6 +142,8 @@ class ActiveSessionController:
         self.media_preparations.append({"kind": "anime", **kwargs})
         if self.media_error == "source_unavailable":
             raise AnimeSourceUnavailableError("anime catalog returned no search results")
+        if self.media_error == "stream_unavailable":
+            raise AnimeStreamUnavailableError("embed page had no player config")
         if self.media_error is not None:
             raise MediaPlaybackError(self.media_error)
         return {
@@ -173,6 +178,8 @@ class ActiveSessionController:
 
     async def choose_anime_media(self, **kwargs: object) -> dict[str, object]:
         self.media_choices.append(kwargs)
+        if self.media_error == "stream_unavailable":
+            raise AnimeStreamUnavailableError("embed page had no player config")
         if self.media_error is not None:
             raise MediaPlaybackError(self.media_error)
         return {
@@ -1305,3 +1312,42 @@ def test_anime_source_unavailable_is_not_reported_as_bad_arguments() -> None:
     body = response.json()
     assert body["error"]["type"] == "source_unavailable"
     assert "do not retry" in body["follow_up"].casefold()
+
+
+def test_anime_stream_unavailable_is_distinct_from_catalog_outage() -> None:
+    upstream = StubUpstreamClient(
+        httpx.Response(
+            201,
+            text="v=0\r\nmock-answer",
+            headers={"Location": "/v1/realtime/calls/call_stream_down"},
+        )
+    )
+    controller = ActiveSessionController(
+        active_session_id="local-session-stream-down",
+        media_error="stream_unavailable",
+    )
+    client = TestClient(
+        create_app(settings(), upstream_client=upstream, controller=controller)  # type: ignore[arg-type]
+    )
+    session = client.post(
+        "/session?local_session_id=local-session-stream-down",
+        content="v=0\r\nmock-offer",
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE, "Content-Type": "application/sdp"},
+    )
+    scope = session.headers["x-okay-hermes-execution-scope"]
+
+    response = client.post(
+        "/execute",
+        json={
+            "scope": scope,
+            "call_id": "call_stream_down_01",
+            "name": "media_choose",
+            "arguments": {"position": 1},
+        },
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
+    )
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["error"]["type"] == "stream_unavailable"
+    assert "do not call media_choose again" in body["follow_up"].casefold()
