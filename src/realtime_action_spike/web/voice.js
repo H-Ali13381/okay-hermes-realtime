@@ -25,7 +25,7 @@ var EPISODE_KEYS = /* @__PURE__ */ new Set([
 ]);
 var RESUME_KEYS = /* @__PURE__ */ new Set(["start_seconds", "duration_seconds", "reason"]);
 var SAFE_ID = /^[A-Za-z0-9_-]{8,128}$/u;
-var IMAGE_HOSTS = /* @__PURE__ */ new Set(["i.ytimg.com", "img.youtube.com", "cdn.xlsbox.com"]);
+var IMAGE_HOSTS = /* @__PURE__ */ new Set(["i.ytimg.com", "img.youtube.com", "cdn.xlsbox.com", "cdn.anipixcdn.co"]);
 function assertExactKeys(value, allowed, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`Invalid media confirmation ${label}`);

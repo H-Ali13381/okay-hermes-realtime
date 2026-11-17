@@ -19,7 +19,7 @@ const EPISODE_KEYS = new Set([
 ]);
 const RESUME_KEYS = new Set(["start_seconds", "duration_seconds", "reason"]);
 const SAFE_ID = /^[A-Za-z0-9_-]{8,128}$/u;
-const IMAGE_HOSTS = new Set(["i.ytimg.com", "img.youtube.com", "cdn.xlsbox.com"]);
+const IMAGE_HOSTS = new Set(["i.ytimg.com", "img.youtube.com", "cdn.xlsbox.com", "cdn.anipixcdn.co"]);
 
 function assertExactKeys(value, allowed, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {

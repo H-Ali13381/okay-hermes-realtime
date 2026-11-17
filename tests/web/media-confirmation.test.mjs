@@ -39,6 +39,17 @@ test("parses a safe exact-session media confirmation", () => {
   assert.equal(parsed.badge, "Anime · Subbed");
 });
 
+test("parses a Hianime poster image without tearing down the voice page", () => {
+  const thumbnailUrl = "https://cdn.anipixcdn.co/thumbnail/1782735600/1065.jpg";
+
+  const parsed = parseMediaConfirmation(
+    confirmation({ thumbnail_url: thumbnailUrl }),
+    "local-session-1234",
+  );
+
+  assert.equal(parsed.thumbnailUrl, thumbnailUrl);
+});
+
 test("rejects stale sessions, unsafe images, unknown fields, and private locators", () => {
   assert.throws(
     () => parseMediaConfirmation(confirmation(), "other-session-1234"),

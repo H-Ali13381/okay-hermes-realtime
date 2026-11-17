@@ -10,6 +10,15 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
+_ALLOWED_THUMBNAIL_HOSTS = frozenset(
+    {
+        "i.ytimg.com",
+        "img.youtube.com",
+        "cdn.xlsbox.com",
+        "cdn.anipixcdn.co",
+    }
+)
+
 
 class TimingName(StrEnum):
     PLAYBACK_SUPPRESSED = "playback_suppressed"
@@ -305,12 +314,7 @@ class MediaConfirmationMessage(_StrictBaseModel):
         parsed = urlsplit(value)
         if (
             parsed.scheme != "https"
-            or parsed.hostname not in {
-                "i.ytimg.com",
-                "img.youtube.com",
-                "cdn.xlsbox.com",
-                "cdn.anipixcdn.co",
-            }
+            or parsed.hostname not in _ALLOWED_THUMBNAIL_HOSTS
             or parsed.username is not None
             or parsed.password is not None
             or parsed.port not in {None, 443}
