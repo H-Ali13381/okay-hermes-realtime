@@ -1,0 +1,18 @@
+flowchart LR
+    Tray["system tray"] -.->|"pause/rearm"| Wake["native wake listener"]
+    Wake -->|"activation socket"| Controller["local controller"]
+
+    Controller --- Broker["scoped /execute broker"]
+    Controller --- Resolver["yt-dlp resolver"]
+    Resolver --> Mpv["paused mpv popup"]
+    Controller --- Brave["dedicated Brave app process"]
+    Controller --- Wire["WebRTC + oai-events"]
+    Wire --- OpenAI["OpenAI Realtime call"]
+
+    classDef primary fill:#e8f1ff,stroke:#1f4e79,color:#111
+    classDef media fill:#ecfdf5,stroke:#047857,color:#111
+    classDef external fill:#f3e8ff,stroke:#6b21a8,color:#111
+
+    class Tray,Wake,Controller primary
+    class Broker,Resolver,Mpv,Brave media
+    class Wire,OpenAI external

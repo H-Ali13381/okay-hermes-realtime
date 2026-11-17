@@ -13,17 +13,9 @@ This project is an OpenAI-specific, independently installable successor to [Okay
 
 ## Runtime topology
 
-```text
-native wake listener ──activation socket──> local controller
-       ▲                                      │
-       │ pause/rearm                          ├─ scoped /execute broker
-       │                                      ├─ yt-dlp resolver → paused mpv popup
-       │                                      └─ dedicated Brave app process
-system tray                                         │
-                                             WebRTC + oai-events
-                                                    │
-                                           OpenAI Realtime call
-```
+![Runtime topology](docs/assets/runtime-topology.svg "Native wake listener → local controller → WebRTC Realtime")
+
+Mermaid source: [runtime-topology.mmd](docs/assets/runtime-topology.mmd).
 
 The controller launches a dedicated Brave app window in its own process group and profile. The page owns one direct WebRTC conversation with the Realtime API; the controller owns session scope, tool authorization, traces, and teardown. Wake detection is paused during a session and re-armed on teardown, including failure paths.
 
