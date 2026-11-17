@@ -5,18 +5,18 @@ import math
 import re
 from collections.abc import Mapping
 from enum import StrEnum
+from importlib.resources import files
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 _ALLOWED_THUMBNAIL_HOSTS = frozenset(
-    {
-        "i.ytimg.com",
-        "img.youtube.com",
-        "cdn.xlsbox.com",
-        "cdn.anipixcdn.co",
-    }
+    json.loads(
+        files("realtime_action_spike")
+        .joinpath("media_image_hosts.json")
+        .read_text(encoding="utf-8")
+    )["hosts"]
 )
 
 

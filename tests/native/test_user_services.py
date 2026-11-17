@@ -150,6 +150,7 @@ def test_built_wheel_contains_runtime_package_web_assets_and_entrypoints(tmp_pat
         assert "realtime_action_spike/service.py" in names
         assert "realtime_action_spike/contracts.py" in names
         assert "realtime_action_spike/media.py" in names
+        assert "realtime_action_spike/media_image_hosts.json" in names
         assert "realtime_action_spike/web/voice.js" in names
         entrypoints = archive.read(
             "openai_realtime_action_spike-0.1.0.dist-info/entry_points.txt"

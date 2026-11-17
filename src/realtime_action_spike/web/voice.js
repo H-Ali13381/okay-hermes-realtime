@@ -3,6 +3,16 @@ function canApplyRemoteAnswer(activePeer, expectedPeer) {
   return activePeer === expectedPeer && expectedPeer?.signalingState !== "closed";
 }
 
+// src/realtime_action_spike/media_image_hosts.json
+var media_image_hosts_default = {
+  hosts: [
+    "i.ytimg.com",
+    "img.youtube.com",
+    "cdn.xlsbox.com",
+    "cdn.anipixcdn.co"
+  ]
+};
+
 // frontend/media-confirmation.js
 var ROOT_KEYS = /* @__PURE__ */ new Set([
   "type",
@@ -25,7 +35,7 @@ var EPISODE_KEYS = /* @__PURE__ */ new Set([
 ]);
 var RESUME_KEYS = /* @__PURE__ */ new Set(["start_seconds", "duration_seconds", "reason"]);
 var SAFE_ID = /^[A-Za-z0-9_-]{8,128}$/u;
-var IMAGE_HOSTS = /* @__PURE__ */ new Set(["i.ytimg.com", "img.youtube.com", "cdn.xlsbox.com", "cdn.anipixcdn.co"]);
+var IMAGE_HOSTS = new Set(media_image_hosts_default.hosts);
 function assertExactKeys(value, allowed, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`Invalid media confirmation ${label}`);

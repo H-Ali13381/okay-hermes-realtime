@@ -1,3 +1,5 @@
+import imageHosts from "../src/realtime_action_spike/media_image_hosts.json" with { type: "json" };
+
 const ROOT_KEYS = new Set([
   "type",
   "session_id",
@@ -19,7 +21,7 @@ const EPISODE_KEYS = new Set([
 ]);
 const RESUME_KEYS = new Set(["start_seconds", "duration_seconds", "reason"]);
 const SAFE_ID = /^[A-Za-z0-9_-]{8,128}$/u;
-const IMAGE_HOSTS = new Set(["i.ytimg.com", "img.youtube.com", "cdn.xlsbox.com", "cdn.anipixcdn.co"]);
+const IMAGE_HOSTS = new Set(imageHosts.hosts);
 
 function assertExactKeys(value, allowed, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
