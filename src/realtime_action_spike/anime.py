@@ -977,21 +977,7 @@ class AnimeSourceAdapter:
         available_numbers = tuple(item.number for item in episodes)
         selected_episode = next((item for item in episodes if item.number == episode), None)
         if selected_episode is None:
-            # Series whose numbering does not include the requested episode (e.g. a
-            # season continuing at 29): resolve the earliest available episode so the
-            # controller's resume logic can still produce a valid proposal.
-            if not episodes:
-                raise MissingAnimeEpisodeError(episode)
-            resolved_mode = self._preference_provider() if audio_mode == "auto" else audio_mode
-            if resolved_mode not in {"sub", "dub"}:
-                raise AnimeSourceError("stored anime audio preference is invalid")
-            return await self._resolve_language_and_stream(
-                selected,
-                episodes[0],
-                episode=episodes[0].number,
-                resolved_mode=resolved_mode,
-                available_numbers=available_numbers,
-            )
+            raise MissingAnimeEpisodeError(episode)
 
         resolved_mode = self._preference_provider() if audio_mode == "auto" else audio_mode
         if resolved_mode not in {"sub", "dub"}:
@@ -1028,12 +1014,7 @@ class AnimeSourceAdapter:
             raise MissingAnimeLanguageError(resolved_mode, tuple(available))
 
         try:
-            master_url = parse_embed_html(await self._transport.fetch_embed(language.embed_url))
-            variants = parse_master_playlist(
-                await self._transport.fetch_playlist(master_url),
-                master_url,
-            )
-            stream_url = select_best_variant(variants).url
+            stream_url = await self._resolve_primary_stream(language.embed_url)
             http_headers: tuple[tuple[str, str], ...] = ()
         except AnimeStreamUnavailableError:
             if self._fallback_resolver is None or resolved_mode != "sub":
@@ -1053,6 +1034,21 @@ class AnimeSourceAdapter:
             http_headers=http_headers,
             available_episode_numbers=available_numbers,
         )
+
+    async def _resolve_primary_stream(self, embed_url: str) -> str:
+        """Classify only embed/playlist failures as playback unavailability."""
+        try:
+            master_url = parse_embed_html(await self._transport.fetch_embed(embed_url))
+            variants = parse_master_playlist(
+                await self._transport.fetch_playlist(master_url), master_url,
+            )
+            return select_best_variant(variants).url
+        except AnimeStreamUnavailableError:
+            raise
+        except AnimeSourceError as exc:
+            # Transport errors share the catalog's error type. Here the catalog and
+            # requested episode/language already resolved; only playback has failed.
+            raise AnimeStreamUnavailableError(str(exc)) from exc
 
     @staticmethod
     def _select_candidate(

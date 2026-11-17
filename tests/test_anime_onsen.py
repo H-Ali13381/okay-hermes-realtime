@@ -57,13 +57,13 @@ class FakeClient:
 
 def _routes(*, exact_mal: bool = True) -> dict[str, FakeResponse]:
     token = "test-session-token"
-    api = "https://api.example.test"
-    search = "https://search.example.test"
+    api = "https://api.animeonsen.xyz"
+    search = "https://search.animeonsen.xyz"
     cookie = _session_cookie(token)
     homepage = FakeResponse(
         text=(
-            '<meta name="ao-api-origin" content="https://api.example.test/v4">'
-            '<meta name="ao-search-origin" content="https://search.example.test">'
+            '<meta name="ao-api-origin" content="https://api.animeonsen.xyz/v4">'
+            '<meta name="ao-search-origin" content="https://search.animeonsen.xyz">'
             '<meta name="ao-search-token" content="search-secret">'
         ),
         cookies=[f"ao.session={cookie}; Path=/"],
@@ -149,3 +149,62 @@ async def test_anime_onsen_resolver_rejects_low_confidence_match() -> None:
 
     with pytest.raises(AnimeSourceError, match="confident"):
         await resolver.resolve("Cowboy Bebop", 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["api", "search"])
+@pytest.mark.parametrize(
+    "origin_template",
+    [
+        "https://foreign.example.test",
+        "https://{host}.foreign.example.test",
+        "https://foreign.{host}",
+        "http://{host}",
+        "//{host}",
+        "https://username:password@{host}",
+        "https://@{host}",
+        "https://{host}:8443",
+        "https://{host}:invalid",
+        "https://[invalid",
+    ],
+)
+async def test_anime_onsen_rejects_unsafe_origin_before_authenticated_calls(
+    kind: str,
+    origin_template: str,
+) -> None:
+    routes = _routes()
+    homepage = routes["https://www.animeonsen.xyz/"]
+    host = f"{kind}.animeonsen.xyz"
+    origin = origin_template.format(host=host)
+    homepage.text = homepage.text.replace(f"https://{host}", origin)
+    client = FakeClient(routes)
+    resolver = AnimeOnsenResolver(client=client)
+
+    with pytest.raises(AnimeSourceError) as exc_info:
+        await resolver.resolve("Cowboy Bebop", 1)
+
+    label = "API" if kind == "api" else "search"
+    assert str(exc_info.value) == f"AnimeOnsen {label} origin is invalid"
+    assert resolver._session is None
+    assert [(method, url) for method, url, _ in client.calls] == [
+        ("POST", "https://graphql.anilist.co"),
+        ("GET", "https://www.animeonsen.xyz/"),
+    ]
+    assert all("Authorization" not in kwargs.get("headers", {}) for _, _, kwargs in client.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["api", "search"])
+async def test_anime_onsen_accepts_explicit_https_port(kind: str) -> None:
+    routes = _routes()
+    origin = f"https://{kind}.animeonsen.xyz"
+    routes["https://www.animeonsen.xyz/"].text = routes[
+        "https://www.animeonsen.xyz/"
+    ].text.replace(origin, f"{origin}:443")
+    client = FakeClient(routes)
+    resolver = AnimeOnsenResolver(client=client)
+
+    session = await resolver._get_session()
+
+    assert getattr(session, f"{kind}_origin") == f"{origin}:443"
+    assert len(client.calls) == 1

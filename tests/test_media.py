@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 import sys
+import tempfile
+from collections.abc import Iterator
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,14 @@ from realtime_action_spike.media import (
     YouTubeVideo,
 )
 from realtime_action_spike.media_catalog import DirectStreamLocator, YouTubePlaybackLocator
+
+
+@pytest.fixture
+def short_runtime_dir() -> Iterator[Path]:
+    # AF_UNIX socket paths must stay under the platform limit even when pytest
+    # uses a long basetemp path.
+    with tempfile.TemporaryDirectory(prefix="ohv-media-") as directory:
+        yield Path(directory)
 
 
 class FakeResolverProcess:
@@ -511,7 +521,10 @@ async def test_launch_starts_confirmed_locator_fullscreen_unpaused_once(
 
 
 @pytest.mark.asyncio
-async def test_launch_passes_bounded_http_headers_to_mpv(tmp_path: Path) -> None:
+@pytest.mark.parametrize("cleanup", ["shutdown", "stop_for_session", "exit"])
+async def test_launch_keeps_http_headers_in_private_config_and_cleans_up(
+    tmp_path: Path, cleanup: str,
+) -> None:
     process = FakePlayerProcess(31200)
     manager, _resolver, factory, _ipc, _signaler = _manager(
         tmp_path,
@@ -536,12 +549,73 @@ async def test_launch_passes_bounded_http_headers_to_mpv(tmp_path: Path) -> None
     )
 
     argv, _kwargs = factory.calls[0]
-    expected_header = (
-        "--http-header-fields=Authorization: Bearer token-value,"
-        "Referer: https://www.example.test/"
+    assert not any(value in arg for arg in argv for _name, value in locator.http_headers)
+    assert not any(arg.startswith("--http-header-fields") for arg in argv)
+    config_path = Path(next(arg.split("=", 1)[1] for arg in argv if arg.startswith("--include=")))
+    assert config_path.parent == tmp_path / "media"
+    assert config_path.stat().st_mode & 0o777 == 0o600
+    assert config_path.parent.stat().st_mode & 0o777 == 0o700
+    expected_header = ",".join(f"{name}: {value}" for name, value in locator.http_headers)
+    quoted_header = f"%{len(expected_header.encode('utf-8'))}%{expected_header}"
+    assert config_path.read_text() == f"http-header-fields={quoted_header}\n"
+
+    if cleanup == "exit":
+        completed = asyncio.Event()
+
+        async def on_complete(_completion: PlaybackCompletion) -> None:
+            completed.set()
+
+        manager.bind_completion_handler(on_complete)
+        process.exit()
+        await asyncio.wait_for(completed.wait(), timeout=0.2)
+    elif cleanup == "stop_for_session":
+        await manager.stop_for_session("voice-session-headers", "pending-accepted-headers")
+    else:
+        await manager.shutdown()
+    assert not config_path.exists()
+    assert not config_path.parent.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["spawn", "cancel", "ipc"])
+async def test_http_header_config_is_cleaned_up_on_launch_failure(
+    tmp_path: Path, failure: str,
+) -> None:
+    process = FakePlayerProcess(31201)
+    manager, _resolver, factory, _ipc, _signaler = _manager(
+        tmp_path, videos=[], processes=[process], ipc=RecordingIpc(exit_on_ready=True),
     )
-    assert expected_header in argv
-    await manager.shutdown()
+    config_paths: list[Path] = []
+
+    async def failing_factory(*argv: str, **kwargs: Any) -> FakePlayerProcess:
+        config_path = Path(
+            next(arg.split("=", 1)[1] for arg in argv if arg.startswith("--include="))
+        )
+        config_paths.append(config_path)
+        assert config_path.exists()
+        if failure == "spawn":
+            raise OSError("simulated spawn failure")
+        if failure == "cancel":
+            raise asyncio.CancelledError
+        return await factory(*argv, **kwargs)
+
+    manager._process_factory = failing_factory
+    expected_error = asyncio.CancelledError if failure == "cancel" else MediaPlaybackError
+    with pytest.raises(expected_error):
+        await manager.launch(
+            session_id="voice-session-headers",
+            playback_id="pending-accepted-headers",
+            locator=DirectStreamLocator(
+                stream_url="https://cdn.example.test/video/manifest.mpd",
+                http_headers=(("Authorization", "Bearer test-only-placeholder"),),
+            ),
+            title="Confirmed title",
+            subtitle="Confirmed subtitle",
+        )
+    assert len(config_paths) == 1
+    assert not config_paths[0].exists()
+    assert not (tmp_path / "media").exists()
+    assert manager.status == {"status": "idle"}
 
 
 @pytest.mark.asyncio
@@ -910,9 +984,9 @@ async def test_shutdown_reaps_playing_player_and_is_idempotent(tmp_path: Path) -
 
 @pytest.mark.asyncio
 async def test_real_subprocess_ipc_prepare_commit_and_process_group_shutdown(
-    tmp_path: Path,
+    short_runtime_dir: Path,
 ) -> None:
-    fake_mpv = tmp_path / "fake-mpv"
+    fake_mpv = short_runtime_dir / "fake-mpv"
     fake_mpv.write_text(
         """#!/usr/bin/env python3
 import json
@@ -944,7 +1018,7 @@ while True:
     manager = MediaPlaybackManager(
         resolver=resolver,
         mpv_bin=str(fake_mpv),
-        runtime_directory=tmp_path / "runtime" / "media",
+        runtime_directory=short_runtime_dir / "runtime" / "media",
         ipc_timeout_seconds=1.0,
         process_exit_timeout_seconds=1.0,
     )
@@ -958,4 +1032,4 @@ while True:
     assert manager.status["status"] == "playing"
     await manager.shutdown()
     assert manager.status == {"status": "idle"}
-    assert list((tmp_path / "runtime").glob("media/*.sock")) == []
+    assert list((short_runtime_dir / "runtime").glob("media/*.sock")) == []

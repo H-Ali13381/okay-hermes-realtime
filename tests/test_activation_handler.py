@@ -4,6 +4,8 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -14,6 +16,16 @@ ACTIVATION = {
     "detected_at": 42.25,
     "native_listener": True,
 }
+
+
+@pytest.fixture
+def socket_dir(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    # Keep AF_UNIX paths independent of long pytest basetemp paths and live sockets.
+    with tempfile.TemporaryDirectory(prefix="act-") as directory:
+        root = Path(directory)
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(root))
+        monkeypatch.setenv("ACTIVATION_SOCKET_PATH", str(root / "activation.sock"))
+        yield root
 
 
 async def _run_handler(payload: bytes, path: Path) -> tuple[int, str, str]:
@@ -65,8 +77,8 @@ async def _serve_once(
 
 
 @pytest.mark.asyncio
-async def test_completed_handler_waits_for_terminal_socket_response(tmp_path: Path) -> None:
-    path = tmp_path / "activation.sock"
+async def test_completed_handler_waits_for_terminal_socket_response(socket_dir: Path) -> None:
+    path = socket_dir / "activation.sock"
     release = asyncio.Event()
     received = asyncio.Event()
     server = await _serve_once(
@@ -95,8 +107,8 @@ async def test_completed_handler_waits_for_terminal_socket_response(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_busy_response_uses_distinct_exit_code(tmp_path: Path) -> None:
-    path = tmp_path / "activation.sock"
+async def test_busy_response_uses_distinct_exit_code(socket_dir: Path) -> None:
+    path = socket_dir / "activation.sock"
     server = await _serve_once(path, {"outcome": "busy"})
 
     code, stdout, stderr = await _run_handler(json.dumps(ACTIVATION).encode(), path)
@@ -109,8 +121,8 @@ async def test_busy_response_uses_distinct_exit_code(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancelled_response_uses_distinct_exit_code(tmp_path: Path) -> None:
-    path = tmp_path / "activation.sock"
+async def test_cancelled_response_uses_distinct_exit_code(socket_dir: Path) -> None:
+    path = socket_dir / "activation.sock"
     server = await _serve_once(
         path,
         {"outcome": "cancelled", "session_id": "local-session-03"},
@@ -130,8 +142,8 @@ async def test_cancelled_response_uses_distinct_exit_code(tmp_path: Path) -> Non
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("payload", [b"", b"not-json", b"{}", b"{} {}"])
-async def test_malformed_stdin_is_sanitized(payload: bytes, tmp_path: Path) -> None:
-    code, stdout, stderr = await _run_handler(payload, tmp_path / "missing.sock")
+async def test_malformed_stdin_is_sanitized(payload: bytes, socket_dir: Path) -> None:
+    code, stdout, stderr = await _run_handler(payload, socket_dir / "missing.sock")
 
     assert code == 1
     assert json.loads(stdout) == {
@@ -142,10 +154,10 @@ async def test_malformed_stdin_is_sanitized(payload: bytes, tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_missing_socket_is_sanitized(tmp_path: Path) -> None:
+async def test_missing_socket_is_sanitized(socket_dir: Path) -> None:
     code, stdout, stderr = await _run_handler(
         json.dumps(ACTIVATION).encode(),
-        tmp_path / "missing" / "activation.sock",
+        socket_dir / "missing" / "activation.sock",
     )
 
     assert code == 1
@@ -157,8 +169,8 @@ async def test_missing_socket_is_sanitized(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_controller_disconnect_is_failed_without_traceback(tmp_path: Path) -> None:
-    path = tmp_path / "activation.sock"
+async def test_controller_disconnect_is_failed_without_traceback(socket_dir: Path) -> None:
+    path = socket_dir / "activation.sock"
     server = await _serve_once(path, None)
 
     code, stdout, stderr = await _run_handler(json.dumps(ACTIVATION).encode(), path)
@@ -173,13 +185,55 @@ async def test_controller_disconnect_is_failed_without_traceback(tmp_path: Path)
     await server.wait_closed()
 
 
-def test_default_socket_path_matches_runtime_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason", ["transport_failure", "session_closed", "socket_unavailable", "invalid_response"]
+)
+async def test_structured_failure_reason_survives_stdout(reason: str, socket_dir: Path) -> None:
+    path = socket_dir / "activation.sock"
+    server = await _serve_once(path, {"outcome": "failed", "error": reason})
+    async with server:
+        code, stdout, stderr = await _run_handler(json.dumps(ACTIVATION).encode(), path)
+
+    assert code == 1
+    assert json.loads(stdout) == {"outcome": "failed", "error": reason}
+    assert stderr == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        "arbitrary private diagnostic\nwith free-form details",
+        "transport_failure: private diagnostic",
+        " transport_failure",
+        "TRANSPORT_FAILURE",
+        "",
+        None,
+        {"reason": "transport_failure", "details": "private diagnostic"},
+        ["transport_failure"],
+        42,
+    ],
+)
+async def test_untrusted_failure_text_is_redacted(error: object, socket_dir: Path) -> None:
+    path = socket_dir / "activation.sock"
+    server = await _serve_once(path, {"outcome": "failed", "error": error})
+    async with server:
+        code, stdout, stderr = await _run_handler(json.dumps(ACTIVATION).encode(), path)
+
+    assert code == 1
+    assert json.loads(stdout) == {"outcome": "failed", "error": "activation failed"}
+    assert stderr == ""
+
+
+def test_default_socket_path_matches_runtime_contract(
+    monkeypatch: pytest.MonkeyPatch, socket_dir: Path
+) -> None:
     from realtime_action_spike.activation_handler import _resolve_socket_path
 
     monkeypatch.delenv("ACTIVATION_SOCKET_PATH", raising=False)
-    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
 
-    assert _resolve_socket_path() == "/run/user/1000/okay-hermes-realtime/activation.sock"
+    assert _resolve_socket_path() == str(socket_dir / "okay-hermes-realtime" / "activation.sock")
 
 
 @pytest.mark.parametrize(

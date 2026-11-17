@@ -18,7 +18,11 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.websockets import WebSocketDisconnect
 
-from .anime import AnimeSourceUnavailableError, AnimeStreamUnavailableError
+from .anime import (
+    AnimeSourceUnavailableError,
+    AnimeStreamUnavailableError,
+    MissingAnimeEpisodeError,
+)
 from .capabilities import (
     CAPABILITIES,
     CapabilityBroker,
@@ -551,6 +555,22 @@ def create_app(
                 "ok": False,
                 "call_id": execution_request.call_id,
                 "error": {"type": "media_playback_failed", "message": str(exc)},
+            }
+        except MissingAnimeEpisodeError as exc:
+            status_code = 409
+            body = {
+                "ok": False,
+                "call_id": execution_request.call_id,
+                "error": {
+                    "type": "episode_unavailable",
+                    "message": str(exc),
+                    "episode": exc.episode,
+                },
+                "follow_up": (
+                    "Tell the user the requested episode is unavailable and ask the user "
+                    "which episode to try instead. Do not substitute another episode "
+                    "or retry playback without their choice."
+                ),
             }
         except AnimeStreamUnavailableError as exc:
             status_code = 503

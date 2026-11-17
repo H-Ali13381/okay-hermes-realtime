@@ -12,6 +12,10 @@ import httpx
 from .anime import AnimeFallbackStream, AnimeStreamUnavailableError, _title_fit_score
 
 _SITE = "https://www.animeonsen.xyz"
+_AUTHENTICATED_ORIGIN_HOSTS = {
+    "API": frozenset({"api.animeonsen.xyz"}),
+    "search": frozenset({"search.animeonsen.xyz"}),
+}
 _ANILIST_URL = "https://graphql.anilist.co"
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -117,19 +121,34 @@ class AnimeOnsenResolver:
         search_token = meta.get("ao-search-token")
         if not api_origin or not search_origin or not search_token:
             raise AnimeStreamUnavailableError("AnimeOnsen session bootstrap data missing")
-        parsed_api = urlsplit(api_origin)
-        parsed_search = urlsplit(search_origin)
-        if parsed_api.scheme != "https" or not parsed_api.hostname:
-            raise AnimeStreamUnavailableError("AnimeOnsen API origin is invalid")
-        if parsed_search.scheme != "https" or not parsed_search.hostname:
-            raise AnimeStreamUnavailableError("AnimeOnsen search origin is invalid")
+        validated_api = self._validated_origin(api_origin, "API")
+        validated_search = self._validated_origin(search_origin, "search")
         self._session = _Session(
             token=self._decode_token(cookie),
-            api_origin=f"{parsed_api.scheme}://{parsed_api.netloc}",
-            search_origin=f"{parsed_search.scheme}://{parsed_search.netloc}",
+            api_origin=validated_api,
+            search_origin=validated_search,
             search_token=search_token,
         )
         return self._session
+
+    @staticmethod
+    def _validated_origin(origin: str, kind: str) -> str:
+        # Bootstrap HTML is untrusted: never let it choose where credentials go.
+        try:
+            parsed = urlsplit(origin)
+            valid = (
+                parsed.scheme == "https"
+                and parsed.hostname in _AUTHENTICATED_ORIGIN_HOSTS[kind]
+                and parsed.username is None
+                and parsed.password is None
+                and parsed.port in {None, 443}
+            )
+        except ValueError:
+            # URL parser errors can contain attacker-controlled input or secrets.
+            raise AnimeStreamUnavailableError(f"AnimeOnsen {kind} origin is invalid") from None
+        if not valid:
+            raise AnimeStreamUnavailableError(f"AnimeOnsen {kind} origin is invalid")
+        return f"https://{parsed.hostname}" + (":443" if parsed.port == 443 else "")
 
     @staticmethod
     def _decode_token(cookie: str) -> str:

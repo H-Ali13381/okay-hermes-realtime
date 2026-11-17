@@ -17,6 +17,7 @@ from realtime_action_spike.anime import (
     AnimeStreamUnavailableError,
     CurlAnimeTransport,
     HianimeTransport,
+    MissingAnimeEpisodeError,
     MissingAnimeLanguageError,
     parse_embed_html,
     parse_episode_json,
@@ -379,6 +380,72 @@ class DeadEmbedTransport(FixtureTransport):
         raise AnimeStreamUnavailableError("embed page had no player config")
 
 
+class BrokenStreamTransport(FixtureTransport):
+    def __init__(self, failure: str) -> None:
+        super().__init__()
+        self.failure = failure
+
+    async def fetch_embed(self, url: str) -> bytes:
+        if self.failure == "embed_request":
+            raise AnimeSourceUnavailableError("anime source request failed")
+        if self.failure == "embed_payload":
+            return b"<html>dead embed</html>"
+        if self.failure == "stream_url":
+            return b"file: 'https://evil.example/master.m3u8'"
+        return await super().fetch_embed(url)
+
+    async def fetch_playlist(self, url: str) -> bytes:
+        if self.failure == "playlist_request":
+            raise AnimeSourceUnavailableError("anime source request timed out")
+        return b"#EXTM3U\n# dead playlist\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [
+    "embed_request", "embed_payload", "stream_url", "playlist_request", "playlist_payload",
+])
+@pytest.mark.parametrize("with_fallback", [False, True])
+async def test_adapter_bounds_stream_stage_failures(failure: str, with_fallback: bool) -> None:
+    fallback = RecordingFallbackResolver(AnimeFallbackStream(
+        stream_url="https://cdn.example.test/video/manifest.mpd",
+        http_headers=(),
+        source="animeonsen",
+    ))
+    adapter = AnimeSourceAdapter(
+        transport=BrokenStreamTransport(failure),
+        preference_provider=lambda: "sub",
+        fallback_resolver=fallback if with_fallback else None,
+    )
+
+    if with_fallback:
+        result = await adapter.resolve("Cowboy Bebop", episode=2)
+        assert result.stream_url == fallback.stream.stream_url
+        assert result.episode == 2
+        assert fallback.calls == [("Cowboy Bebop", 2)]
+    else:
+        with pytest.raises(AnimeStreamUnavailableError):
+            await adapter.resolve("Cowboy Bebop", episode=2)
+        assert fallback.calls == []
+
+
+@pytest.mark.asyncio
+async def test_catalog_failure_does_not_trigger_stream_fallback() -> None:
+    fallback = RecordingFallbackResolver(AnimeFallbackStream(
+        stream_url="https://cdn.example.test/video/manifest.mpd",
+        http_headers=(),
+        source="animeonsen",
+    ))
+    adapter = AnimeSourceAdapter(
+        transport=FixtureTransport(search=b"<html>dead catalog</html>"),
+        preference_provider=lambda: "sub",
+        fallback_resolver=fallback,
+    )
+
+    with pytest.raises(AnimeSourceUnavailableError):
+        await adapter.resolve("Cowboy Bebop")
+    assert fallback.calls == []
+
+
 class RecordingFallbackResolver:
     def __init__(self, stream: AnimeFallbackStream) -> None:
         self.stream = stream
@@ -486,13 +553,16 @@ async def test_adapter_returns_typed_ambiguity_instead_of_guessing() -> None:
 
 
 @pytest.mark.asyncio
-async def test_adapter_falls_back_to_first_episode_when_numbering_skips_request() -> None:
-    adapter = AnimeSourceAdapter(transport=FixtureTransport(), preference_provider=lambda: "sub")
+@pytest.mark.parametrize("method", ["resolve", "resolve_or_rank"])
+async def test_adapter_rejects_missing_episode_without_resolving_another(method: str) -> None:
+    transport = FixtureTransport()
+    adapter = AnimeSourceAdapter(transport=transport, preference_provider=lambda: "sub")
 
-    result = await adapter.resolve("Cowboy Bebop", episode=99, audio_mode="auto")
+    with pytest.raises(MissingAnimeEpisodeError) as caught:
+        await getattr(adapter, method)("Cowboy Bebop", episode=99, audio_mode="auto")
 
-    assert result.episode == 1
-    assert result.available_episode_numbers == (1, 2)
+    assert caught.value.episode == 99
+    assert transport.calls == [("search", "Cowboy Bebop"), ("episodes", 1065)]
 
 
 @pytest.mark.asyncio

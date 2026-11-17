@@ -10,6 +10,7 @@ import os
 import secrets
 import shutil
 import signal
+import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -358,6 +359,7 @@ class _OwnedPlayer:
     video: YouTubeVideo
     process: PlayerProcess
     ipc_path: Path
+    http_header_config_path: Path | None = None
     status: Literal["starting", "playing"] = "starting"
     watcher: asyncio.Task[None] | None = None
     sampler: asyncio.Task[None] | None = None
@@ -462,16 +464,28 @@ class MediaPlaybackManager:
             ipc_path = self._runtime_directory / f"{playback_id}.sock"
             ipc_path.unlink(missing_ok=True)
             http_headers = locator.http_headers if isinstance(locator, DirectStreamLocator) else ()
-            argv = self._build_confirmed_mpv_argv(
-                mpv_path=mpv_path,
-                yt_dlp_path=yt_dlp_path,
-                browser_cookies=browser_cookies,
-                ipc_path=ipc_path,
-                target=target,
-                start_seconds=start_seconds,
-                http_headers=http_headers,
-            )
+            http_header_config_path: Path | None = None
             try:
+                if http_headers:
+                    # NamedTemporaryFile creates the include atomically with mode 0600.
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", encoding="utf-8", dir=self._runtime_directory,
+                        prefix="mpv-headers-", suffix=".conf", delete=False,
+                    ) as config:
+                        http_header_config_path = Path(config.name)
+                        joined = ",".join(f"{name}: {value}" for name, value in http_headers)
+                        # mpv's byte-length quoting preserves literal '#' and whitespace.
+                        quoted = f"%{len(joined.encode('utf-8'))}%{joined}"
+                        config.write(f"http-header-fields={quoted}\n")
+                argv = self._build_confirmed_mpv_argv(
+                    mpv_path=mpv_path,
+                    yt_dlp_path=yt_dlp_path,
+                    browser_cookies=browser_cookies,
+                    ipc_path=ipc_path,
+                    target=target,
+                    start_seconds=start_seconds,
+                    http_header_config_path=http_header_config_path,
+                )
                 process = await self._process_factory(
                     *argv,
                     stdin=asyncio.subprocess.DEVNULL,
@@ -479,10 +493,13 @@ class MediaPlaybackManager:
                     stderr=asyncio.subprocess.DEVNULL,
                     start_new_session=True,
                 )
-            except FileNotFoundError as exc:
-                raise MediaPlaybackError("mpv is not installed or is not executable") from exc
-            except OSError as exc:
-                raise MediaPlaybackError("mpv could not be started") from exc
+            except BaseException as exc:
+                self._cleanup_runtime(ipc_path, http_header_config_path)
+                if isinstance(exc, FileNotFoundError):
+                    raise MediaPlaybackError("mpv is not installed or is not executable") from exc
+                if isinstance(exc, OSError):
+                    raise MediaPlaybackError("mpv could not be started") from exc
+                raise
 
             video_id = (
                 locator.video_id
@@ -500,6 +517,7 @@ class MediaPlaybackManager:
                 ),
                 process=process,
                 ipc_path=ipc_path,
+                http_header_config_path=http_header_config_path,
             )
             self._active = player
             try:
@@ -558,7 +576,7 @@ class MediaPlaybackManager:
         ipc_path: Path,
         target: str,
         start_seconds: float,
-        http_headers: tuple[tuple[str, str], ...] = (),
+        http_header_config_path: Path | None = None,
     ) -> tuple[str, ...]:
         argv = [
             mpv_path,
@@ -579,9 +597,8 @@ class MediaPlaybackManager:
                     "--ytdl-raw-options-append="
                     f"cookies-from-browser={browser_cookies}"
                 )
-        if http_headers:
-            joined = ",".join(f"{name}: {value}" for name, value in http_headers)
-            argv.append(f"--http-header-fields={joined}")
+        if http_header_config_path is not None:
+            argv.append(f"--include={http_header_config_path}")
         argv.extend([f"--input-ipc-server={ipc_path}", "--", target])
         return tuple(argv)
 
@@ -602,7 +619,7 @@ class MediaPlaybackManager:
                 final_progress = await self._read_progress(player)
             player.watcher = None
             self._active = None
-            self._cleanup_runtime(player.ipc_path)
+            self._cleanup_runtime(player.ipc_path, player.http_header_config_path)
             returncode = player.process.returncode if player.process.returncode is not None else 1
             completion = PlaybackCompletion(
                 session_id=player.session_id,
@@ -704,7 +721,7 @@ class MediaPlaybackManager:
             raise
         if self._active is player:
             self._active = None
-        self._cleanup_runtime(player.ipc_path)
+        self._cleanup_runtime(player.ipc_path, player.http_header_config_path)
 
     async def _terminate_process(self, process: PlayerProcess) -> None:
         if process.returncode is None:
@@ -729,7 +746,9 @@ class MediaPlaybackManager:
         except TimeoutError as exc:
             raise MediaPlaybackError("mpv did not exit after forced termination") from exc
 
-    def _cleanup_runtime(self, ipc_path: Path) -> None:
+    def _cleanup_runtime(self, ipc_path: Path, http_header_config_path: Path | None = None) -> None:
+        if http_header_config_path is not None:
+            http_header_config_path.unlink(missing_ok=True)
         ipc_path.unlink(missing_ok=True)
         with contextlib.suppress(OSError):
             self._runtime_directory.rmdir()

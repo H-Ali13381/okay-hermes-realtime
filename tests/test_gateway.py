@@ -12,6 +12,7 @@ from starlette.websockets import WebSocketDisconnect
 from realtime_action_spike.anime import (
     AnimeSourceUnavailableError,
     AnimeStreamUnavailableError,
+    MissingAnimeEpisodeError,
 )
 from realtime_action_spike.config import Settings, build_realtime_session
 from realtime_action_spike.crunchyroll_remote.contracts import RemotePrototypeError
@@ -142,6 +143,8 @@ class ActiveSessionController:
         self.media_preparations.append({"kind": "anime", **kwargs})
         if self.media_error == "source_unavailable":
             raise AnimeSourceUnavailableError("anime catalog returned no search results")
+        if self.media_error == "episode_unavailable":
+            raise MissingAnimeEpisodeError(99)
         if self.media_error == "stream_unavailable":
             raise AnimeStreamUnavailableError("embed page had no player config")
         if self.media_error is not None:
@@ -178,6 +181,8 @@ class ActiveSessionController:
 
     async def choose_anime_media(self, **kwargs: object) -> dict[str, object]:
         self.media_choices.append(kwargs)
+        if self.media_error == "episode_unavailable":
+            raise MissingAnimeEpisodeError(99)
         if self.media_error == "stream_unavailable":
             raise AnimeStreamUnavailableError("embed page had no player config")
         if self.media_error is not None:
@@ -1273,6 +1278,44 @@ def test_internal_open_is_loopback_only_and_response_is_sanitized() -> None:
     assert "session" not in local.text
     assert remote.status_code == 403
     assert launcher.urls and "activation=launch-token-private" in launcher.urls[0]
+
+
+@pytest.mark.parametrize("name,arguments", [
+    ("media_prepare_anime", {"query": "Cowboy Bebop", "episode": 99}),
+    ("media_choose", {"position": 1}),
+])
+def test_missing_anime_episode_asks_user_without_substitution(name: str, arguments: dict) -> None:
+    controller = ActiveSessionController(
+        active_session_id="local-session-missing-episode", media_error="episode_unavailable",
+    )
+    upstream = StubUpstreamClient(httpx.Response(
+        201, text="v=0\r\nanswer", headers={"Location": "/v1/realtime/calls/missing_episode"},
+    ))
+    client = TestClient(create_app(
+        settings(), upstream_client=upstream, controller=controller,  # type: ignore[arg-type]
+    ))
+    session = client.post(
+        "/session?local_session_id=local-session-missing-episode",
+        content="v=0\r\noffer",
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE, "Content-Type": "application/sdp"},
+    )
+    response = client.post(
+        "/execute",
+        json={
+            "scope": session.headers["x-okay-hermes-execution-scope"],
+            "call_id": "call_missing_episode", "name": name, "arguments": arguments,
+        },
+        headers={LOCAL_CLIENT_HEADER: LOCAL_CLIENT_HEADER_VALUE},
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["ok"] is False
+    assert body["error"] == {
+        "type": "episode_unavailable", "message": "episode 99 is not available", "episode": 99,
+    }
+    assert "ask the user" in body["follow_up"].casefold()
+    assert "do not substitute" in body["follow_up"].casefold()
 
 
 def test_anime_source_unavailable_is_not_reported_as_bad_arguments() -> None:
