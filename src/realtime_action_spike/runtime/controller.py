@@ -219,7 +219,12 @@ class VoiceSessionController:
             permission_client=HermesKanbanPermissionClient(),
         )
         self._media_manager = media_manager or MediaPlaybackManager()
-        self._youtube_resolver = youtube_resolver or YouTubeResolver()
+        if youtube_resolver is not None:
+            self._youtube_resolver = youtube_resolver
+        elif isinstance(self._media_manager, MediaPlaybackManager):
+            self._youtube_resolver = self._media_manager.resolver
+        else:
+            self._youtube_resolver = YouTubeResolver()
         state_root = Path(os.getenv("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
         preference_store = media_preference_store or MediaPreferenceStore(
             state_root / "okay-hermes-realtime" / "media_state.json"

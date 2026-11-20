@@ -26,6 +26,10 @@ class MediaPlaybackError(RuntimeError):
 
 logger = logging.getLogger(__name__)
 
+# YouTube's default ANDROID_VR player client returns stream URLs that fail with
+# HTTP 403 when mpv fetches them. The android client returns fetchable URLs.
+_YOUTUBE_EXTRACTOR_ARGS = "youtube:player_client=android"
+
 
 @dataclass(frozen=True, slots=True)
 class YouTubeVideo:
@@ -115,6 +119,8 @@ class YouTubeResolver:
             "--skip-download",
             "--dump-single-json",
             "--no-warnings",
+            "--extractor-args",
+            _YOUTUBE_EXTRACTOR_ARGS,
         ]
         if self._browser_cookies:
             argv.extend(["--cookies-from-browser", self._browser_cookies])
@@ -416,6 +422,10 @@ class MediaPlaybackManager:
         return Path(runtime_root) / "okay-hermes-realtime" / "media"
 
     @property
+    def resolver(self) -> VideoResolver:
+        return self._resolver
+
+    @property
     def status(self) -> dict[str, object]:
         active = self._active
         if active is None:
@@ -592,6 +602,9 @@ class MediaPlaybackManager:
         if yt_dlp_path is not None:
             quoted_path = f"%{len(yt_dlp_path.encode('utf-8'))}%{yt_dlp_path}"
             argv.append(f"--script-opts=ytdl_hook-ytdl_path={quoted_path}")
+            argv.append(
+                f"--ytdl-raw-options-append=extractor-args={_YOUTUBE_EXTRACTOR_ARGS}"
+            )
             if browser_cookies is not None:
                 argv.append(
                     "--ytdl-raw-options-append="

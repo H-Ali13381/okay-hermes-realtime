@@ -538,6 +538,18 @@ def test_main_reports_generic_controller_lock_failures_without_touching_settings
     assert called == {"settings": False, "runtime": False}
 
 
+def test_service_wires_configured_youtube_resolver_into_controller() -> None:
+    service = RuntimeService(
+        Settings(openai_api_key=None, yt_dlp_bin="/opt/bin/yt-dlp"),
+        launcher_factory=lambda _settings: FakeLauncher(),  # type: ignore[arg-type]
+        socket_factory=lambda _controller, _settings: FakeSocket(),  # type: ignore[arg-type]
+        app_factory=lambda _settings, _controller: object(),  # type: ignore[arg-type]
+        http_server_factory=lambda _app, _settings: FakeHTTPServer(),
+    )
+
+    assert service._controller._youtube_resolver.yt_dlp_bin == "/opt/bin/yt-dlp"
+
+
 def test_main_returns_130_when_lock_acquire_is_interrupted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

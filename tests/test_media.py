@@ -169,6 +169,28 @@ async def test_resolver_uses_one_result_search_without_a_shell() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resolver_requests_android_player_client_for_playable_urls() -> None:
+    process = FakeResolverProcess(
+        stdout=json.dumps(
+            {
+                "id": "dQw4w9WgXcQ",
+                "title": "A useful video",
+                "channel": "Useful Channel",
+                "webpage_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            }
+        ).encode()
+    )
+    factory = RecordingProcessFactory(process)
+    resolver = YouTubeResolver(process_factory=factory)
+
+    await resolver.resolve("latest useful channel video")
+
+    argv = factory.calls[0][0]
+    assert "--extractor-args" in argv
+    assert argv[argv.index("--extractor-args") + 1] == "youtube:player_client=android"
+
+
+@pytest.mark.asyncio
 async def test_resolver_preserves_an_exact_allowlisted_url() -> None:
     url = "https://youtu.be/dQw4w9WgXcQ"
     process = FakeResolverProcess(
@@ -510,6 +532,9 @@ async def test_launch_starts_confirmed_locator_fullscreen_unpaused_once(
     assert "--geometry=640x360-32-32" not in argv
     assert argv[-2:] == ("--", expected_target)
     assert any("ytdl_hook-ytdl_path" in arg for arg in argv) is needs_ytdlp
+    assert (
+        "--ytdl-raw-options-append=extractor-args=youtube:player_client=android" in argv
+    ) is needs_ytdlp
     assert kwargs["start_new_session"] is True
     assert ipc.ready_paths
     assert manager.status == {

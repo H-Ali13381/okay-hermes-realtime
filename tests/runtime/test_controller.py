@@ -9,8 +9,10 @@ from realtime_action_spike.anime import AnimeResolution, RankedResolution
 from realtime_action_spike.capabilities import HandoffRecord
 from realtime_action_spike.media import (
     LaunchedPlayback,
+    MediaPlaybackManager,
     PlaybackCompletion,
     PlaybackProgress,
+    YouTubeResolver,
     YouTubeVideo,
 )
 from realtime_action_spike.media_state import AnimeProgressStore, MediaPreferenceStore
@@ -396,6 +398,17 @@ async def test_crunchyroll_login_is_bound_to_live_session_and_reaped_on_teardown
     assert login.stop_calls == [session_id]
     await controller.shutdown_crunchyroll()
     assert login.shutdown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_controller_shares_media_manager_youtube_resolver() -> None:
+    youtube = YouTubeResolver(yt_dlp_bin="/opt/bin/yt-dlp")
+    controller = VoiceSessionController(
+        DeterministicLauncher(),
+        media_manager=MediaPlaybackManager(resolver=youtube),  # type: ignore[arg-type]
+    )
+
+    assert controller._youtube_resolver is youtube
 
 
 @pytest.mark.asyncio
